@@ -223,8 +223,11 @@ pub fn plan_pointer_path(
     for i in 1..=steps {
         let tau = i as f64 / steps as f64;
         let progress = minimum_jerk(tau);
-        // Smooth bell curve sin(pi * tau) vanishes cleanly at start and end.
-        let lateral = peak_offset * (std::f64::consts::PI * tau).sin();
+        // The arc is a function of forward progress, not of time, so the path is a fixed
+        // curve in space traversed with the minimum-jerk speed profile. Driving it by `tau`
+        // makes the lateral offset grow linearly while forward progress is still ~0, so the
+        // pointer would leave and arrive almost perpendicular to the direction of travel.
+        let lateral = peak_offset * (std::f64::consts::PI * progress).sin();
 
         let point = if i == steps {
             end
@@ -344,6 +347,31 @@ mod tests {
 
         assert!(path.len() >= 10);
         assert_eq!(path.last().map(|s| s.point), Some(end));
+    }
+
+    #[test]
+    fn plan_pointer_path_departs_and_arrives_along_the_chord() {
+        // Horizontal move: forward is +x, lateral is y.
+        let start = Point { x: 0.0, y: 0.0 };
+        let end = Point { x: 800.0, y: 0.0 };
+        let path = plan_pointer_path(start, end, 1.0, MotionConfig::default());
+        assert!(path.len() >= 10);
+
+        // With arc_ratio r the path is y = r*d*sin(pi*x/d), whose slope never exceeds pi*r.
+        let max_slope = std::f64::consts::PI * MotionConfig::default().arc_ratio * 1.05;
+        for step in &path[..path.len() - 1] {
+            let forward = step.point.x;
+            let lateral = step.point.y.abs();
+            assert!(
+                lateral <= forward.mul_add(max_slope, 1e-9),
+                "lateral {lateral} exceeds forward {forward} * {max_slope}"
+            );
+            let remaining = end.x - forward;
+            assert!(
+                lateral <= remaining.mul_add(max_slope, 1e-9),
+                "lateral {lateral} exceeds remaining {remaining} * {max_slope}"
+            );
+        }
     }
 
     #[test]
