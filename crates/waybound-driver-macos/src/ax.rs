@@ -101,6 +101,20 @@ pub fn read_current_url(pid: i32) -> Result<Option<String>> {
     Ok(copy_attr(&web_area, "AXURL").and_then(|v| cf_to_url_string(&v)))
 }
 
+/// Reads the visible screen-space bounding rectangle of `AXWebArea`.
+///
+/// # Errors
+///
+/// Returns [`WayboundError::BackendUnavailable`] if Accessibility permissions are missing.
+pub fn read_viewport_bounds(pid: i32) -> Result<Option<Bounds>> {
+    let window_root = open_window_root(pid)?;
+    let Some(web_area) = find_web_area(&window_root) else {
+        return Ok(None);
+    };
+    let bounds = read_bounds(&web_area);
+    Ok((bounds.width > 0.0 && bounds.height > 0.0).then_some(bounds))
+}
+
 fn find_web_area(root: &OwnedCf) -> Option<OwnedCf> {
     let mut stack: Vec<(OwnedCf, usize)> = Vec::new();
     // SAFETY: `root` is a valid retained `OwnedCf` pointing to an `AXUIElement`.

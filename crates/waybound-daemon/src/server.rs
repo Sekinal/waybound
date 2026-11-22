@@ -223,8 +223,30 @@ fn scroll_viewport(
     Ok(())
 }
 
+const MAX_SCROLL_INTO_VIEW_ATTEMPTS: usize = 6;
+
 fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery) -> Result<()> {
-    let node = driver.locate(query)?;
+    let mut node = driver.locate(query)?;
+
+    // Auto-scroll off-screen elements into the visible viewport when viewport bounds are known.
+    if let Ok(Some(vp)) = driver.viewport_bounds()
+        && vp.height > 40.0
+    {
+        for _ in 0..MAX_SCROLL_INTO_VIEW_ATTEMPTS {
+            let (_, cy) = node.bounds.center();
+            let top = vp.y + 12.0;
+            let bottom = vp.y + vp.height - 12.0;
+            if cy >= top && cy <= bottom {
+                break;
+            }
+            let step = (vp.height * 0.6).clamp(180.0, 520.0);
+            let delta_y = if cy > bottom { -step } else { step };
+            scroll_viewport(driver, state, 0.0, delta_y)?;
+            thread::sleep(Duration::from_millis(120));
+            node = driver.locate(query)?;
+        }
+    }
+
     let b = node.bounds;
     if !b.x.is_finite()
         || !b.y.is_finite()

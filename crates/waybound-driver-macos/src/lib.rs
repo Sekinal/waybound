@@ -13,7 +13,7 @@ mod screenshot;
 use std::path::Path;
 use std::sync::Mutex;
 
-use waybound_core::{AccessibilityNode, BackendKind, Driver, InputEvent, Point, Result};
+use waybound_core::{AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Point, Result};
 
 /// Native macOS browser driver targeting a running browser process by PID.
 pub struct MacOsDriver {
@@ -64,6 +64,17 @@ impl Driver for MacOsDriver {
         #[cfg(target_os = "macos")]
         {
             ax::read_current_url(self.pid)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(None)
+        }
+    }
+
+    fn viewport_bounds(&self) -> Result<Option<Bounds>> {
+        #[cfg(target_os = "macos")]
+        {
+            ax::read_viewport_bounds(self.pid)
         }
         #[cfg(not(target_os = "macos"))]
         {

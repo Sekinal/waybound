@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::input::InputEvent;
-use crate::locator::{AccessibilityNode, LocatorQuery};
+use crate::locator::{AccessibilityNode, Bounds, LocatorQuery};
 
 /// Supported execution backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -113,6 +113,17 @@ pub trait Driver: Send + Sync {
     /// Returns an error if native navigation fails.
     fn navigate(&self, _url: &str) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Returns the visible screen-space bounds of the active web viewport, if known.
+    ///
+    /// Used by `waybound-daemon` to auto-scroll off-screen elements into view before clicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OS accessibility bus cannot be queried.
+    fn viewport_bounds(&self) -> Result<Option<Bounds>> {
+        Ok(None)
     }
 
     /// Captures a native OS screenshot of the active browser window as PNG to `output_path`.

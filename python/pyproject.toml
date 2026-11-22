@@ -9,6 +9,9 @@ description = "Ergonomic, out-of-band OS-level browser automation SDK"
 requires-python = ">=3.12"
 dependencies = []
 
+[project.scripts]
+waybound-mcp = "waybound.mcp_server:main"
+
 [dependency-groups]
 dev = [
   "mypy>=1.15.0",
