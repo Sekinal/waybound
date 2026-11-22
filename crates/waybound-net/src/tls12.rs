@@ -22,10 +22,12 @@ const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 
 /// Maximum TLS 1.2 record payload (RFC 5246 §6.2.3: 2^14 + 2048).
 const MAX_TLS_RECORD_LEN: usize = 18_432;
-/// Cap buffered ciphertext waiting for keylog secrets so memory stays bounded.
-const MAX_PENDING_CIPHERTEXT: usize = 256 * 1024;
 /// Cap on protected records queued per direction while the master secret is unknown.
 const MAX_PENDING_RECORDS: usize = 32;
+/// Cap buffered ciphertext waiting for keylog secrets so memory stays bounded. Sized so
+/// that [`MAX_PENDING_RECORDS`] full-size records fit, matching the TLS 1.3 decoder's
+/// tolerance for a late keylog line during a large transfer.
+const MAX_PENDING_CIPHERTEXT: usize = MAX_PENDING_RECORDS * MAX_TLS_RECORD_LEN;
 /// RFC 5288 §3: `GenericAEADCipher.nonce_explicit` length for AES-GCM.
 const GCM_EXPLICIT_NONCE_LEN: usize = 8;
 const AEAD_TAG_LEN: usize = 16;
