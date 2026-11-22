@@ -1,4 +1,8 @@
-# Running `waybound` with Headless Waydroid on Linux (ARM64 / x86_64)
+# Running `waybound` with Waydroid on Linux (ARM64 / x86_64)
+
+The `android` backend drives Chrome on any Android device or emulator reachable over ADB. Connecting to an already-running Waydroid (or other Android device) by ADB serial is the supported path.
+
+> **Status: `launch_waydroid=True` is experimental and does not work as written** ([#16](https://github.com/Sekinal/waybound/issues/16)). The daemon waits for ADB on `127.0.0.1:<adb_port>`, but nothing forwards Waydroid's `adbd` to that address; the Python SDK's default `startup_timeout_s` (5 s) is shorter than the daemon's 30 s ADB wait; Waydroid runs a single system-wide container, so `instance_id` does not give separate instances and stopping one session stops them all; and the Android `http_proxy` is set to `127.0.0.1`, which inside the container is the container itself. This path is not exercised in CI.
 
 ## Prerequisites (Ubuntu / Debian Linux Host)
 
@@ -6,12 +10,13 @@
    ```bash
    sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
    ```
-2. **Install Waydroid, headless Weston, ADB, and tshark:**
+2. **Install Waydroid and ADB:**
    ```bash
    sudo apt-get update
-   sudo apt-get install -y waydroid weston android-tools-adb tshark
+   sudo apt-get install -y waydroid android-tools-adb
    sudo waydroid init -s GAPPS
    ```
+   `weston` is only needed for the experimental `launch_waydroid=True` path.
 3. **Install official Google Chrome APK inside Waydroid:**
    ```bash
    waydroid app install /path/to/GoogleChrome.apk
@@ -19,28 +24,24 @@
 
 ## Usage from Python
 
+Connect to a running Waydroid / Android device by ADB serial (any serial that `adb devices` lists once you have run `adb connect`):
+
 ```python
 from waybound import LaunchOptions, Role, launch
 
-with launch(
-    LaunchOptions(
-        backend="android",
-        launch_waydroid=True,
-        instance_id="worker-01",
-        adb_port=5555,
-        url="https://www.wikipedia.org",
-        proxy="socks5://user:pass@proxy.example.com:1080",
-        timezone="America/New_York",
-    )
-) as page:
-    page.get_by_role(Role.LINK, name="English").wait_for().click()
+with launch(LaunchOptions(backend="android", serial="<device-ip>:5555")) as page:
+    page.goto("https://www.wikipedia.org")
+    link = page.get_by_role(Role.LINK, name="English")
+    link.wait_for()
+    link.click()
     print("URL:", page.url())
     png = page.screenshot()
 ```
 
-Or connect directly to an already-running Waydroid / Android device by ADB serial:
+## Limitations of the `android` backend
 
-```python
-with launch(LaunchOptions(backend="android", serial="127.0.0.1:5555")) as page:
-    page.goto("https://www.wikipedia.org")
-```
+- Input goes through `adb shell input`, which cannot send modifier chords: modifiers are dropped, and `fill()` appends to the field instead of replacing its content. Browser shortcuts are affected too: `reload()`, `new_tab()`, `close_tab()`, `next_tab()` and `prev_tab()` send the bare key (`r`, `t`, `w`, Tab), and `go_back()`/`go_forward()` send a bare left/right arrow. `goto()` works (it opens the URL with `am start`).
+- Pointer motion is not simulated; taps land directly on the target.
+- Accessibility snapshots come from `uiautomator dump` and are capped at 2,000 nodes.
+- `timezone=` and `locale=` are ignored when connecting with `serial=`; `timezone=` is only applied by the experimental `launch_waydroid=True` path.
+- Passive response capture (`ssl_keylog`) does not apply: nothing configures a TLS key log inside Android.

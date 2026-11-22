@@ -307,7 +307,7 @@ class UnixSocketTransport:
         self._expect_ok({"method": "prev_tab"}, "prev_tab")
 
     def screenshot(self, path: str) -> None:
-        """Capture a native OS PNG screenshot of the browser window to `path`."""
+        """Capture a native OS PNG screenshot to `path` (browser window on macOS, else screen)."""
         self._expect_ok({"method": "screenshot", "path": path}, "screenshot")
 
     def scroll(self, delta_x: float, delta_y: float) -> None:

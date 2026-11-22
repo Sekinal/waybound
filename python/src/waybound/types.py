@@ -206,5 +206,5 @@ class Transport(Protocol):
         ...
 
     def screenshot(self, path: str) -> None:
-        """Capture a native OS PNG screenshot of the browser window to `path`."""
+        """Capture a native OS PNG screenshot to `path` (browser window on macOS, else screen)."""
         ...

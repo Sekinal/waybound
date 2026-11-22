@@ -185,7 +185,10 @@ class Page:
         self._transport.wait_for_network_idle(idle_ms=idle_ms, timeout_ms=timeout_ms)
 
     def screenshot(self, path: Path | str | None = None) -> bytes:
-        """Capture a native OS PNG screenshot of the browser window and return PNG bytes."""
+        """Capture a native OS PNG screenshot and return PNG bytes.
+
+        macOS captures the browser window; the other backends capture the whole screen.
+        """
         if path is not None:
             out_path = Path(path).resolve()
             self._transport.screenshot(str(out_path))

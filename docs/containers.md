@@ -1,6 +1,6 @@
 # Running `waybound` in Headless Containers (Podman & Docker)
 
-`waybound` ships a standard OCI [`Containerfile`](../Containerfile) and [`compose.yaml`](../compose.yaml) that run unmodified Linux Chrome/Chromium inside a headless `Xvfb` + `AT-SPI2` + `xdotool` session — completely out-of-band, with zero CDP and without touching your host cursor or keyboard.
+`waybound` ships a standard OCI [`Containerfile`](../Containerfile) and [`compose.yaml`](../compose.yaml) that run unmodified Linux Chrome/Chromium inside a headless `Xvfb` + `AT-SPI2` session — completely out-of-band, with zero CDP and without touching your host cursor or keyboard. Input goes to the Xvfb display through X11 `XTEST`; `xdotool` is installed as a fallback.
 
 Both **Podman** (rootless by default, recommended) and **Docker** are first-class and use identical commands.
 
@@ -44,9 +44,11 @@ with waybound.launch(opts) as page:
 '
 ```
 
-## Optional: Passive TLS Capture (`tshark` + `SSLKEYLOGFILE`)
+## Optional: Passive TLS Capture (`SSLKEYLOGFILE`)
 
-Add `--cap-add=NET_RAW --cap-add=NET_ADMIN` when running if you want passive `tshark` decryption inside the container:
+When the script launches Chrome itself (`launch_chrome=True`) and sets `ssl_keylog=...`, decryption happens inside the daemon on the traffic it relays, so no extra capabilities are needed.
+
+The `tshark` path is only used when attaching to a Chrome the daemon did not launch (`pid=...`). That needs packet-capture capabilities:
 
 ```bash
 podman run --rm \
@@ -58,7 +60,9 @@ podman run --rm \
   python3 your_script.py
 ```
 
-## Scaling Workers with Compose
+## Compose
+
+[`compose.yaml`](../compose.yaml) builds the image and runs `waybound doctor` with the capture capabilities added. The entrypoint only starts a D-Bus session and the AT-SPI2 bus; Xvfb is started by the daemon for sessions with `headless_xvfb=True`, always on display `:99`, so run one such session per container.
 
 ```bash
 podman compose up --build

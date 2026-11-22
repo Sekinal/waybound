@@ -175,7 +175,10 @@ class AsyncPage:
         )
 
     async def screenshot(self, path: Path | str | None = None) -> bytes:
-        """Capture a native OS PNG screenshot of the browser window and return PNG bytes."""
+        """Capture a native OS PNG screenshot and return PNG bytes.
+
+        macOS captures the browser window; the other backends capture the whole screen.
+        """
         return await asyncio.to_thread(self._inner.screenshot, path)
 
     def get_by_role(

@@ -123,7 +123,8 @@ pub enum Request {
         /// Maximum wait time in milliseconds.
         timeout_ms: u64,
     },
-    /// Capture a native OS PNG screenshot of the browser window to `path`.
+    /// Capture a native OS PNG screenshot to `path` (the browser window on macOS, the whole
+    /// display on Linux, the primary screen on Windows, the device screen on Android).
     Screenshot {
         /// Destination PNG file path.
         path: String,
