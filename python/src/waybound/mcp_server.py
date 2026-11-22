@@ -154,7 +154,10 @@ def _tool_snapshot(page: Page, _args: dict[str, object]) -> dict[str, object]:
 def _tool_click(page: Page, args: dict[str, object]) -> dict[str, object]:
     role = _parse_role(args.get("role"))
     label = args.get("name")
-    label_str = label if isinstance(label, str) else None
+    label_str = label if isinstance(label, str) and label else None
+    if role is None and label_str is None:
+        msg = "waybound_click requires at least 'role' or 'name'"
+        raise ValueError(msg)
     nth = max(0, _as_int(args.get("nth"), 0))
     loc = (
         page.get_by_role(role, name=label_str)
@@ -236,13 +239,18 @@ def _handle_tools_call(page: Page, req_id: object, params: object) -> dict[str, 
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
 
-def handle_rpc_message(page: Page, msg: dict[str, object]) -> dict[str, object] | None:
-    """Process one JSON-RPC 2.0 MCP message; returns None for notifications."""
+def handle_rpc_message(
+    page_provider: Callable[[], Page],
+    msg: dict[str, object],
+) -> dict[str, object] | None:
+    """Process one JSON-RPC 2.0 MCP message; returns None for any notification."""
+    if "id" not in msg:
+        return None
     req_id = msg.get("id")
     method = msg.get("method")
 
-    if method == "notifications/initialized":
-        return None
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     if method == "initialize":
         return {
             "jsonrpc": "2.0",
@@ -256,7 +264,7 @@ def handle_rpc_message(page: Page, msg: dict[str, object]) -> dict[str, object] 
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
     if method == "tools/call":
-        return _handle_tools_call(page, req_id, msg.get("params"))
+        return _handle_tools_call(page_provider(), req_id, msg.get("params"))
     return _rpc_error(req_id, -32601, f"method not found: {method!r}")
 
 
@@ -279,8 +287,17 @@ def _options_from_env() -> LaunchOptions:
 
 
 def main() -> None:
-    """Run the `waybound-mcp` stdio JSON-RPC server."""
-    with launch(_options_from_env()) as page:
+    """Run the `waybound-mcp` stdio server, lazily launching the browser on first tool call."""
+    session = launch(_options_from_env())
+    active_page: Page | None = None
+
+    def get_page() -> Page:
+        nonlocal active_page
+        if active_page is None:
+            active_page = session.__enter__()
+        return active_page
+
+    try:
         for raw_line in sys.stdin:
             trimmed = raw_line.strip()
             if not trimmed:
@@ -293,10 +310,12 @@ def main() -> None:
                 continue
             if not isinstance(decoded, dict):
                 continue
-            response = handle_rpc_message(page, decoded)
+            response = handle_rpc_message(get_page, decoded)
             if response is not None:
                 sys.stdout.write(json.dumps(response) + "\n")
                 sys.stdout.flush()
+    finally:
+        session.close()
 
 
 if __name__ == "__main__":

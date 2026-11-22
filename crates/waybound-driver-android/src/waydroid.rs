@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use waybound_core::{Result, WayboundError};
 
 #[cfg(target_os = "linux")]
@@ -261,13 +261,25 @@ fn apply_android_settings(serial: &str, config: &WaydroidConfig) -> Result<()> {
         let escaped = adb::shell_single_quote(proxy);
         let cmd = format!("settings put global http_proxy {escaped}");
         let args = adb::build_adb_args(Some(serial), &["shell", &cmd]);
-        let _ = Command::new("adb").args(&args).status()?;
+        let out = Command::new("adb")
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()?;
+        if !out.status.success() {
+            warn!(serial, status = %out.status, "failed to configure Android http_proxy");
+        }
     }
     if let Some(tz) = &config.timezone {
         let escaped = adb::shell_single_quote(tz);
         let cmd = format!("setprop persist.sys.timezone {escaped}");
         let args = adb::build_adb_args(Some(serial), &["shell", &cmd]);
-        let _ = Command::new("adb").args(&args).status()?;
+        let out = Command::new("adb")
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()?;
+        if !out.status.success() {
+            warn!(serial, status = %out.status, "failed to configure Android timezone");
+        }
     }
     Ok(())
 }

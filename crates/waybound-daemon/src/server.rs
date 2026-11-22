@@ -225,29 +225,7 @@ fn scroll_viewport(
 
 const MAX_SCROLL_INTO_VIEW_ATTEMPTS: usize = 6;
 
-fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery) -> Result<()> {
-    let mut node = driver.locate(query)?;
-
-    // Auto-scroll off-screen elements into the visible viewport when viewport bounds are known.
-    if let Ok(Some(vp)) = driver.viewport_bounds()
-        && vp.height > 40.0
-    {
-        for _ in 0..MAX_SCROLL_INTO_VIEW_ATTEMPTS {
-            let (_, cy) = node.bounds.center();
-            let top = vp.y + 12.0;
-            let bottom = vp.y + vp.height - 12.0;
-            if cy >= top && cy <= bottom {
-                break;
-            }
-            let step = (vp.height * 0.6).clamp(180.0, 520.0);
-            let delta_y = if cy > bottom { -step } else { step };
-            scroll_viewport(driver, state, 0.0, delta_y)?;
-            thread::sleep(Duration::from_millis(120));
-            node = driver.locate(query)?;
-        }
-    }
-
-    let b = node.bounds;
+fn validate_bounds(b: waybound_core::Bounds, query: &LocatorQuery) -> Result<()> {
     if !b.x.is_finite()
         || !b.y.is_finite()
         || !b.width.is_finite()
@@ -259,6 +237,42 @@ fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery
             query: format!("element matched {query:?} but has invalid bounds {b:?}"),
         });
     }
+    Ok(())
+}
+
+fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery) -> Result<()> {
+    let mut node = driver.locate(query)?;
+    validate_bounds(node.bounds, query)?;
+
+    // Auto-scroll off-screen elements into the visible viewport when viewport bounds are known.
+    if let Ok(Some(vp)) = driver.viewport_bounds()
+        && vp.height > 40.0
+    {
+        let mut positioned_in_vp = false;
+        for _ in 0..MAX_SCROLL_INTO_VIEW_ATTEMPTS {
+            let (_, cy) = node.bounds.center();
+            let top = vp.y + 12.0;
+            let bottom = vp.y + vp.height - 12.0;
+            if cy >= top && cy <= bottom {
+                break;
+            }
+            // On macOS, wheel events go to the window under the cursor — ensure cursor is inside vp.
+            if !positioned_in_vp && driver.backend_kind() == BackendKind::MacOsNative {
+                let (vx, vy) = vp.center();
+                let mut rng = SplitMix64::from_entropy();
+                move_pointer(driver, state, Point { x: vx, y: vy }, &mut rng)?;
+                positioned_in_vp = true;
+            }
+            let step = (vp.height * 0.6).clamp(180.0, 520.0);
+            let delta_y = if cy > bottom { -step } else { step };
+            scroll_viewport(driver, state, 0.0, delta_y)?;
+            thread::sleep(Duration::from_millis(120));
+            node = driver.locate(query)?;
+            validate_bounds(node.bounds, query)?;
+        }
+    }
+
+    let b = node.bounds;
 
     let mut rng = SplitMix64::from_entropy();
     let target = if state.options.use_motion {

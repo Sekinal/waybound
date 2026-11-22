@@ -185,8 +185,10 @@ pub fn build_input_shell_args(event: &InputEvent, last_cursor: &mut Point) -> Op
             };
             let x1 = coord_to_i32(origin.x);
             let y1 = coord_to_i32(origin.y);
-            let x2 = coord_to_i32(origin.x - *delta_x);
-            let y2 = coord_to_i32(origin.y - *delta_y);
+            // Negative delta_y scrolls down (revealing content below), which on touchscreens
+            // requires swiping the finger upward (y2 < y1).
+            let x2 = coord_to_i32(origin.x + *delta_x);
+            let y2 = coord_to_i32(origin.y + *delta_y);
             Some(vec![
                 "shell".to_owned(),
                 "input".to_owned(),
@@ -498,11 +500,11 @@ mod tests {
             ])
         );
 
-        // Scroll -> input swipe from cursor to cursor - delta
+        // Negative delta_y scrolls down by swiping upward from cursor (641 -> 441).
         let scroll_args = build_input_shell_args(
             &InputEvent::Scroll {
                 delta_x: 0.0,
-                delta_y: 200.0,
+                delta_y: -200.0,
             },
             &mut cursor,
         );

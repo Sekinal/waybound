@@ -19,11 +19,26 @@ def test_mcp_server_initialize_list_and_tool_calls() -> None:
         pytest.skip("waybound-daemon binary not built yet (run cargo build)")
 
     with launch(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
-        init_resp = handle_rpc_message(page, {"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        provider = lambda: page  # noqa: E731
+
+        # Notifications (no "id") must return None per JSON-RPC 2.0.
+        assert (
+            handle_rpc_message(provider, {"jsonrpc": "2.0", "method": "notifications/cancelled"})
+            is None
+        )
+
+        ping_resp = handle_rpc_message(provider, {"jsonrpc": "2.0", "id": 0, "method": "ping"})
+        assert ping_resp == {"jsonrpc": "2.0", "id": 0, "result": {}}
+
+        init_resp = handle_rpc_message(
+            provider, {"jsonrpc": "2.0", "id": 1, "method": "initialize"}
+        )
         assert init_resp is not None
         assert init_resp["id"] == 1
 
-        list_resp = handle_rpc_message(page, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        list_resp = handle_rpc_message(
+            provider, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        )
         assert list_resp is not None
         result = list_resp["result"]
         assert isinstance(result, dict)
@@ -32,7 +47,7 @@ def test_mcp_server_initialize_list_and_tool_calls() -> None:
         assert len(tools) == 8
 
         url_resp = handle_rpc_message(
-            page,
+            provider,
             {
                 "jsonrpc": "2.0",
                 "id": 3,
@@ -48,7 +63,7 @@ def test_mcp_server_initialize_list_and_tool_calls() -> None:
         assert content[0]["text"] == "https://mock.waybound.local/"
 
         snap_resp = handle_rpc_message(
-            page,
+            provider,
             {
                 "jsonrpc": "2.0",
                 "id": 4,
@@ -65,7 +80,7 @@ def test_mcp_server_initialize_list_and_tool_calls() -> None:
         assert len(nodes) == 2
 
         shot_resp = handle_rpc_message(
-            page,
+            provider,
             {
                 "jsonrpc": "2.0",
                 "id": 5,
