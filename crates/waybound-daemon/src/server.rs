@@ -18,10 +18,11 @@ use std::time::{Duration, Instant};
 
 use waybound_core::{
     BackendKind, Driver, InputEvent, KeyCode, KeyModifier, LocatorQuery, MotionConfig, MouseButton,
-    Point, Request, Response, Result, SplitMix64, WayboundError, hover_pause_before_click,
+    Point, Request, Response, Result, Role, SplitMix64, WayboundError, hover_pause_before_click,
     key_delay, key_hold_ms, mouse_hold_ms, pick_click_point, plan_human_pointer_path,
     plan_scroll_burst,
 };
+use waybound_net::{InflightCounter, wait_for_network_idle};
 
 use crate::net_tap::ResponseStore;
 
@@ -61,10 +62,12 @@ impl Drop for ConnectionGuard {
 }
 
 /// Runtime options for daemon request execution.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ServerOptions {
     /// Whether to execute smooth minimum-jerk pointer trajectories before clicks.
     pub use_motion: bool,
+    /// Shared inflight HTTP/1.1–2 request counter for `wait_for_network_idle`.
+    pub inflight: InflightCounter,
 }
 
 struct SessionState {
@@ -119,6 +122,18 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             Err(err) => Response::from(&err),
         },
         Request::Click { query } => match click_element(driver, state, &query) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
+        Request::DblClick { query } => match dblclick_element(driver, state, &query) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
+        Request::SelectOption {
+            query,
+            label,
+            index,
+        } => match select_option_element(driver, state, &query, label.as_deref(), index) {
             Ok(()) => Response::Ok,
             Err(err) => Response::from(&err),
         },
@@ -195,6 +210,25 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             Ok(response) => Response::HttpResponse { response },
             Err(err) => Response::from(&err),
         },
+        Request::WaitForNetworkIdle {
+            idle_ms,
+            timeout_ms,
+        } => {
+            let clamped_idle = Duration::from_millis(idle_ms.clamp(50, 10_000));
+            let clamped_timeout = Duration::from_millis(timeout_ms.min(60_000));
+            if wait_for_network_idle(&state.options.inflight, clamped_idle, clamped_timeout) {
+                Response::Ok
+            } else {
+                Response::from(&WayboundError::Timeout {
+                    timeout_ms: timeout_ms.min(60_000),
+                    context: format!(
+                        "network did not remain idle for {}ms (inflight={})",
+                        clamped_idle.as_millis(),
+                        state.options.inflight.get()
+                    ),
+                })
+            }
+        }
         Request::Screenshot { path } => match driver.screenshot(Path::new(&path)) {
             Ok(()) => Response::Ok,
             Err(err) => Response::from(&err),
@@ -382,6 +416,66 @@ fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery
         button: MouseButton::Left,
         hold_ms,
     })
+}
+
+fn dblclick_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery) -> Result<()> {
+    click_element(driver, state, query)?;
+    thread::sleep(Duration::from_millis(60));
+    driver.dispatch_input(&InputEvent::MouseClick {
+        button: MouseButton::Left,
+        hold_ms: 0,
+    })
+}
+
+fn select_option_element(
+    driver: &dyn Driver,
+    state: &SessionState,
+    query: &LocatorQuery,
+    label: Option<&str>,
+    index: Option<usize>,
+) -> Result<()> {
+    click_element(driver, state, query)?;
+    thread::sleep(Duration::from_millis(120));
+
+    if let Some(target_label) = label {
+        // First try clicking a visible ARIA `option` node matching `target_label`.
+        let opt_query = LocatorQuery::by_role(Role::Option, Some(target_label.to_owned()));
+        if driver.locate(&opt_query).is_ok() {
+            return click_element(driver, state, &opt_query);
+        }
+        // Fallback for native OS `<select>` popups: type-ahead characters + Enter.
+        type_text(driver, target_label, false)?;
+        thread::sleep(Duration::from_millis(80));
+        return driver.dispatch_input(&InputEvent::KeyPress {
+            key: KeyCode::Enter,
+            modifiers: Vec::new(),
+            hold_ms: 0,
+        });
+    }
+
+    if let Some(idx) = index {
+        driver.dispatch_input(&InputEvent::KeyPress {
+            key: KeyCode::Home,
+            modifiers: Vec::new(),
+            hold_ms: 0,
+        })?;
+        thread::sleep(Duration::from_millis(40));
+        for _ in 0..idx.min(200) {
+            driver.dispatch_input(&InputEvent::KeyPress {
+                key: KeyCode::ArrowDown,
+                modifiers: Vec::new(),
+                hold_ms: 0,
+            })?;
+            thread::sleep(Duration::from_millis(25));
+        }
+        return driver.dispatch_input(&InputEvent::KeyPress {
+            key: KeyCode::Enter,
+            modifiers: Vec::new(),
+            hold_ms: 0,
+        });
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -852,7 +946,10 @@ mod tests {
 
     fn state() -> SessionState {
         SessionState::new(
-            ServerOptions { use_motion: false },
+            ServerOptions {
+                use_motion: false,
+                inflight: InflightCounter::default(),
+            },
             Arc::new(ResponseStore::default()),
             Arc::new(AtomicBool::new(false)),
         )

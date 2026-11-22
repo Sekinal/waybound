@@ -73,6 +73,14 @@ class AsyncLocator:
         """Click the resolved element using native OS input."""
         await asyncio.to_thread(self._inner.click)
 
+    async def dblclick(self) -> None:
+        """Double-click the resolved element using native OS input."""
+        await asyncio.to_thread(self._inner.dblclick)
+
+    async def select_option(self, *, label: str | None = None, index: int | None = None) -> None:
+        """Select an option from a `<select>` or combobox by label or 0-based index."""
+        await asyncio.to_thread(self._inner.select_option, label=label, index=index)
+
     async def fill(self, text: str) -> None:
         """Fill the resolved input element using native keyboard events."""
         await asyncio.to_thread(self._inner.fill, text)
@@ -158,6 +166,12 @@ class AsyncPage:
         """Wait until a passively decrypted HTTP response matches `url_contains`."""
         return await asyncio.to_thread(
             self._inner.wait_for_response, url_contains, timeout_ms=timeout_ms
+        )
+
+    async def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
+        """Wait until zero HTTP/1.1 or HTTP/2 requests remain inflight for `idle_ms`."""
+        await asyncio.to_thread(
+            self._inner.wait_for_network_idle, idle_ms=idle_ms, timeout_ms=timeout_ms
         )
 
     async def screenshot(self, path: Path | str | None = None) -> bytes:

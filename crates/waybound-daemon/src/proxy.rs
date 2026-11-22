@@ -15,6 +15,9 @@ use std::thread;
 use std::time::Duration;
 
 use waybound_core::Result;
+use waybound_net::{
+    Direction, HostBlocker, InflightCounter, KeyLogStore, PassiveConnectionTap, ResponseCallback,
+};
 
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
@@ -131,6 +134,24 @@ impl UpstreamProxy {
     }
 }
 
+/// Configuration for passive, zero-MITM TLS 1.3 + HTTP/1.1–2 decryption inside the proxy relay.
+#[derive(Clone)]
+pub struct PassiveTapConfig {
+    /// Live `SSLKEYLOGFILE` reader.
+    pub keylog: KeyLogStore,
+    /// Shared inflight request counter powering `wait_for_network_idle`.
+    pub inflight: InflightCounter,
+    /// Callback invoked with each decrypted HTTP response.
+    pub on_response: ResponseCallback,
+}
+
+#[derive(Clone)]
+struct ForwarderConfig {
+    upstream: Option<UpstreamProxy>,
+    blocker: HostBlocker,
+    tap: Option<PassiveTapConfig>,
+}
+
 /// RAII handle for the local loopback proxy forwarder thread.
 pub struct ProxyForwarder {
     local_addr: SocketAddr,
@@ -144,15 +165,38 @@ impl ProxyForwarder {
     ///
     /// Returns [`waybound_core::WayboundError::Io`] if `127.0.0.1:0` cannot be bound or
     /// the listener thread cannot be spawned.
+    #[cfg(test)]
     pub fn start(upstream: UpstreamProxy) -> Result<Self> {
+        Self::start_with_options(Some(upstream), HostBlocker::default(), None)
+    }
+
+    /// Starts a loopback HTTP/CONNECT proxy with optional upstream proxy, L4 host blocker,
+    /// and passive zero-MITM `SSLKEYLOGFILE` TLS 1.3 decryption tap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`waybound_core::WayboundError::Io`] if `127.0.0.1:0` cannot be bound or
+    /// the listener thread cannot be spawned.
+    pub fn start_with_options(
+        upstream: Option<UpstreamProxy>,
+        blocker: HostBlocker,
+        tap: Option<PassiveTapConfig>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let local_addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_ref = Arc::clone(&shutdown);
-        let upstream_arc = Arc::new(upstream);
-        let upstream_thread = Arc::clone(&upstream_arc);
+        let has_tap = tap.is_some();
+        let has_blocker = !blocker.is_empty();
+        let upstream_desc = upstream.as_ref().map(|u| (u.protocol, u.host_port.clone()));
+        let cfg = Arc::new(ForwarderConfig {
+            upstream,
+            blocker,
+            tap,
+        });
+        let cfg_thread = Arc::clone(&cfg);
         let active_tunnels = Arc::new(AtomicUsize::new(0));
 
         let _ = thread::Builder::new()
@@ -167,7 +211,7 @@ impl ProxyForwarder {
                                 tracing::warn!("proxy forwarder at max concurrent tunnels");
                                 continue;
                             }
-                            let up = Arc::clone(&upstream_thread);
+                            let c = Arc::clone(&cfg_thread);
                             let guard = TunnelGuard {
                                 counter: Arc::clone(&active_tunnels),
                             };
@@ -175,7 +219,7 @@ impl ProxyForwarder {
                                 .name("waybound-proxy-conn".to_owned())
                                 .spawn(move || {
                                     let _guard = guard;
-                                    if let Err(err) = handle_client(client, &up) {
+                                    if let Err(err) = handle_client(client, &c) {
                                         tracing::debug!(error = %err, "proxy client tunnel closed");
                                     }
                                 });
@@ -200,10 +244,10 @@ impl ProxyForwarder {
 
         tracing::info!(
             listen = %local_addr,
-            protocol = ?upstream_arc.protocol,
-            upstream = %upstream_arc.host_port,
-            authenticated = upstream_arc.credentials.is_some(),
-            "started local proxy auth forwarder"
+            upstream = ?upstream_desc,
+            passive_tls_tap = has_tap,
+            host_blocker = has_blocker,
+            "started local pass-through proxy"
         );
 
         Ok(Self {
@@ -241,7 +285,7 @@ fn connect_upstream(host_port: &str) -> io::Result<TcpStream> {
     }))
 }
 
-fn handle_client(mut client: TcpStream, upstream: &UpstreamProxy) -> io::Result<()> {
+fn handle_client(mut client: TcpStream, cfg: &ForwarderConfig) -> io::Result<()> {
     client.set_nonblocking(false)?;
     client.set_read_timeout(Some(HEADER_IO_TIMEOUT))?;
     client.set_write_timeout(Some(HEADER_IO_TIMEOUT))?;
@@ -276,33 +320,47 @@ fn handle_client(mut client: TcpStream, upstream: &UpstreamProxy) -> io::Result<
         return Ok(());
     }
 
-    let mut upstream_stream = connect_upstream(&upstream.host_port)?;
-    upstream_stream.set_read_timeout(Some(HEADER_IO_TIMEOUT))?;
-    upstream_stream.set_write_timeout(Some(HEADER_IO_TIMEOUT))?;
+    let (target_host, target_port, is_connect) = parse_request_target(&header_lines[0])?;
 
-    match upstream.protocol {
-        ProxyProtocol::Http => {
-            forward_http_upstream(&mut upstream_stream, &header_lines, total_bytes, upstream)?;
-            let buffered = client_reader.buffer();
-            if !buffered.is_empty() {
-                upstream_stream.write_all(buffered)?;
-                upstream_stream.flush()?;
-            }
-        }
-        ProxyProtocol::Socks5 => {
-            let (target_host, target_port, is_connect) = parse_request_target(&header_lines[0])?;
-            socks5_handshake(&mut upstream_stream, upstream, &target_host, target_port)?;
-            if is_connect {
-                client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
-                client.flush()?;
-            } else {
-                forward_plain_http_over_socks(&mut upstream_stream, &header_lines, total_bytes)?;
-            }
-            let buffered = client_reader.buffer();
-            if !buffered.is_empty() {
-                upstream_stream.write_all(buffered)?;
-                upstream_stream.flush()?;
-            }
+    // L4 hostname blocking (zero MITM — drops before upstream connect or TLS handshake).
+    if cfg.blocker.is_blocked(&target_host) {
+        tracing::debug!(host = %target_host, "blocked host at L4 proxy");
+        client.write_all(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        client.flush()?;
+        return Ok(());
+    }
+
+    let (mut upstream_stream, strip_http_connect_reply) = open_upstream_tunnel(
+        &mut client,
+        cfg.upstream.as_ref(),
+        &header_lines,
+        total_bytes,
+        &target_host,
+        target_port,
+        is_connect,
+    )?;
+
+    let tap = if is_connect && !strip_http_connect_reply {
+        cfg.tap.as_ref().map(|t| {
+            PassiveConnectionTap::new(
+                target_host.clone(),
+                t.keylog.clone(),
+                t.inflight.clone(),
+                Arc::clone(&t.on_response),
+            )
+        })
+    } else {
+        None
+    };
+
+    let buffered = client_reader.buffer();
+    if !buffered.is_empty() {
+        upstream_stream.write_all(buffered)?;
+        upstream_stream.flush()?;
+        if let Some(ref t) = tap {
+            t.observe(Direction::ClientToServer, buffered);
         }
     }
 
@@ -315,18 +373,76 @@ fn handle_client(mut client: TcpStream, upstream: &UpstreamProxy) -> io::Result<
     let mut client_to_up_dst = upstream_stream.try_clone()?;
     let mut up_to_client_src = upstream_stream;
     let mut up_to_client_dst = client;
+    let tap_c2s = tap.clone();
 
     let forward_thread = thread::Builder::new()
         .name("waybound-proxy-pipe".to_owned())
         .spawn(move || {
-            let _ = copy_stream(&mut client_to_up_src, &mut client_to_up_dst);
+            let _ = copy_stream(
+                &mut client_to_up_src,
+                &mut client_to_up_dst,
+                tap_c2s.as_ref(),
+                Direction::ClientToServer,
+            );
             let _ = client_to_up_dst.shutdown(std::net::Shutdown::Write);
         })?;
 
-    let _ = copy_stream(&mut up_to_client_src, &mut up_to_client_dst);
+    let _ = copy_stream(
+        &mut up_to_client_src,
+        &mut up_to_client_dst,
+        tap.as_ref(),
+        Direction::ServerToClient,
+    );
     let _ = up_to_client_dst.shutdown(std::net::Shutdown::Write);
     let _ = forward_thread.join();
     Ok(())
+}
+
+fn open_upstream_tunnel(
+    client: &mut TcpStream,
+    upstream: Option<&UpstreamProxy>,
+    header_lines: &[String],
+    total_bytes: usize,
+    target_host: &str,
+    target_port: u16,
+    is_connect: bool,
+) -> io::Result<(TcpStream, bool)> {
+    match upstream {
+        None => {
+            let dest = format!("{target_host}:{target_port}");
+            let mut s = connect_upstream(&dest)?;
+            s.set_read_timeout(Some(HEADER_IO_TIMEOUT))?;
+            s.set_write_timeout(Some(HEADER_IO_TIMEOUT))?;
+            if is_connect {
+                client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+                client.flush()?;
+            } else {
+                forward_plain_http_over_socks(&mut s, header_lines, total_bytes)?;
+            }
+            Ok((s, false))
+        }
+        Some(up) => {
+            let mut s = connect_upstream(&up.host_port)?;
+            s.set_read_timeout(Some(HEADER_IO_TIMEOUT))?;
+            s.set_write_timeout(Some(HEADER_IO_TIMEOUT))?;
+            match up.protocol {
+                ProxyProtocol::Http => {
+                    forward_http_upstream(&mut s, header_lines, total_bytes, up)?;
+                    Ok((s, is_connect))
+                }
+                ProxyProtocol::Socks5 => {
+                    socks5_handshake(&mut s, up, target_host, target_port)?;
+                    if is_connect {
+                        client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+                        client.flush()?;
+                    } else {
+                        forward_plain_http_over_socks(&mut s, header_lines, total_bytes)?;
+                    }
+                    Ok((s, false))
+                }
+            }
+        }
+    }
 }
 
 fn forward_http_upstream(
@@ -605,7 +721,12 @@ fn socks5_handshake(
     drain_socks5_reply_addr(stream, hdr[3])
 }
 
-fn copy_stream(src: &mut TcpStream, dst: &mut TcpStream) -> io::Result<()> {
+fn copy_stream(
+    src: &mut TcpStream,
+    dst: &mut TcpStream,
+    tap: Option<&PassiveConnectionTap>,
+    dir: Direction,
+) -> io::Result<()> {
     let mut buf = [0u8; 16 * 1024];
     loop {
         let n = src.read(&mut buf)?;
@@ -613,6 +734,9 @@ fn copy_stream(src: &mut TcpStream, dst: &mut TcpStream) -> io::Result<()> {
             return Ok(());
         }
         dst.write_all(&buf[..n])?;
+        if let Some(t) = tap {
+            t.observe(dir, &buf[..n]);
+        }
     }
 }
 

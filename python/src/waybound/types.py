@@ -135,6 +135,20 @@ class Transport(Protocol):
         """Locate the target element and dispatch a native click."""
         ...
 
+    def dblclick(self, query: LocatorQuery) -> None:
+        """Locate the target element and dispatch a native double-click."""
+        ...
+
+    def select_option(
+        self,
+        query: LocatorQuery,
+        *,
+        label: str | None = None,
+        index: int | None = None,
+    ) -> None:
+        """Select an option from a `<select>` or combobox by label or 0-based index."""
+        ...
+
     def fill(self, query: LocatorQuery, text: str) -> None:
         """Focus the target element and type text via native keyboard events."""
         ...
@@ -185,6 +199,10 @@ class Transport(Protocol):
 
     def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
         """Wait until a passively captured HTTP response matches `url_contains`."""
+        ...
+
+    def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
+        """Wait until zero HTTP/1.1 or HTTP/2 requests remain inflight for `idle_ms`."""
         ...
 
     def screenshot(self, path: str) -> None:

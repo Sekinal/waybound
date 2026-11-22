@@ -231,6 +231,41 @@ class UnixSocketTransport:
         """Locate the target element and dispatch a native click."""
         self._expect_ok({"method": "click", "query": _encode_query(query)}, "click")
 
+    def dblclick(self, query: LocatorQuery) -> None:
+        """Locate the target element and dispatch a native double-click."""
+        self._expect_ok({"method": "dblclick", "query": _encode_query(query)}, "dblclick")
+
+    def select_option(
+        self,
+        query: LocatorQuery,
+        *,
+        label: str | None = None,
+        index: int | None = None,
+    ) -> None:
+        """Select an option from a `<select>` or combobox by label or 0-based index."""
+        self._expect_ok(
+            {
+                "method": "select_option",
+                "query": _encode_query(query),
+                "label": label,
+                "index": index,
+            },
+            "select_option",
+        )
+
+    def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
+        """Wait until zero HTTP/1.1 or HTTP/2 requests remain inflight for `idle_ms`."""
+        clamped_ms = max(0, timeout_ms)
+        self._expect_ok(
+            {
+                "method": "wait_for_network_idle",
+                "idle_ms": max(50, idle_ms),
+                "timeout_ms": clamped_ms,
+            },
+            "wait_for_network_idle",
+            timeout_override_s=max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0),
+        )
+
     def fill(self, query: LocatorQuery, text: str) -> None:
         """Focus the target element and type text via native keyboard events."""
         self._expect_ok(

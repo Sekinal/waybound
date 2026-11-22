@@ -86,6 +86,14 @@ class Locator:
         """Click the resolved element using native OS input."""
         self._transport.click(self.query)
 
+    def dblclick(self) -> None:
+        """Double-click the resolved element using native OS input."""
+        self._transport.dblclick(self.query)
+
+    def select_option(self, *, label: str | None = None, index: int | None = None) -> None:
+        """Select an option from a `<select>` or combobox by label or 0-based index."""
+        self._transport.select_option(self.query, label=label, index=index)
+
     def fill(self, text: str) -> None:
         """Fill the resolved input element using native keyboard events."""
         self._transport.fill(self.query, text)
@@ -171,6 +179,10 @@ class Page:
     def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
         """Wait until a passively decrypted HTTP response matches `url_contains`."""
         return self._transport.wait_for_response(url_contains, timeout_ms=timeout_ms)
+
+    def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
+        """Wait until zero HTTP/1.1 or HTTP/2 requests remain inflight for `idle_ms`."""
+        self._transport.wait_for_network_idle(idle_ms=idle_ms, timeout_ms=timeout_ms)
 
     def screenshot(self, path: Path | str | None = None) -> bytes:
         """Capture a native OS PNG screenshot of the browser window and return PNG bytes."""

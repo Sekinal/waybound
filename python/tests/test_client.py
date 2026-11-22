@@ -49,6 +49,18 @@ class FakeTransport:
     def fill(self, query: LocatorQuery, text: str) -> None:
         self.events.append(("fill", (query, text)))
 
+    def dblclick(self, query: LocatorQuery) -> None:
+        self.events.append(("dblclick", query))
+
+    def select_option(
+        self,
+        query: LocatorQuery,
+        *,
+        label: str | None = None,
+        index: int | None = None,
+    ) -> None:
+        self.events.append(("select_option", (query, label, index)))
+
     def navigate(self, url: str) -> None:
         self.events.append(("navigate", url))
 
@@ -91,6 +103,9 @@ class FakeTransport:
             content_type="application/json",
             body="{}",
         )
+
+    def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
+        self.events.append(("wait_for_network_idle", (idle_ms, timeout_ms)))
 
     def screenshot(self, path: str) -> None:
         self.events.append(("screenshot", path))

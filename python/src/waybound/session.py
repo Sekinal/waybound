@@ -42,6 +42,7 @@ class LaunchOptions:
     profile_dir: Path | str | None = None
     ssl_keylog: Path | str | None = None
     proxy: str | None = None
+    block_hosts: tuple[str, ...] = ()
     timezone: str | None = None
     locale: str | None = None
     focus: bool = False
@@ -167,6 +168,8 @@ class Session:
         for flag, val in pairs:
             if val is not None:
                 cmd.extend([flag, val])
+        if opts.block_hosts:
+            cmd.extend(["--block-hosts", ",".join(opts.block_hosts)])
         if opts.headless_xvfb:
             cmd.append("--headless-xvfb")
         if opts.launch_chrome:

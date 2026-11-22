@@ -17,6 +17,7 @@ waybound-driver-android.workspace = true
 waybound-driver-linux.workspace = true
 waybound-driver-macos.workspace = true
 waybound-driver-windows.workspace = true
+waybound-net.workspace = true
 
 [lints]
 workspace = true

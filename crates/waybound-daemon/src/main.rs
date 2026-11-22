@@ -29,8 +29,9 @@ use waybound_driver_windows::WindowsDriver;
 use crate::launcher::{ChromeLaunchOptions, launch_chrome};
 use crate::mock_driver::MockDriver;
 use crate::net_tap::{ResponseStore, start_passive_tap};
-use crate::proxy::{ProxyForwarder, UpstreamProxy};
+use crate::proxy::{PassiveTapConfig, ProxyForwarder, UpstreamProxy};
 use crate::server::ServerOptions;
+use waybound_net::{HostBlocker, InflightCounter, KeyLogStore};
 
 #[allow(clippy::struct_excessive_bools)]
 struct CliArgs {
@@ -49,6 +50,7 @@ struct CliArgs {
     ssl_keylog_file: Option<PathBuf>,
     initial_url: Option<String>,
     proxy: Option<String>,
+    block_hosts: Vec<String>,
     timezone: Option<String>,
     locale: Option<String>,
     focus: bool,
@@ -77,6 +79,7 @@ fn parse_args() -> Result<CliArgs, String> {
         ssl_keylog_file: None,
         initial_url: None,
         proxy: env::var("WAYBOUND_PROXY").ok(),
+        block_hosts: Vec::new(),
         timezone: None,
         locale: None,
         focus: false,
@@ -120,6 +123,13 @@ fn parse_args() -> Result<CliArgs, String> {
             }
             "--url" => cli.initial_url = Some(next_arg(&mut args, "--url")?),
             "--proxy" => cli.proxy = Some(next_arg(&mut args, "--proxy")?),
+            "--block-host" => cli.block_hosts.push(next_arg(&mut args, "--block-host")?),
+            "--block-hosts" => {
+                let csv = next_arg(&mut args, "--block-hosts")?;
+                for host in csv.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    cli.block_hosts.push(host.to_owned());
+                }
+            }
             "--timezone" => cli.timezone = Some(next_arg(&mut args, "--timezone")?),
             "--locale" => cli.locale = Some(next_arg(&mut args, "--locale")?),
             "--focus" => cli.focus = true,
@@ -139,16 +149,39 @@ fn default_user_socket_path() -> std::io::Result<PathBuf> {
     Ok(dir.join("w.sock"))
 }
 
-fn setup_proxy(raw: Option<String>) -> Result<(Option<String>, Option<ProxyForwarder>), String> {
-    match raw {
-        Some(raw_proxy) if raw_proxy.contains('@') => {
-            let upstream = UpstreamProxy::parse(&raw_proxy)?;
-            let fwd = ProxyForwarder::start(upstream).map_err(|e| e.to_string())?;
-            Ok((Some(fwd.chrome_proxy_arg()), Some(fwd)))
+fn setup_proxy(
+    raw: Option<String>,
+    block_hosts: &[String],
+    ssl_keylog: Option<&PathBuf>,
+    responses: &Arc<ResponseStore>,
+    inflight: &InflightCounter,
+) -> Result<(Option<String>, Option<ProxyForwarder>), String> {
+    let blocker = HostBlocker::new(block_hosts);
+    let tap = ssl_keylog.map(|path| {
+        let store = Arc::clone(responses);
+        PassiveTapConfig {
+            keylog: KeyLogStore::new(path),
+            inflight: inflight.clone(),
+            on_response: Arc::new(move |seq, resp| {
+                store.upsert(seq, resp);
+            }),
         }
-        Some(raw_proxy) => Ok((Some(raw_proxy), None)),
-        None => Ok((None, None)),
+    });
+
+    let needs_local_relay =
+        !blocker.is_empty() || tap.is_some() || raw.as_deref().is_some_and(|p| p.contains('@'));
+
+    if !needs_local_relay {
+        return Ok((raw, None));
     }
+
+    let upstream = match raw {
+        Some(raw_proxy) => Some(UpstreamProxy::parse(&raw_proxy)?),
+        None => None,
+    };
+    let fwd =
+        ProxyForwarder::start_with_options(upstream, blocker, tap).map_err(|e| e.to_string())?;
+    Ok((Some(fwd.chrome_proxy_arg()), Some(fwd)))
 }
 
 struct BackendBundle {
@@ -163,8 +196,16 @@ struct BackendBundle {
 fn launch_desktop_chrome(
     cli: &CliArgs,
     display: Option<String>,
+    responses: &Arc<ResponseStore>,
+    inflight: &InflightCounter,
 ) -> Result<(i32, launcher::LaunchedChrome, Option<ProxyForwarder>), String> {
-    let (chrome_proxy_server, proxy_fwd) = setup_proxy(cli.proxy.clone())?;
+    let (chrome_proxy_server, proxy_fwd) = setup_proxy(
+        cli.proxy.clone(),
+        &cli.block_hosts,
+        cli.ssl_keylog_file.as_ref(),
+        responses,
+        inflight,
+    )?;
     let opts = ChromeLaunchOptions {
         binary_path: None,
         profile_dir: cli.profile_dir.clone(),
@@ -182,7 +223,11 @@ fn launch_desktop_chrome(
 }
 
 #[allow(clippy::too_many_lines)]
-fn build_backend(cli: CliArgs) -> Result<BackendBundle, String> {
+fn build_backend(
+    cli: CliArgs,
+    responses: &Arc<ResponseStore>,
+    inflight: &InflightCounter,
+) -> Result<BackendBundle, String> {
     match cli.backend.as_str() {
         "mock" => Ok(BackendBundle {
             driver: Arc::new(MockDriver::sample_page()),
@@ -194,7 +239,13 @@ fn build_backend(cli: CliArgs) -> Result<BackendBundle, String> {
         }),
         "android" => {
             let (serial, waydroid_session, proxy_fwd) = if cli.launch_waydroid {
-                let (local_proxy, fwd) = setup_proxy(cli.proxy)?;
+                let (local_proxy, fwd) = setup_proxy(
+                    cli.proxy,
+                    &cli.block_hosts,
+                    cli.ssl_keylog_file.as_ref(),
+                    responses,
+                    inflight,
+                )?;
                 let android_proxy = local_proxy.map(|p| {
                     p.strip_prefix("http://")
                         .map_or_else(|| p.clone(), ToOwned::to_owned)
@@ -236,7 +287,8 @@ fn build_backend(cli: CliArgs) -> Result<BackendBundle, String> {
         }
         "macos" => {
             let (target_pid, launched, fwd) = if cli.launch_chrome {
-                let (pid, chrome, proxy_fwd) = launch_desktop_chrome(&cli, None)?;
+                let (pid, chrome, proxy_fwd) =
+                    launch_desktop_chrome(&cli, None, responses, inflight)?;
                 (pid, Some(chrome), proxy_fwd)
             } else if let Some(pid) = cli.pid {
                 (pid, None, None)
@@ -266,7 +318,8 @@ fn build_backend(cli: CliArgs) -> Result<BackendBundle, String> {
             };
 
             let (target_pid, launched, fwd) = if cli.launch_chrome {
-                let (pid, chrome, proxy_fwd) = launch_desktop_chrome(&cli, display_env.clone())?;
+                let (pid, chrome, proxy_fwd) =
+                    launch_desktop_chrome(&cli, display_env.clone(), responses, inflight)?;
                 (Some(pid), Some(chrome), proxy_fwd)
             } else {
                 (cli.pid, None, None)
@@ -284,7 +337,8 @@ fn build_backend(cli: CliArgs) -> Result<BackendBundle, String> {
         }
         "windows" => {
             let (target_pid, launched, fwd) = if cli.launch_chrome {
-                let (pid, chrome, proxy_fwd) = launch_desktop_chrome(&cli, None)?;
+                let (pid, chrome, proxy_fwd) =
+                    launch_desktop_chrome(&cli, None, responses, inflight)?;
                 (Some(pid), Some(chrome), proxy_fwd)
             } else {
                 (cli.pid, None, None)
@@ -345,17 +399,25 @@ fn main() -> ExitCode {
     }
 
     let responses = Arc::new(ResponseStore::default());
-    let _net_tap = cli.ssl_keylog_file.as_ref().and_then(|keylog| {
-        match start_passive_tap(keylog, Arc::clone(&responses)) {
-            Ok(tap) => Some(tap),
-            Err(err) => {
-                tracing::warn!(error = %err, "passive network tap unavailable; continuing without capture");
-                None
+    let inflight = InflightCounter::default();
+    // When `--launch-chrome` is set, the built-in zero-MITM local pass-through proxy handles
+    // passive TLS 1.3 + HTTP/1.1–2 decryption in-process (zero tshark, zero CAP_NET_RAW).
+    // Only fall back to external `tshark` when attaching to an already-running browser PID.
+    let _net_tap = if cli.launch_chrome {
+        None
+    } else {
+        cli.ssl_keylog_file.as_ref().and_then(|keylog| {
+            match start_passive_tap(keylog, Arc::clone(&responses)) {
+                Ok(tap) => Some(tap),
+                Err(err) => {
+                    tracing::warn!(error = %err, "passive network tap unavailable; continuing without capture");
+                    None
+                }
             }
-        }
-    });
+        })
+    };
 
-    let bundle = match build_backend(cli) {
+    let bundle = match build_backend(cli, &responses, &inflight) {
         Ok(bundle) => bundle,
         Err(msg) => {
             tracing::error!(error = %msg, "failed to initialize backend");
@@ -365,6 +427,7 @@ fn main() -> ExitCode {
 
     let options = ServerOptions {
         use_motion: bundle.use_motion,
+        inflight,
     };
 
     if let Some(addr) = tcp_addr {

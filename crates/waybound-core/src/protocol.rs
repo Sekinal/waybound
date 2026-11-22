@@ -39,6 +39,22 @@ pub enum Request {
         /// Semantic locator query.
         query: LocatorQuery,
     },
+    /// Locate an element matching `query` and double-click its center.
+    DblClick {
+        /// Semantic locator query.
+        query: LocatorQuery,
+    },
+    /// Locate a `<select>` or combobox matching `query` and select an option by label or 0-based index.
+    SelectOption {
+        /// Semantic locator query targeting the combobox/select control.
+        query: LocatorQuery,
+        /// Optional visible option label to type/select.
+        #[serde(default)]
+        label: Option<String>,
+        /// Optional 0-based option index (navigated via `Home` + `ArrowDown` * `index` + `Enter`).
+        #[serde(default)]
+        index: Option<usize>,
+    },
     /// Locate an element matching `query`, focus it, and type `text`.
     Fill {
         /// Semantic locator query.
@@ -93,6 +109,13 @@ pub enum Request {
     WaitForResponse {
         /// Case-insensitive URL substring filter.
         url_contains: String,
+        /// Maximum wait time in milliseconds.
+        timeout_ms: u64,
+    },
+    /// Wait until zero HTTP/1.1–2 requests are inflight for at least `idle_ms` (or until `timeout_ms`).
+    WaitForNetworkIdle {
+        /// Continuous idle duration in milliseconds (e.g. 500).
+        idle_ms: u64,
         /// Maximum wait time in milliseconds.
         timeout_ms: u64,
     },
