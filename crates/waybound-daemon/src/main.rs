@@ -6,6 +6,7 @@
 mod launcher;
 mod mock_driver;
 mod net_tap;
+mod peer;
 mod proxy;
 mod server;
 
