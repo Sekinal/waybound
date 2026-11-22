@@ -677,6 +677,8 @@ fn decode_zstd(raw: &[u8]) -> Vec<u8> {
     while !rest.is_empty() && out.len() < limit {
         // Frame_Header_Descriptor bit 2 is Content_Checksum_flag (RFC 8878 §3.1.1.1.1).
         let has_checksum = rest.get(4).is_some_and(|d| d & 0x04 != 0);
+        let frame = rest;
+        let frame_out_start = out.len();
         match decoder.reset(&mut rest) {
             Ok(()) => {}
             Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
@@ -691,8 +693,24 @@ fn decode_zstd(raw: &[u8]) -> Vec<u8> {
             }
             Err(_) => break,
         }
-        if !decode_zstd_frame(&mut decoder, &mut rest, has_checksum, &mut out, limit) {
-            break;
+        match decode_zstd_frame(&mut decoder, &mut rest, has_checksum, &mut out, limit) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(remaining) => {
+                // A corrupt block leaves the decoder's window unreleased and may
+                // have pushed part of that block, so decode the frame again with
+                // a fresh reset, ending it right before the corrupt block.
+                out.truncate(frame_out_start);
+                let complete_len = frame.len().saturating_sub(remaining);
+                let mut patched = frame.get(..complete_len).unwrap_or_default().to_vec();
+                patched.extend_from_slice(&ZSTD_SYNTHETIC_FRAME_END);
+                let mut src = patched.as_slice();
+                if decoder.reset(&mut src).is_ok() {
+                    let _ =
+                        decode_zstd_frame(&mut decoder, &mut src, has_checksum, &mut out, limit);
+                }
+                break;
+            }
         }
     }
     out
@@ -738,16 +756,19 @@ fn peek_zstd_block(rest: &[u8], has_checksum: bool) -> ZstdBlock {
 }
 
 /// Decodes the blocks of the frame whose header `decoder` has just read,
-/// appending to `out` up to `limit` bytes. Returns `true` when the frame ended
-/// in full and the input may hold another frame.
+/// appending to `out` up to `limit` bytes. Returns `Ok(true)` when the frame
+/// ended in full and the input may hold another frame, `Ok(false)` when decoding
+/// should stop, and `Err(n)` when the block starting `n` bytes before the end of
+/// the input is corrupt.
 fn decode_zstd_frame(
     decoder: &mut FrameDecoder,
     rest: &mut &[u8],
     has_checksum: bool,
     out: &mut Vec<u8>,
     limit: usize,
-) -> bool {
+) -> Result<bool, usize> {
     loop {
+        let remaining = rest.len();
         let result = match peek_zstd_block(rest, has_checksum) {
             ZstdBlock::Complete => {
                 decoder.decode_blocks(&mut *rest, BlockDecodingStrategy::UptoBlocks(1))
@@ -766,18 +787,17 @@ fn decode_zstd_frame(
             }
         };
         if result.is_err() {
-            // Corrupt block: keep what was already released.
-            return false;
+            return Err(remaining);
         }
         if let Some(chunk) = decoder.collect() {
             let room = limit.saturating_sub(out.len());
             out.extend_from_slice(chunk.get(..room).unwrap_or(&chunk));
         }
         if out.len() >= limit {
-            return false;
+            return Ok(false);
         }
         if decoder.is_finished() {
-            return true;
+            return Ok(true);
         }
     }
 }
@@ -967,7 +987,7 @@ mod tests {
         );
         let truncated = &compressed[..compressed.len() * 3 / 4];
         let partial = decode_body_bytes(truncated, Some("zstd")).unwrap_or_default();
-        assert!(!partial.is_empty());
+        assert_ne!(partial, "");
         assert!(partial.len() < text.len());
         assert!(text.starts_with(&partial));
     }
@@ -1065,6 +1085,31 @@ mod tests {
         assert_eq!(
             decode_body_bytes(b"plain text", Some("zstd")).as_deref(),
             Some("plain text")
+        );
+    }
+
+    #[test]
+    fn keeps_blocks_before_corrupt_zstd_block() {
+        let good = raw_block_frame(&[b"aaaa", b"bbbb", b"cccc", b""], false);
+        // Drop the empty last block (3 bytes) and replace it with a corrupt one.
+        let prefix = &good[..good.len() - 3];
+
+        // Block_Type 3 (reserved), Block_Size 4, body present.
+        let mut reserved = prefix.to_vec();
+        reserved.extend_from_slice(&[0x26, 0x00, 0x00, 1, 2, 3, 4]);
+        assert_eq!(
+            decode_body_bytes(&reserved, Some("zstd")).as_deref(),
+            Some("aaaabbbbcccc")
+        );
+
+        // Raw block declaring 200000 bytes (over the 128 KiB block maximum), body present.
+        let mut oversized = prefix.to_vec();
+        let header: u32 = 1 | (200_000 << 3);
+        oversized.extend_from_slice(&header.to_le_bytes()[..3]);
+        oversized.extend(std::iter::repeat_n(b'z', 200_000));
+        assert_eq!(
+            decode_body_bytes(&oversized, Some("zstd")).as_deref(),
+            Some("aaaabbbbcccc")
         );
     }
 }
