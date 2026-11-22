@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -513,7 +513,7 @@ pub fn start_passive_tap(ssl_keylog: &Path, store: Arc<ResponseStore>) -> Result
     })?;
 
     let iface = default_interface();
-    let mut cmd = Command::new(&tshark);
+    let mut cmd = waybound_core::process::command(&tshark);
     let _ = cmd
         .args([
             "-l",

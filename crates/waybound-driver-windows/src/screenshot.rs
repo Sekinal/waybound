@@ -64,7 +64,7 @@ try {
 #[cfg(target_os = "windows")]
 pub fn capture_screenshot(output_path: &Path) -> Result<()> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     tracing::debug!(path = %output_path.display(), "capturing Windows screenshot");
@@ -75,7 +75,7 @@ pub fn capture_screenshot(output_path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut cmd = Command::new("powershell.exe");
+    let mut cmd = waybound_core::process::command("powershell.exe");
     let _ = cmd
         .arg("-NoProfile")
         .arg("-NonInteractive")

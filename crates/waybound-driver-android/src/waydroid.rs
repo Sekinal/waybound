@@ -5,7 +5,7 @@
 //! teardown on [`Drop`].
 
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 #[cfg(target_os = "linux")]
 use std::thread;
 #[cfg(target_os = "linux")]
@@ -147,7 +147,7 @@ impl WaydroidSession {
         let weston = if config.headless {
             let args = build_weston_args(&socket_name);
             debug!(?args, "starting headless weston compositor");
-            let child = Command::new("weston")
+            let child = waybound_core::process::command("weston")
                 .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -163,7 +163,7 @@ impl WaydroidSession {
             None
         };
 
-        let mut cmd = Command::new("waydroid");
+        let mut cmd = waybound_core::process::command("waydroid");
         let _ = cmd
             .args(["session", "start"])
             .env("WAYLAND_DISPLAY", &socket_name)
@@ -207,7 +207,7 @@ impl WaydroidSession {
 
 impl Drop for WaydroidSession {
     fn drop(&mut self) {
-        let _ = Command::new("waydroid")
+        let _ = waybound_core::process::command("waydroid")
             .args(["session", "stop"])
             .env("XDG_DATA_HOME", &self.config.data_dir)
             .stdin(Stdio::null())
@@ -230,14 +230,14 @@ impl Drop for WaydroidSession {
 fn wait_for_adb_device(serial: &str) -> Result<()> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     while Instant::now() < deadline {
-        let _ = Command::new("adb")
+        let _ = waybound_core::process::command("adb")
             .args(["connect", serial])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
 
-        if let Ok(output) = Command::new("adb")
+        if let Ok(output) = waybound_core::process::command("adb")
             .args(["-s", serial, "get-state"])
             .stdin(Stdio::null())
             .output()
@@ -261,7 +261,7 @@ fn apply_android_settings(serial: &str, config: &WaydroidConfig) -> Result<()> {
         let escaped = adb::shell_single_quote(proxy);
         let cmd = format!("settings put global http_proxy {escaped}");
         let args = adb::build_adb_args(Some(serial), &["shell", &cmd]);
-        let out = Command::new("adb")
+        let out = waybound_core::process::command("adb")
             .args(&args)
             .stdin(Stdio::null())
             .output()?;
@@ -273,7 +273,7 @@ fn apply_android_settings(serial: &str, config: &WaydroidConfig) -> Result<()> {
         let escaped = adb::shell_single_quote(tz);
         let cmd = format!("setprop persist.sys.timezone {escaped}");
         let args = adb::build_adb_args(Some(serial), &["shell", &cmd]);
-        let out = Command::new("adb")
+        let out = waybound_core::process::command("adb")
             .args(&args)
             .stdin(Stdio::null())
             .output()?;

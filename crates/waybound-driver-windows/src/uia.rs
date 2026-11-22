@@ -387,12 +387,12 @@ while ($queue.Count -gt 0 -and $nodes.Count -lt $maxNodes) {
 #[cfg(target_os = "windows")]
 pub fn query_uia_tree(pid: Option<i32>) -> Result<UiaSnapshot> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     tracing::debug!(?pid, "querying Windows UIAutomation tree");
 
-    let mut cmd = Command::new("powershell.exe");
+    let mut cmd = waybound_core::process::command("powershell.exe");
     let _ = cmd
         .arg("-NoProfile")
         .arg("-NonInteractive")
