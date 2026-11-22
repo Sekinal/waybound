@@ -246,21 +246,52 @@ fn wait_for_element(
     timeout_ms: u64,
 ) -> Result<waybound_core::AccessibilityNode> {
     let clamped_ms = timeout_ms.min(MAX_WAIT_TIMEOUT_MS);
-    let deadline = Instant::now() + Duration::from_millis(clamped_ms);
+    match poll_locate(
+        driver,
+        query,
+        Duration::from_millis(clamped_ms),
+        WAIT_POLL_INTERVAL,
+    ) {
+        Err(WayboundError::ElementNotFound { .. }) => Err(WayboundError::Timeout {
+            timeout_ms: clamped_ms,
+            context: format!("element not found for query: {query:?}"),
+        }),
+        Err(err @ WayboundError::Transient { .. }) => Err(WayboundError::Timeout {
+            timeout_ms: clamped_ms,
+            context: format!("element not found for query: {query:?}; last backend error: {err}"),
+        }),
+        other => other,
+    }
+}
 
+/// Polls `driver.locate(query)` until it succeeds or `wait` elapses.
+///
+/// `ElementNotFound` and transient backend failures (for example an Android UI dump taken
+/// mid-animation) both mean "not ready yet". Any other error is returned at once. When
+/// the deadline passes, the last error is returned unchanged, so a final transient
+/// failure carries its backend message to the caller.
+fn poll_locate(
+    driver: &dyn Driver,
+    query: &LocatorQuery,
+    wait: Duration,
+    interval: Duration,
+) -> Result<waybound_core::AccessibilityNode> {
+    let deadline = Instant::now() + wait;
     loop {
         match driver.locate(query) {
             Ok(node) => return Ok(node),
-            Err(WayboundError::ElementNotFound { .. }) => {
-                if Instant::now() >= deadline {
-                    return Err(WayboundError::Timeout {
-                        timeout_ms: clamped_ms,
-                        context: format!("element not found for query: {query:?}"),
-                    });
+            Err(err)
+                if matches!(
+                    err,
+                    WayboundError::ElementNotFound { .. } | WayboundError::Transient { .. }
+                ) && Instant::now() < deadline =>
+            {
+                if err.is_transient() {
+                    tracing::debug!(error = %err, "transient backend failure while locating; retrying");
                 }
-                thread::sleep(WAIT_POLL_INTERVAL);
+                thread::sleep(interval);
             }
-            Err(other) => return Err(other),
+            Err(err) => return Err(err),
         }
     }
 }
@@ -330,16 +361,7 @@ fn locate_with_auto_wait(
     driver: &dyn Driver,
     query: &LocatorQuery,
 ) -> Result<waybound_core::AccessibilityNode> {
-    let deadline = Instant::now() + DEFAULT_ACTION_WAIT;
-    loop {
-        match driver.locate(query) {
-            Ok(node) => return Ok(node),
-            Err(WayboundError::ElementNotFound { .. }) if Instant::now() < deadline => {
-                thread::sleep(ACTION_POLL_INTERVAL);
-            }
-            Err(err) => return Err(err),
-        }
-    }
+    poll_locate(driver, query, DEFAULT_ACTION_WAIT, ACTION_POLL_INTERVAL)
 }
 
 fn validate_bounds(b: waybound_core::Bounds, query: &LocatorQuery) -> Result<()> {
@@ -541,18 +563,24 @@ fn fill_element(
 fn replace_field_content(driver: &dyn Driver, text: &str, pace: bool) -> Result<()> {
     let select_all_mod = match driver.backend_kind() {
         BackendKind::MacOsNative => KeyModifier::Meta,
-        // `adb shell input` cannot send modifier chords (they are dropped), so a select-all
-        // would type a literal "a". Keep append semantics there until the driver supports it.
-        BackendKind::AndroidWaydroid => return type_text(driver, text, pace),
         _ => KeyModifier::Control,
     };
 
     thread::sleep(Duration::from_millis(40));
-    driver.dispatch_input(&InputEvent::KeyPress {
+    match driver.dispatch_input(&InputEvent::KeyPress {
         key: KeyCode::Char('a'),
         modifiers: vec![select_all_mod],
         hold_ms: 0,
-    })?;
+    }) {
+        Ok(()) => {}
+        // Android before API 31 cannot send Ctrl+A through `adb shell input`; keep append
+        // semantics there rather than failing the whole fill.
+        Err(WayboundError::UnsupportedInput { reason, .. }) => {
+            tracing::debug!(%reason, "select-all unsupported; fill appends to existing text");
+            return type_text(driver, text, pace);
+        }
+        Err(err) => return Err(err),
+    }
     thread::sleep(Duration::from_millis(40));
 
     if text.is_empty() {
@@ -998,6 +1026,155 @@ mod tests {
             vec![
                 (KeyCode::Char('a'), vec![KeyModifier::Meta]),
                 (KeyCode::Backspace, Vec::new()),
+            ]
+        );
+    }
+
+    /// Driver whose `locate` fails transiently `failures` times, then finds the node
+    /// (or keeps failing forever when `failures == usize::MAX`).
+    struct FlakyDriver {
+        inner: MockDriver,
+        failures: usize,
+        calls: AtomicUsize,
+    }
+
+    impl FlakyDriver {
+        fn new(failures: usize) -> Self {
+            Self {
+                inner: MockDriver::sample_page(),
+                failures,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Driver for FlakyDriver {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::AndroidWaydroid
+        }
+
+        fn snapshot_tree(&self) -> Result<Vec<waybound_core::AccessibilityNode>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.failures {
+                return Err(WayboundError::Transient {
+                    backend: "android_waydroid".to_owned(),
+                    reason: format!("ERROR: could not get idle state. (call {call})"),
+                });
+            }
+            self.inner.snapshot_tree()
+        }
+
+        fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
+            self.inner.dispatch_input(event)
+        }
+    }
+
+    #[test]
+    fn wait_for_element_retries_transient_backend_failures() {
+        let driver = FlakyDriver::new(3);
+        let query = LocatorQuery::by_role(Role::TextBox, Some("Origin".to_owned()));
+        let found = wait_for_element(&driver, &query, 5_000);
+        assert!(found.is_ok(), "{found:?}");
+        assert_eq!(driver.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn wait_for_element_timeout_carries_last_transient_error() {
+        let driver = FlakyDriver::new(usize::MAX);
+        let query = LocatorQuery::by_role(Role::TextBox, Some("Origin".to_owned()));
+        let result = wait_for_element(&driver, &query, 200);
+        assert!(
+            matches!(
+                &result,
+                Err(WayboundError::Timeout { timeout_ms: 200, context })
+                    if context.contains("could not get idle state")
+            ),
+            "{result:?}"
+        );
+        assert!(driver.calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    /// Driver whose snapshot always fails with a fatal (non-transient) error.
+    struct FatalDriver(AtomicUsize);
+    impl Driver for FatalDriver {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::AndroidWaydroid
+        }
+        fn snapshot_tree(&self) -> Result<Vec<waybound_core::AccessibilityNode>> {
+            let _ = self.0.fetch_add(1, Ordering::SeqCst);
+            Err(WayboundError::BackendUnavailable {
+                backend: "android_waydroid".to_owned(),
+                reason: "error: device offline".to_owned(),
+            })
+        }
+        fn dispatch_input(&self, _event: &InputEvent) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn auto_wait_returns_last_transient_error_and_stops_on_fatal() {
+        let driver = FlakyDriver::new(usize::MAX);
+        let query = LocatorQuery::by_role(Role::TextBox, Some("Origin".to_owned()));
+        let result = poll_locate(
+            &driver,
+            &query,
+            Duration::from_millis(150),
+            Duration::from_millis(10),
+        );
+        assert!(
+            matches!(result, Err(WayboundError::Transient { ref reason, .. }) if reason.contains("idle state"))
+        );
+
+        let fatal = FatalDriver(AtomicUsize::new(0));
+        let result = poll_locate(
+            &fatal,
+            &query,
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        );
+        assert!(matches!(
+            result,
+            Err(WayboundError::BackendUnavailable { .. })
+        ));
+        assert_eq!(fatal.0.load(Ordering::SeqCst), 1);
+    }
+
+    /// Records key presses but rejects modifier chords, like Android before API 31.
+    struct NoChordDriver(MockDriver);
+
+    impl Driver for NoChordDriver {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::AndroidWaydroid
+        }
+
+        fn snapshot_tree(&self) -> Result<Vec<waybound_core::AccessibilityNode>> {
+            self.0.snapshot_tree()
+        }
+
+        fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
+            if let InputEvent::KeyPress { modifiers, .. } = event
+                && !modifiers.is_empty()
+            {
+                return Err(WayboundError::UnsupportedInput {
+                    backend: "android_waydroid".to_owned(),
+                    reason: "no keycombination".to_owned(),
+                });
+            }
+            self.0.dispatch_input(event)
+        }
+    }
+
+    #[test]
+    fn fill_appends_when_select_all_is_unsupported() {
+        let driver = NoChordDriver(MockDriver::sample_page());
+        let query = LocatorQuery::by_role(Role::TextBox, Some("Origin".to_owned()));
+        assert!(fill_element(&driver, &state(), &query, "NR").is_ok());
+        assert_eq!(
+            key_events(&driver.0),
+            vec![
+                (KeyCode::Char('N'), Vec::new()),
+                (KeyCode::Char('R'), Vec::new()),
             ]
         );
     }

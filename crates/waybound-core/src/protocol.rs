@@ -185,6 +185,8 @@ impl From<&WayboundError> for Response {
             WayboundError::BackendUnavailable { .. } => "backend_unavailable",
             WayboundError::Timeout { .. } => "timeout",
             WayboundError::Io(_) => "io_error",
+            WayboundError::Transient { .. } => "transient",
+            WayboundError::UnsupportedInput { .. } => "unsupported_input",
         };
         Self::Error {
             code: code.to_owned(),
@@ -228,5 +230,33 @@ mod tests {
             let decoded: Result<Request, _> = serde_json::from_value(legacy);
             assert_eq!(decoded.ok(), Some(expected.clone()), "method {method}");
         }
+    }
+
+    #[test]
+    fn transient_and_unsupported_input_errors_have_distinct_codes() {
+        let transient = WayboundError::Transient {
+            backend: "android_waydroid".to_owned(),
+            reason: "ERROR: could not get idle state.".to_owned(),
+        };
+        assert!(transient.is_transient());
+        assert_eq!(
+            Response::from(&transient),
+            Response::Error {
+                code: "transient".to_owned(),
+                message:
+                    "transient backend failure: android_waydroid (ERROR: could not get idle state.)"
+                        .to_owned(),
+            }
+        );
+
+        let unsupported = WayboundError::UnsupportedInput {
+            backend: "android_waydroid".to_owned(),
+            reason: "Control+a needs API 31".to_owned(),
+        };
+        assert!(!unsupported.is_transient());
+        assert!(matches!(
+            Response::from(&unsupported),
+            Response::Error { code, .. } if code == "unsupported_input"
+        ));
     }
 }

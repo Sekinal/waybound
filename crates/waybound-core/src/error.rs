@@ -36,4 +36,34 @@ pub enum WayboundError {
     /// Underlying I/O or IPC failure.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A backend call failed for a reason expected to clear on its own, such as an
+    /// Android `uiautomator dump` taken while the screen is still animating.
+    ///
+    /// Wait loops treat this as "not ready yet" and keep polling until their deadline.
+    #[error("transient backend failure: {backend} ({reason})")]
+    Transient {
+        /// Backend identifier.
+        backend: String,
+        /// Explanation of the failure, including the backend's own message.
+        reason: String,
+    },
+
+    /// The backend cannot express the requested input (for example a modifier chord
+    /// on an Android version without `input keycombination`).
+    #[error("unsupported input for {backend}: {reason}")]
+    UnsupportedInput {
+        /// Backend identifier.
+        backend: String,
+        /// Which part of the input cannot be delivered, and why.
+        reason: String,
+    },
+}
+
+impl WayboundError {
+    /// Returns `true` for failures that a retry may heal ([`WayboundError::Transient`]).
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient { .. })
+    }
 }

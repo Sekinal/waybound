@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from waybound import (
     AccessibilityNode,
     Bounds,
@@ -11,6 +13,7 @@ from waybound import (
     Page,
     Role,
 )
+from waybound.transport import WayboundDaemonError
 
 
 class FakeTransport:
@@ -133,3 +136,49 @@ def test_page_semantic_locators() -> None:
         ("scroll", (0.0, -250.0)),
         ("press", ("enter", ())),
     ]
+
+
+class FlakyUrlTransport(FakeTransport):
+    """Transport whose `current_url` fails with daemon errors before answering."""
+
+    def __init__(self, failures: list[WayboundDaemonError], url: str | None) -> None:
+        super().__init__()
+        self.failures = failures
+        self.url = url
+        self.calls = 0
+
+    def current_url(self) -> str | None:
+        self.calls += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        return self.url
+
+
+def _transient(n: int) -> WayboundDaemonError:
+    return WayboundDaemonError(
+        "transient",
+        f"transient backend failure: android_waydroid (ERROR: could not get idle state. #{n})",
+    )
+
+
+def test_wait_for_url_retries_transient_failures() -> None:
+    transport = FlakyUrlTransport([_transient(1), _transient(2), _transient(3)], "https://ok.test/")
+    assert Page(transport).wait_for_url("ok.test", timeout_ms=5_000) == "https://ok.test/"
+    assert transport.calls == 4
+
+
+def test_wait_for_url_timeout_carries_last_transient_error() -> None:
+    transport = FlakyUrlTransport([_transient(n) for n in range(1_000)], None)
+    with pytest.raises(WayboundDaemonError) as info:
+        Page(transport).wait_for_url("ok.test", timeout_ms=200)
+    assert info.value.code == "timeout"
+    assert "could not get idle state" in str(info.value)
+
+
+def test_wait_for_url_raises_fatal_errors_immediately() -> None:
+    fatal = WayboundDaemonError("backend_unavailable", "error: device offline")
+    transport = FlakyUrlTransport([fatal], "https://ok.test/")
+    with pytest.raises(WayboundDaemonError) as info:
+        Page(transport).wait_for_url("ok.test", timeout_ms=5_000)
+    assert info.value is fatal
+    assert transport.calls == 1

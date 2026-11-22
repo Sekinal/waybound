@@ -19,6 +19,11 @@ use waybound_core::{
 pub struct AndroidDriver {
     serial: Option<String>,
     cursor: Mutex<Point>,
+    /// Serialises `uiautomator dump`: two concurrent dumps on one device make each other
+    /// fail (`UiAutomationService ... already registered`).
+    dump_lock: Mutex<()>,
+    /// Device API level decides how modifier chords are sent; probed once on first use.
+    chords: adb::ChordSupportCache,
 }
 
 impl AndroidDriver {
@@ -31,6 +36,8 @@ impl AndroidDriver {
         Self {
             serial,
             cursor: Mutex::new(Point { x: 0.0, y: 0.0 }),
+            dump_lock: Mutex::new(()),
+            chords: adb::ChordSupportCache::new(),
         }
     }
 
@@ -49,6 +56,18 @@ impl AndroidDriver {
     pub fn open_url(&self, url: &str) -> Result<()> {
         adb::open_chrome_url(self.serial.as_deref(), url)
     }
+
+    /// Dumps the UI hierarchy, retrying transient `uiautomator` failures briefly.
+    fn dump_xml(&self) -> Result<String> {
+        let _guard = self
+            .dump_lock
+            .lock()
+            .map_err(|_| WayboundError::BackendUnavailable {
+                backend: "android_waydroid".to_owned(),
+                reason: "uiautomator dump mutex poisoned".to_owned(),
+            })?;
+        adb::dump_ui_xml_with_retry(self.serial.as_deref(), &adb::SystemClock)
+    }
 }
 
 impl Driver for AndroidDriver {
@@ -57,12 +76,12 @@ impl Driver for AndroidDriver {
     }
 
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
-        let raw_xml = adb::dump_ui_xml(self.serial.as_deref())?;
+        let raw_xml = self.dump_xml()?;
         Ok(xml::parse_uiautomator_xml(&raw_xml))
     }
 
     fn current_url(&self) -> Result<Option<String>> {
-        let raw_xml = adb::dump_ui_xml(self.serial.as_deref())?;
+        let raw_xml = self.dump_xml()?;
         Ok(xml::extract_chrome_url(&raw_xml))
     }
 
@@ -83,7 +102,7 @@ impl Driver for AndroidDriver {
                 backend: "android_waydroid".to_owned(),
                 reason: "cursor state mutex poisoned".to_owned(),
             })?;
-        adb::dispatch_input(self.serial.as_deref(), event, &mut guard)
+        adb::dispatch_input(self.serial.as_deref(), event, &mut guard, &self.chords)
     }
 }
 
