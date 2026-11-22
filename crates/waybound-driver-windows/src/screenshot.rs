@@ -28,7 +28,7 @@ pub fn validate_png_bytes(bytes: &[u8]) -> Result<()> {
 const SCREENSHOT_TIMEOUT_MS: u64 = 10_000;
 
 #[cfg(target_os = "windows")]
-const SCREENSHOT_POWERSHELL_SCRIPT: &str = r#"
+const SCREENSHOT_POWERSHELL_SCRIPT: &str = r"
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -51,7 +51,7 @@ try {
 } finally {
     $bitmap.Dispose()
 }
-"#;
+";
 
 /// Captures a PNG screenshot of the primary Windows desktop to `output_path` using
 /// `powershell.exe` and `System.Drawing.Bitmap::CopyFromScreen`, then validates the PNG header.

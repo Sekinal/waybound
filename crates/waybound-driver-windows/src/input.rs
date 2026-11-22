@@ -154,12 +154,11 @@ pub mod win32_input {
             backend: "windows".to_owned(),
             reason: "input batch exceeds u32::MAX".to_owned(),
         })?;
-        let cb_size = i32::try_from(std::mem::size_of::<Input>()).map_err(|_| {
-            WayboundError::BackendUnavailable {
+        let cb_size =
+            i32::try_from(size_of::<Input>()).map_err(|_| WayboundError::BackendUnavailable {
                 backend: "windows".to_owned(),
                 reason: "INPUT struct size exceeds i32::MAX".to_owned(),
-            }
-        })?;
+            })?;
 
         // SAFETY: `inputs.as_ptr()` points to a valid contiguous array of `count` `Input`
         // structs whose `#[repr(C)]` layout matches Win32 `INPUT` of size `cb_size`.
