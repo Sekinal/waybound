@@ -116,14 +116,49 @@ enum DecoderState {
     Tls13(Box<PassiveTls13Decoder>),
 }
 
+/// Application-data plaintext decrypted by one [`PassiveTlsDecoder::feed`] call.
+///
+/// A single feed can yield plaintext for *both* directions: replaying buffered bytes once
+/// the version is known, or releasing records queued while the keylog line was missing.
+/// Consumers that correlate requests with responses should process
+/// [`Self::client_to_server`] before [`Self::server_to_client`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Plaintext {
+    /// Decrypted browser -> origin bytes.
+    pub client_to_server: Vec<u8>,
+    /// Decrypted origin -> browser bytes.
+    pub server_to_client: Vec<u8>,
+}
+
+impl Plaintext {
+    /// Returns `true` when neither direction produced plaintext.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.client_to_server.is_empty() && self.server_to_client.is_empty()
+    }
+
+    /// Returns the plaintext for `dir`.
+    #[must_use]
+    pub fn get(&self, dir: Direction) -> &[u8] {
+        match dir {
+            Direction::ClientToServer => &self.client_to_server,
+            Direction::ServerToClient => &self.server_to_client,
+        }
+    }
+
+    fn push(&mut self, dir: Direction, bytes: &[u8]) {
+        match dir {
+            Direction::ClientToServer => self.client_to_server.extend_from_slice(bytes),
+            Direction::ServerToClient => self.server_to_client.extend_from_slice(bytes),
+        }
+    }
+}
+
 /// Passive bidirectional TLS 1.2 / 1.3 decryptor for a single TCP connection.
 #[derive(Debug)]
 pub struct PassiveTlsDecoder {
     keylog: KeyLogStore,
     state: DecoderState,
-    /// Plaintext produced for the opposite direction while replaying buffered bytes.
-    carry_c2s: Vec<u8>,
-    carry_s2c: Vec<u8>,
 }
 
 impl PassiveTlsDecoder {
@@ -136,8 +171,6 @@ impl PassiveTlsDecoder {
                 c2s: Vec::new(),
                 s2c: Vec::new(),
             },
-            carry_c2s: Vec::new(),
-            carry_s2c: Vec::new(),
         }
     }
 
@@ -151,35 +184,19 @@ impl PassiveTlsDecoder {
         }
     }
 
-    /// Takes plaintext for `dir` that was decrypted while replaying buffered ciphertext
-    /// during a [`Self::feed`] call for the opposite direction.
-    ///
-    /// [`Self::feed`] also returns this data on the next call for `dir`; callers that
-    /// care about cross-direction ordering (request before response) drain it right after
-    /// each feed.
-    pub fn take_carried(&mut self, dir: Direction) -> Vec<u8> {
-        std::mem::take(match dir {
-            Direction::ClientToServer => &mut self.carry_c2s,
-            Direction::ServerToClient => &mut self.carry_s2c,
-        })
-    }
-
-    /// Feeds raw ciphertext bytes for `dir` and returns any decrypted application-data plaintext.
-    pub fn feed(&mut self, dir: Direction, data: &[u8]) -> Vec<u8> {
-        let mut out = self.take_carried(dir);
+    /// Feeds raw ciphertext bytes observed in `dir` and returns any decrypted
+    /// application-data plaintext, for either direction.
+    pub fn feed(&mut self, dir: Direction, data: &[u8]) -> Plaintext {
+        let mut out = Plaintext::default();
         let detected = match &mut self.state {
             DecoderState::Tls12(dec) => {
-                out.extend_from_slice(&dec.feed(dir, data));
+                out.push(dir, &dec.feed(dir, data));
                 // Keys may have just become available for records queued on the other side.
-                let flushed = dec.flush(dir.opposite());
-                match dir {
-                    Direction::ClientToServer => self.carry_s2c.extend_from_slice(&flushed),
-                    Direction::ServerToClient => self.carry_c2s.extend_from_slice(&flushed),
-                }
+                out.push(dir.opposite(), &dec.flush(dir.opposite()));
                 return out;
             }
             DecoderState::Tls13(dec) => {
-                out.extend_from_slice(&dec.feed(dir, data));
+                out.push(dir, &dec.feed(dir, data));
                 return out;
             }
             DecoderState::Detecting { c2s, s2c } => {
@@ -197,12 +214,12 @@ impl PassiveTlsDecoder {
             }
         };
         if let Some(version) = detected {
-            self.switch_to(version, dir, &mut out);
+            self.switch_to(version, &mut out);
         }
         out
     }
 
-    fn switch_to(&mut self, version: TlsVersion, dir: Direction, out: &mut Vec<u8>) {
+    fn switch_to(&mut self, version: TlsVersion, out: &mut Plaintext) {
         let placeholder = DecoderState::Detecting {
             c2s: Vec::new(),
             s2c: Vec::new(),
@@ -213,30 +230,37 @@ impl PassiveTlsDecoder {
         };
         let keylog = self.keylog.clone();
         // Replay the client side first so `client_random` is known before the ServerHello.
-        let (plain_c2s, plain_s2c) = match version {
+        match version {
             TlsVersion::Tls12 => {
                 let mut dec = Box::new(PassiveTls12Decoder::new(keylog));
-                let mut c = dec.feed(Direction::ClientToServer, &c2s);
-                let s = dec.feed(Direction::ServerToClient, &s2c);
+                out.push(
+                    Direction::ClientToServer,
+                    &dec.feed(Direction::ClientToServer, &c2s),
+                );
+                out.push(
+                    Direction::ServerToClient,
+                    &dec.feed(Direction::ServerToClient, &s2c),
+                );
                 // Client records queued before the ServerHello supplied `server_random`.
-                c.extend_from_slice(&dec.flush(Direction::ClientToServer));
+                out.push(
+                    Direction::ClientToServer,
+                    &dec.flush(Direction::ClientToServer),
+                );
                 self.state = DecoderState::Tls12(dec);
-                (c, s)
             }
             TlsVersion::Tls13 => {
                 let mut dec = Box::new(PassiveTls13Decoder::new(keylog));
-                let c = dec.feed(Direction::ClientToServer, &c2s);
-                let s = dec.feed(Direction::ServerToClient, &s2c);
+                out.push(
+                    Direction::ClientToServer,
+                    &dec.feed(Direction::ClientToServer, &c2s),
+                );
+                out.push(
+                    Direction::ServerToClient,
+                    &dec.feed(Direction::ServerToClient, &s2c),
+                );
                 self.state = DecoderState::Tls13(dec);
-                (c, s)
             }
-        };
-        let (same, other, other_carry) = match dir {
-            Direction::ClientToServer => (plain_c2s, plain_s2c, &mut self.carry_s2c),
-            Direction::ServerToClient => (plain_s2c, plain_c2s, &mut self.carry_c2s),
-        };
-        out.extend_from_slice(&same);
-        other_carry.extend_from_slice(&other);
+        }
     }
 }
 
@@ -303,9 +327,15 @@ mod tests {
         let mut dec = PassiveTlsDecoder::new(store);
         let rec12 = server_hello_record(0xc02b, &[]);
         let (first, rest) = rec12.split_at(10);
-        assert!(dec.feed(Direction::ServerToClient, first).is_empty());
+        assert_eq!(
+            dec.feed(Direction::ServerToClient, first),
+            Plaintext::default()
+        );
         assert_eq!(dec.version(), None);
-        assert!(dec.feed(Direction::ServerToClient, rest).is_empty());
+        assert_eq!(
+            dec.feed(Direction::ServerToClient, rest),
+            Plaintext::default()
+        );
         assert_eq!(dec.version(), Some(TlsVersion::Tls12));
     }
 

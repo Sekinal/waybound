@@ -285,6 +285,11 @@ pub struct PassiveTls12Decoder {
     client_random: Option<[u8; 32]>,
     server_random: Option<[u8; 32]>,
     cipher_suite: Option<Tls12CipherSuite>,
+    /// Keylog generation at the last `CLIENT_RANDOM` miss (skips re-searching unchanged data).
+    last_keylog_miss: Option<u64>,
+    /// Set when the connection cannot be decrypted (unsupported suite or queue overflow);
+    /// all buffers are released and later bytes are ignored.
+    abandoned: bool,
     c2s: DirState,
     s2c: DirState,
 }
@@ -298,6 +303,8 @@ impl PassiveTls12Decoder {
             client_random: None,
             server_random: None,
             cipher_suite: None,
+            last_keylog_miss: None,
+            abandoned: false,
             c2s: DirState::default(),
             s2c: DirState::default(),
         }
@@ -310,9 +317,19 @@ impl PassiveTls12Decoder {
         }
     }
 
+    /// Stops decrypting this connection and frees everything buffered for it.
+    fn abandon(&mut self) {
+        self.abandoned = true;
+        self.c2s = DirState::default();
+        self.s2c = DirState::default();
+    }
+
     /// Feeds raw ciphertext bytes for `dir` and returns any decrypted application-data plaintext.
     pub fn feed(&mut self, dir: Direction, data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
+        if self.abandoned {
+            return out;
+        }
         let buf = self.dir_mut(dir);
         if buf.raw.len().saturating_add(data.len()) > MAX_PENDING_CIPHERTEXT * 2 {
             // Prevent unbounded growth on non-TLS or unsupported streams.
@@ -325,21 +342,29 @@ impl PassiveTls12Decoder {
     }
 
     fn drain_records(&mut self, dir: Direction, out: &mut Vec<u8>) {
+        // Walk complete records with a cursor and compact the buffer once at the end.
+        let mut pos = 0usize;
         loop {
             let buf = self.dir_mut(dir);
-            let Some(header) = buf.raw.first_chunk::<5>().copied() else {
+            let Some(header) = buf
+                .raw
+                .get(pos..)
+                .and_then(<[u8]>::first_chunk::<5>)
+                .copied()
+            else {
                 break;
             };
             let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
             if len > MAX_TLS_RECORD_LEN {
                 // Not valid TLS framing; drop buffer to avoid stalling.
                 buf.raw.clear();
-                break;
+                return;
             }
-            let Some(payload) = buf.raw.get(5..5 + len).map(<[u8]>::to_vec) else {
+            let start = pos + 5;
+            let Some(payload) = buf.raw.get(start..start + len).map(<[u8]>::to_vec) else {
                 break;
             };
-            let _ = buf.raw.drain(..5 + len);
+            pos = start + len;
 
             if buf.encrypted {
                 let seq = buf.next_seq;
@@ -351,7 +376,13 @@ impl PassiveTls12Decoder {
             } else if header[0] == CONTENT_TYPE_HANDSHAKE {
                 self.inspect_plaintext_handshake(dir, &payload);
             }
+            if self.abandoned {
+                return;
+            }
         }
+        let buf = self.dir_mut(dir);
+        let consumed = pos.min(buf.raw.len());
+        let _ = buf.raw.drain(..consumed);
     }
 
     fn inspect_plaintext_handshake(&mut self, dir: Direction, payload: &[u8]) {
@@ -371,6 +402,10 @@ impl PassiveTls12Decoder {
                 {
                     self.server_random = Some(hello.random);
                     self.cipher_suite = Tls12CipherSuite::from_u16(hello.cipher_suite);
+                    if self.cipher_suite.is_none() {
+                        // CBC or another suite we cannot decrypt: never queue anything.
+                        self.abandon();
+                    }
                 }
             }
         }
@@ -387,7 +422,7 @@ impl PassiveTls12Decoder {
         };
         let Some(master_secret) = self
             .keylog
-            .lookup(&client_random)
+            .lookup_if_changed(&client_random, &mut self.last_keylog_miss)
             .and_then(|secrets| secrets.master_secret)
         else {
             return false;
@@ -416,18 +451,20 @@ impl PassiveTls12Decoder {
             header,
             payload,
         };
-        if !keys_ready {
-            // Keep the record with its sequence number so it decrypts once the keylog catches up.
-            if buf.pending.len() < MAX_PENDING_RECORDS
-                && buf.pending_bytes.saturating_add(record.payload.len()) <= MAX_PENDING_CIPHERTEXT
-            {
-                buf.pending_bytes = buf.pending_bytes.saturating_add(record.payload.len());
-                buf.pending.push(record);
-            }
+        if keys_ready {
+            buf.pending.push(record);
+            buf.decrypt_pending(out);
             return;
         }
+        // Keep the record with its sequence number so it decrypts once the keylog catches up.
+        let bytes = buf.pending_bytes.saturating_add(record.payload.len());
+        if buf.pending.len() >= MAX_PENDING_RECORDS || bytes > MAX_PENDING_CIPHERTEXT {
+            // The keylog line is not coming in time; a gap would desync the HTTP stream anyway.
+            self.abandon();
+            return;
+        }
+        buf.pending_bytes = bytes;
         buf.pending.push(record);
-        buf.decrypt_pending(out);
     }
 
     /// Decrypts records of `dir` that were queued while the master secret was unavailable.
@@ -449,7 +486,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::tls::{PassiveTlsDecoder, TlsVersion};
+    use crate::tls::{PassiveTlsDecoder, Plaintext, TlsVersion};
     use waybound_core::CapturedResponse;
 
     use crate::{InflightCounter, PassiveConnectionTap};
@@ -724,14 +761,16 @@ mod tests {
         for exp in [AES128, AES256, CHACHA] {
             let (c2s, s2c) = transcript(&exp);
             let mut dec = PassiveTlsDecoder::new(keylog_with(master_secret()));
-            let client_plain = dec.feed(Direction::ClientToServer, &c2s);
             // No ServerHello yet, so nothing can be decrypted.
-            assert!(client_plain.is_empty());
-            let server_plain = dec.feed(Direction::ServerToClient, &s2c);
+            assert_eq!(
+                dec.feed(Direction::ClientToServer, &c2s),
+                Plaintext::default()
+            );
+            // The ServerHello reveals TLS 1.2; buffered client bytes are replayed too.
+            let plain = dec.feed(Direction::ServerToClient, &s2c);
             assert_eq!(dec.version(), Some(TlsVersion::Tls12));
-            assert_eq!(server_plain, RESPONSE);
-            // Client application data buffered during detection is returned on the next feed.
-            assert_eq!(dec.feed(Direction::ClientToServer, &[]), REQUEST);
+            assert_eq!(plain.client_to_server, REQUEST);
+            assert_eq!(plain.server_to_client, RESPONSE);
         }
     }
 
@@ -751,14 +790,17 @@ mod tests {
                 if c.is_none() && s.is_none() {
                     break;
                 }
-                if let Some(c) = c {
-                    client_out.extend(dec.feed(Direction::ClientToServer, c));
-                }
-                if let Some(s) = s {
-                    server_out.extend(dec.feed(Direction::ServerToClient, s));
+                for (dir, chunk) in [
+                    (Direction::ClientToServer, c),
+                    (Direction::ServerToClient, s),
+                ] {
+                    if let Some(chunk) = chunk {
+                        let plain = dec.feed(dir, chunk);
+                        client_out.extend_from_slice(&plain.client_to_server);
+                        server_out.extend_from_slice(&plain.server_to_client);
+                    }
                 }
             }
-            client_out.extend(dec.feed(Direction::ClientToServer, &[]));
             assert_eq!(client_out, REQUEST);
             assert_eq!(server_out, RESPONSE);
         }
@@ -769,18 +811,59 @@ mod tests {
         let (c2s, s2c) = transcript(&AES128);
         let store = KeyLogStore::new("/nonexistent/test.keylog");
         let mut dec = PassiveTls12Decoder::new(store.clone());
-        assert!(dec.feed(Direction::ClientToServer, &c2s).is_empty());
+        assert_eq!(dec.feed(Direction::ClientToServer, &c2s), Vec::<u8>::new());
         let (early, late) = s2c.split_at(s2c.len() - 30);
-        assert!(dec.feed(Direction::ServerToClient, early).is_empty());
+        assert_eq!(dec.feed(Direction::ServerToClient, early), Vec::<u8>::new());
+        // A repeated miss with an unchanged keylog does not search again.
+        let miss = dec.last_keylog_miss;
+        assert_ne!(miss, None);
+        assert_eq!(dec.flush(Direction::ClientToServer), Vec::<u8>::new());
+        assert_eq!(dec.last_keylog_miss, miss);
 
         store.insert_master_secret_for_test(CLIENT_RANDOM, master_secret());
         assert_eq!(dec.feed(Direction::ServerToClient, late), RESPONSE);
         // The client side still has its queued request; an explicit flush releases it.
         assert_eq!(dec.flush(Direction::ClientToServer), REQUEST);
-        assert!(dec.flush(Direction::ClientToServer).is_empty());
+        assert_eq!(dec.flush(Direction::ClientToServer), Vec::<u8>::new());
         // Later records keep the sequence numbering intact.
         let next = seal_record(&AES128, true, 2, CONTENT_TYPE_APPLICATION_DATA, b"!");
         assert_eq!(dec.feed(Direction::ClientToServer, &next), b"!");
+    }
+
+    #[test]
+    fn queue_overflow_and_unsupported_suite_release_buffers() {
+        let store = KeyLogStore::new("/nonexistent/test.keylog");
+        let mut dec = PassiveTls12Decoder::new(store.clone());
+        let _ = dec.feed(Direction::ClientToServer, &client_hello());
+        let _ = dec.feed(Direction::ServerToClient, &server_hello(AES128.suite_id));
+        let _ = dec.feed(Direction::ServerToClient, &CCS);
+        for seq in 0..u64::try_from(MAX_PENDING_RECORDS).unwrap_or(0) {
+            let rec = seal_record(&AES128, false, seq, CONTENT_TYPE_APPLICATION_DATA, b"x");
+            assert_eq!(dec.feed(Direction::ServerToClient, &rec), Vec::<u8>::new());
+        }
+        assert_eq!(dec.s2c.pending.len(), MAX_PENDING_RECORDS);
+        let rec = seal_record(&AES128, false, 32, CONTENT_TYPE_APPLICATION_DATA, b"x");
+        assert_eq!(dec.feed(Direction::ServerToClient, &rec), Vec::<u8>::new());
+        assert!(dec.abandoned);
+        assert_eq!(dec.s2c.pending.len(), 0);
+        assert_eq!(dec.s2c.raw.capacity(), 0);
+        // Even once the key shows up, the gapped connection stays abandoned.
+        store.insert_master_secret_for_test(CLIENT_RANDOM, master_secret());
+        let rec = seal_record(&AES128, false, 33, CONTENT_TYPE_APPLICATION_DATA, b"y");
+        assert_eq!(dec.feed(Direction::ServerToClient, &rec), Vec::<u8>::new());
+
+        // A CBC ServerHello abandons immediately: nothing is queued afterwards.
+        let mut dec = PassiveTls12Decoder::new(keylog_with(master_secret()));
+        let _ = dec.feed(Direction::ClientToServer, &client_hello());
+        let _ = dec.feed(Direction::ServerToClient, &server_hello(0xc013));
+        assert!(dec.abandoned);
+        let _ = dec.feed(Direction::ServerToClient, &CCS);
+        assert_eq!(
+            dec.feed(Direction::ServerToClient, &record(23, &[0u8; 64])),
+            Vec::<u8>::new()
+        );
+        assert_eq!(dec.s2c.pending.len(), 0);
+        assert_eq!(dec.s2c.raw.len(), 0);
     }
 
     #[test]
@@ -789,9 +872,14 @@ mod tests {
         let mut wrong = master_secret();
         wrong[0] ^= 1;
         let mut dec = PassiveTlsDecoder::new(keylog_with(wrong));
-        assert!(dec.feed(Direction::ClientToServer, &c2s).is_empty());
-        assert!(dec.feed(Direction::ServerToClient, &s2c).is_empty());
-        assert!(dec.feed(Direction::ClientToServer, &[]).is_empty());
+        assert_eq!(
+            dec.feed(Direction::ClientToServer, &c2s),
+            Plaintext::default()
+        );
+        assert_eq!(
+            dec.feed(Direction::ServerToClient, &s2c),
+            Plaintext::default()
+        );
 
         // Protected records that are too short, oversized framing, and random bytes.
         for exp in [AES128, CHACHA] {
@@ -801,40 +889,31 @@ mod tests {
             let _ = dec.feed(Direction::ServerToClient, &CCS);
             for len in 0..40 {
                 let body: Vec<u8> = (0..len).map(|i| u8::try_from(i).unwrap_or(0)).collect();
-                assert!(
-                    dec.feed(Direction::ServerToClient, &record(23, &body))
-                        .is_empty()
+                assert_eq!(
+                    dec.feed(Direction::ServerToClient, &record(23, &body)),
+                    Vec::<u8>::new()
                 );
             }
-            assert!(
-                dec.feed(Direction::ServerToClient, &[23, 3, 3, 0xff, 0xff, 0])
-                    .is_empty()
+            assert_eq!(
+                dec.feed(Direction::ServerToClient, &[23, 3, 3, 0xff, 0xff, 0]),
+                Vec::<u8>::new()
             );
             let junk: Vec<u8> = (0u32..4096)
                 .map(|i| u8::try_from(i.wrapping_mul(2_654_435_761) >> 24).unwrap_or(0))
                 .collect();
-            assert!(dec.feed(Direction::ClientToServer, &junk).is_empty());
+            assert_eq!(dec.feed(Direction::ClientToServer, &junk), Vec::<u8>::new());
         }
-
-        // A ServerHello with an unsupported (CBC) suite never yields keys.
-        let mut dec = PassiveTls12Decoder::new(keylog_with(master_secret()));
-        let _ = dec.feed(Direction::ClientToServer, &client_hello());
-        let _ = dec.feed(Direction::ServerToClient, &server_hello(0xc013));
-        let _ = dec.feed(Direction::ServerToClient, &CCS);
-        assert!(
-            dec.feed(Direction::ServerToClient, &record(23, &[0u8; 64]))
-                .is_empty()
-        );
     }
 
-    #[test]
-    fn passive_tap_correlates_tls12_http_exchange() {
-        let captured: Arc<Mutex<Vec<CapturedResponse>>> = Arc::new(Mutex::new(Vec::new()));
+    type Captured = Arc<Mutex<Vec<CapturedResponse>>>;
+
+    fn tap_with(store: KeyLogStore) -> (PassiveConnectionTap, Captured, InflightCounter) {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
         let cap_clone = Arc::clone(&captured);
         let inflight = InflightCounter::default();
         let tap = PassiveConnectionTap::new(
             "old.example.com".to_owned(),
-            keylog_with(master_secret()),
+            store,
             inflight.clone(),
             Arc::new(move |_, resp| {
                 if let Ok(mut g) = cap_clone.lock() {
@@ -842,16 +921,49 @@ mod tests {
                 }
             }),
         );
-        let (c2s, s2c) = transcript(&AES256);
-        tap.observe(Direction::ClientToServer, &c2s);
-        // The request is replayed when the ServerHello reveals TLS 1.2 and must reach the
-        // correlator before the response decrypted in the same call.
-        tap.observe(Direction::ServerToClient, &s2c);
+        (tap, captured, inflight)
+    }
+
+    fn assert_single_legacy_response(captured: &Captured, inflight: &InflightCounter) {
         let list = captured.lock().map(|g| g.clone()).unwrap_or_default();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].url, "https://old.example.com/legacy");
         assert_eq!(list[0].status, 200);
         assert_eq!(list[0].body.as_deref(), Some("hello"));
         assert_eq!(inflight.get(), 0);
+    }
+
+    #[test]
+    fn passive_tap_correlates_tls12_http_exchange() {
+        let (tap, captured, inflight) = tap_with(keylog_with(master_secret()));
+        let (c2s, s2c) = transcript(&AES256);
+        tap.observe(Direction::ClientToServer, &c2s);
+        // The request is replayed when the ServerHello reveals TLS 1.2 and must reach the
+        // correlator before the response decrypted in the same call.
+        tap.observe(Direction::ServerToClient, &s2c);
+        assert_single_legacy_response(&captured, &inflight);
+    }
+
+    /// Regression: with the keylog line late, both directions are queued; whichever direction
+    /// next delivers a record releases both queues, and the request must still go first.
+    #[test]
+    fn passive_tap_orders_request_first_when_keylog_arrives_late() {
+        for trigger in [Direction::ClientToServer, Direction::ServerToClient] {
+            let store = KeyLogStore::new("/nonexistent/test.keylog");
+            let (tap, captured, inflight) = tap_with(store.clone());
+            let (c2s, s2c) = transcript(&CHACHA);
+            tap.observe(Direction::ClientToServer, &c2s);
+            tap.observe(Direction::ServerToClient, &s2c);
+            assert_eq!(captured.lock().map_or(1, |g| g.len()), 0);
+
+            store.insert_master_secret_for_test(CLIENT_RANDOM, master_secret());
+            // An encrypted alert carries no plaintext but releases the queued records.
+            let alert = match trigger {
+                Direction::ClientToServer => seal_record(&CHACHA, true, 2, 21, &[1, 0]),
+                Direction::ServerToClient => seal_record(&CHACHA, false, 4, 21, &[1, 0]),
+            };
+            tap.observe(trigger, &alert);
+            assert_single_legacy_response(&captured, &inflight);
+        }
     }
 }

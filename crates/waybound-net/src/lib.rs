@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 pub use http::{HttpConnectionCorrelator, InflightCounter, ResponseCallback, decode_body_bytes};
 pub use keylog::{KeyLogStore, TrafficSecrets};
-pub use tls::{PassiveTlsDecoder, TlsVersion};
+pub use tls::{PassiveTlsDecoder, Plaintext, TlsVersion};
 pub use tls12::{PassiveTls12Decoder, Tls12CipherSuite};
 pub use tls13::{Direction, PassiveTls13Decoder, Tls13CipherSuite};
 
@@ -65,24 +65,15 @@ impl PassiveConnectionTap {
         }
         if let Ok(mut guard) = self.inner.lock() {
             let plain = guard.tls.feed(dir, ciphertext);
-            // Plaintext for the other direction can appear when the TLS version is detected
-            // and buffered bytes are replayed; it was observed earlier, so deliver it first.
-            let other = dir.opposite();
-            let carried = guard.tls.take_carried(other);
-            guard.deliver(other, &carried);
-            guard.deliver(dir, &plain);
-        }
-    }
-}
-
-impl TapInner {
-    fn deliver(&mut self, dir: Direction, plain: &[u8]) {
-        if plain.is_empty() {
-            return;
-        }
-        match dir {
-            Direction::ClientToServer => self.http.feed_client(plain),
-            Direction::ServerToClient => self.http.feed_server(plain),
+            // One feed can release plaintext for both directions (version detection replay,
+            // or records queued until the keylog line appeared). Always hand the correlator
+            // the client side first so requests are known before their responses.
+            if !plain.client_to_server.is_empty() {
+                guard.http.feed_client(&plain.client_to_server);
+            }
+            if !plain.server_to_client.is_empty() {
+                guard.http.feed_server(&plain.server_to_client);
+            }
         }
     }
 }
