@@ -90,11 +90,17 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
 
     let mut cmd = Command::new(&binary);
     let _ = cmd
+        .arg("--force-renderer-accessibility")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
     if let Some(profile_dir) = &options.profile_dir {
+        std::fs::create_dir_all(profile_dir).map_err(WayboundError::Io)?;
+        let first_run = profile_dir.join("First Run");
+        if !first_run.exists() {
+            let _ = std::fs::File::create(&first_run);
+        }
         let _ = cmd.arg(format!("--user-data-dir={}", profile_dir.display()));
     }
     if let Some(keylog) = &options.ssl_keylog_file {

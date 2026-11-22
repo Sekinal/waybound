@@ -60,24 +60,52 @@ pub fn snapshot_application_tree(pid: i32) -> Result<Vec<AccessibilityNode>> {
 
     enable_enhanced_ui(&app);
 
-    // Prefer the active browser window so we spend the node budget on web content
-    // rather than menu bar items.
+    // Prefer the active browser window, then the first window in `AXWindows`,
+    // falling back to the application root so we work even when Chrome is backgrounded.
     let root = copy_attr(&app, "AXFocusedWindow")
         .or_else(|| copy_attr(&app, "AXMainWindow"))
+        .or_else(|| first_ax_window(&app))
         .unwrap_or(app);
 
     let mut nodes = Vec::new();
     let mut visited = 0;
     walk_node(&root, 0, &mut visited, &mut nodes);
+    tracing::debug!(
+        pid,
+        visited,
+        captured = nodes.len(),
+        "macos AX snapshot complete"
+    );
     Ok(nodes)
 }
 
+fn first_ax_window(app: &OwnedCf) -> Option<OwnedCf> {
+    let windows = copy_attr(app, "AXWindows")?;
+    // SAFETY: Verify `windows` is a `CFArray` and element 0 is a valid `AXUIElement` before retaining.
+    unsafe {
+        if CFGetTypeID(windows.as_ptr()) != CFArrayGetTypeID() {
+            return None;
+        }
+        if CFArrayGetCount(windows.as_ptr()) <= 0 {
+            return None;
+        }
+        let first = CFArrayGetValueAtIndex(windows.as_ptr(), 0);
+        if first.is_null() || CFGetTypeID(first) != AXUIElementGetTypeID() {
+            return None;
+        }
+        OwnedCf::retain(first)
+    }
+}
+
 fn enable_enhanced_ui(app: &OwnedCf) {
-    let Some(key) = cf_string("AXEnhancedUserInterface") else {
-        return;
-    };
-    // SAFETY: `app` and `key` are valid retained CF objects, and `kCFBooleanTrue` is a global CF constant.
-    let _ = unsafe { AXUIElementSetAttributeValue(app.as_ptr(), key.as_ptr(), kCFBooleanTrue) };
+    for attr in ["AXEnhancedUserInterface", "AXManualAccessibility"] {
+        if let Some(key) = cf_string(attr) {
+            // SAFETY: `app` and `key` are valid retained CF objects, and `kCFBooleanTrue` is a global CF constant.
+            let status =
+                unsafe { AXUIElementSetAttributeValue(app.as_ptr(), key.as_ptr(), kCFBooleanTrue) };
+            tracing::debug!(attr, status, "set AX attribute on target application");
+        }
+    }
 }
 
 fn copy_attr(element: &OwnedCf, attr_name: &str) -> Option<OwnedCf> {
