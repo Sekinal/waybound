@@ -12,6 +12,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 waybound-core.workspace = true
+waybound-driver-android.workspace = true
 waybound-driver-macos.workspace = true
 
 [lints]

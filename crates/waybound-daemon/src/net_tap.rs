@@ -161,16 +161,12 @@ impl StreamCorrelator {
         let h3_path = cols[11].trim();
 
         let content_type = first_non_empty(&[cols[12], cols[13], cols[14]]);
-        let body_hex = if cols.len() >= 18 {
-            first_non_empty(&[cols[15], cols[16], cols[17]])
-        } else {
-            None
-        };
-        let content_encoding = if cols.len() >= 21 {
-            first_non_empty(&[cols[18], cols[19], cols[20]])
-        } else {
-            None
-        };
+        let body_hex = (cols.len() >= 18)
+            .then(|| first_non_empty(&[cols[15], cols[16], cols[17]]))
+            .flatten();
+        let content_encoding = (cols.len() >= 21)
+            .then(|| first_non_empty(&[cols[18], cols[19], cols[20]]))
+            .flatten();
 
         let Some(key) = build_stream_key(tcp_stream, udp_stream, h2_stream, h3_stream) else {
             return;
@@ -221,11 +217,13 @@ impl StreamCorrelator {
             entry.status = Some(code);
         }
 
-        if let Some(ct) = content_type {
-            entry.content_type = Some(ct.to_owned());
-        }
-        if let Some(ce) = content_encoding {
-            entry.content_encoding = Some(ce.to_owned());
+        if entry.status.is_some() {
+            if let Some(ct) = content_type {
+                entry.content_type = Some(ct.to_owned());
+            }
+            if let Some(ce) = content_encoding {
+                entry.content_encoding = Some(ce.to_owned());
+            }
         }
 
         // Only collect payload bytes after response status headers are observed so POST/PUT

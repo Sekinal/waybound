@@ -145,10 +145,15 @@ fn focus_macos_pid(pid: i32) {
     let script = format!(
         "tell application \"System Events\" to set frontmost of first process whose unix id is {pid} to true"
     );
-    let _ = Command::new("/usr/bin/osascript")
-        .args(["-e", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    let _ = std::thread::Builder::new()
+        .name("waybound-focus".to_owned())
+        .spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let _ = Command::new("/usr/bin/osascript")
+                .args(["-e", &script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        });
 }

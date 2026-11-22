@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
 use waybound_core::Driver;
+use waybound_driver_android::AndroidDriver;
 use waybound_driver_macos::MacOsDriver;
 
 use crate::launcher::{ChromeLaunchOptions, launch_chrome};
@@ -30,6 +31,7 @@ struct CliArgs {
     socket_path: Option<PathBuf>,
     backend: String,
     pid: Option<i32>,
+    serial: Option<String>,
     launch_chrome: bool,
     profile_dir: Option<PathBuf>,
     ssl_keylog_file: Option<PathBuf>,
@@ -41,104 +43,62 @@ struct CliArgs {
     no_motion: bool,
 }
 
+fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+    args.next()
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
 fn parse_args() -> Result<CliArgs, String> {
-    let mut socket_path = env::var("WAYBOUND_SOCKET").ok().map(PathBuf::from);
-    let mut backend = "mock".to_owned();
-    let mut pid = None;
-    let mut launch_chrome_flag = false;
-    let mut profile_dir = None;
-    let mut ssl_keylog_file = None;
-    let mut initial_url = None;
-    let mut proxy = env::var("WAYBOUND_PROXY").ok();
-    let mut timezone = None;
-    let mut locale = None;
-    let mut focus = false;
-    let mut no_motion = false;
+    let mut cli = CliArgs {
+        socket_path: env::var("WAYBOUND_SOCKET").ok().map(PathBuf::from),
+        backend: "mock".to_owned(),
+        pid: None,
+        serial: None,
+        launch_chrome: false,
+        profile_dir: None,
+        ssl_keylog_file: None,
+        initial_url: None,
+        proxy: env::var("WAYBOUND_PROXY").ok(),
+        timezone: None,
+        locale: None,
+        focus: false,
+        no_motion: false,
+    };
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--socket" => {
-                let path = args
-                    .next()
-                    .ok_or_else(|| "--socket requires a path argument".to_owned())?;
-                socket_path = Some(PathBuf::from(path));
-            }
-            "--backend" => {
-                let val = args
-                    .next()
-                    .ok_or_else(|| "--backend requires a value ('mock' or 'macos')".to_owned())?;
-                backend = val;
-            }
+            "--socket" => cli.socket_path = Some(PathBuf::from(next_arg(&mut args, "--socket")?)),
+            "--backend" => cli.backend = next_arg(&mut args, "--backend")?,
             "--pid" => {
-                let val = args
-                    .next()
-                    .ok_or_else(|| "--pid requires a positive integer".to_owned())?;
+                let val = next_arg(&mut args, "--pid")?;
                 let parsed = val
                     .parse::<i32>()
                     .map_err(|_| format!("invalid --pid value: {val}"))?;
                 if parsed <= 0 {
                     return Err(format!("--pid must be positive, got {parsed}"));
                 }
-                pid = Some(parsed);
+                cli.pid = Some(parsed);
             }
-            "--launch-chrome" => launch_chrome_flag = true,
+            "--serial" => cli.serial = Some(next_arg(&mut args, "--serial")?),
+            "--launch-chrome" => cli.launch_chrome = true,
             "--profile-dir" => {
-                let path = args
-                    .next()
-                    .ok_or_else(|| "--profile-dir requires a path argument".to_owned())?;
-                profile_dir = Some(PathBuf::from(path));
+                cli.profile_dir = Some(PathBuf::from(next_arg(&mut args, "--profile-dir")?));
             }
             "--ssl-keylog" => {
-                let path = args
-                    .next()
-                    .ok_or_else(|| "--ssl-keylog requires a path argument".to_owned())?;
-                ssl_keylog_file = Some(PathBuf::from(path));
+                cli.ssl_keylog_file = Some(PathBuf::from(next_arg(&mut args, "--ssl-keylog")?));
             }
-            "--url" => {
-                let val = args
-                    .next()
-                    .ok_or_else(|| "--url requires a URL argument".to_owned())?;
-                initial_url = Some(val);
-            }
-            "--proxy" => {
-                let val = args
-                    .next()
-                    .ok_or_else(|| "--proxy requires a proxy URL argument".to_owned())?;
-                proxy = Some(val);
-            }
-            "--timezone" => {
-                let val = args.next().ok_or_else(|| {
-                    "--timezone requires an IANA timezone (e.g., America/New_York)".to_owned()
-                })?;
-                timezone = Some(val);
-            }
-            "--locale" => {
-                let val = args
-                    .next()
-                    .ok_or_else(|| "--locale requires a locale (e.g., en_US.UTF-8)".to_owned())?;
-                locale = Some(val);
-            }
-            "--focus" => focus = true,
-            "--no-motion" => no_motion = true,
+            "--url" => cli.initial_url = Some(next_arg(&mut args, "--url")?),
+            "--proxy" => cli.proxy = Some(next_arg(&mut args, "--proxy")?),
+            "--timezone" => cli.timezone = Some(next_arg(&mut args, "--timezone")?),
+            "--locale" => cli.locale = Some(next_arg(&mut args, "--locale")?),
+            "--focus" => cli.focus = true,
+            "--no-motion" => cli.no_motion = true,
             unknown => return Err(format!("unknown argument: {unknown}")),
         }
     }
 
-    Ok(CliArgs {
-        socket_path,
-        backend,
-        pid,
-        launch_chrome: launch_chrome_flag,
-        profile_dir,
-        ssl_keylog_file,
-        initial_url,
-        proxy,
-        timezone,
-        locale,
-        focus,
-        no_motion,
-    })
+    Ok(cli)
 }
 
 fn default_user_socket_path() -> std::io::Result<PathBuf> {
@@ -160,6 +120,61 @@ fn setup_proxy(raw: Option<String>) -> Result<(Option<String>, Option<ProxyForwa
     }
 }
 
+type BackendBundle = (
+    Arc<dyn Driver>,
+    bool,
+    Option<launcher::LaunchedChrome>,
+    Option<ProxyForwarder>,
+);
+
+fn build_backend(cli: CliArgs) -> Result<BackendBundle, String> {
+    match cli.backend.as_str() {
+        "mock" => Ok((Arc::new(MockDriver::sample_page()), false, None, None)),
+        "android" => {
+            let android = AndroidDriver::new(cli.serial);
+            if let Some(url) = &cli.initial_url {
+                android.open_url(url).map_err(|e| e.to_string())?;
+            }
+            tracing::info!(serial = ?android.serial(), "starting android/waydroid driver");
+            Ok((Arc::new(android), !cli.no_motion, None, None))
+        }
+        "macos" => {
+            let (target_pid, launched, fwd) = if cli.launch_chrome {
+                let (chrome_proxy_server, proxy_fwd) = setup_proxy(cli.proxy)?;
+                let opts = ChromeLaunchOptions {
+                    binary_path: None,
+                    profile_dir: cli.profile_dir,
+                    ssl_keylog_file: cli.ssl_keylog_file,
+                    initial_url: cli.initial_url,
+                    proxy_server: chrome_proxy_server,
+                    timezone: cli.timezone,
+                    locale: cli.locale,
+                    focus: cli.focus,
+                };
+                let chrome = launch_chrome(&opts).map_err(|e| e.to_string())?;
+                let pid = chrome.pid();
+                (pid, Some(chrome), proxy_fwd)
+            } else if let Some(pid) = cli.pid {
+                (pid, None, None)
+            } else {
+                return Err(
+                    "--backend macos requires either --pid <pid> or --launch-chrome".to_owned(),
+                );
+            };
+            tracing::info!(pid = target_pid, "starting macos native driver");
+            Ok((
+                Arc::new(MacOsDriver::new(target_pid)),
+                !cli.no_motion,
+                launched,
+                fwd,
+            ))
+        }
+        other => Err(format!(
+            "unknown backend {other:?} (expected 'mock', 'macos', or 'android')"
+        )),
+    }
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -176,7 +191,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let socket_path = match cli.socket_path {
+    let socket_path = match cli.socket_path.clone() {
         Some(p) => p,
         None => match default_user_socket_path() {
             Ok(p) => p,
@@ -188,7 +203,6 @@ fn main() -> ExitCode {
     };
 
     let responses = Arc::new(ResponseStore::default());
-    // Start passive wire tap before launching Chrome so initial TLS handshakes are captured.
     let _net_tap = cli.ssl_keylog_file.as_ref().and_then(|keylog| {
         match start_passive_tap(keylog, Arc::clone(&responses)) {
             Ok(tap) => Some(tap),
@@ -199,63 +213,10 @@ fn main() -> ExitCode {
         }
     });
 
-    // Keep `_launched` and `_proxy_forwarder` alive for the full lifetime of the daemon.
-    let (driver, use_motion, _launched, _proxy_forwarder): (
-        Arc<dyn Driver>,
-        bool,
-        Option<launcher::LaunchedChrome>,
-        Option<ProxyForwarder>,
-    ) = match cli.backend.as_str() {
-        "mock" => (Arc::new(MockDriver::sample_page()), false, None, None),
-        "macos" => {
-            let (target_pid, launched, fwd) = if cli.launch_chrome {
-                let (chrome_proxy_server, proxy_fwd) = match setup_proxy(cli.proxy) {
-                    Ok(pair) => pair,
-                    Err(msg) => {
-                        tracing::error!(error = %msg, "failed to configure proxy");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let opts = ChromeLaunchOptions {
-                    binary_path: None,
-                    profile_dir: cli.profile_dir,
-                    ssl_keylog_file: cli.ssl_keylog_file,
-                    initial_url: cli.initial_url,
-                    proxy_server: chrome_proxy_server,
-                    timezone: cli.timezone,
-                    locale: cli.locale,
-                    focus: cli.focus,
-                };
-                match launch_chrome(&opts) {
-                    Ok(chrome) => {
-                        let pid = chrome.pid();
-                        (pid, Some(chrome), proxy_fwd)
-                    }
-                    Err(err) => {
-                        tracing::error!(error = %err, "failed to launch Google Chrome");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            } else if let Some(pid) = cli.pid {
-                (pid, None, None)
-            } else {
-                tracing::error!("--backend macos requires either --pid <pid> or --launch-chrome");
-                return ExitCode::FAILURE;
-            };
-
-            tracing::info!(pid = target_pid, "starting macos native driver");
-            (
-                Arc::new(MacOsDriver::new(target_pid)),
-                !cli.no_motion,
-                launched,
-                fwd,
-            )
-        }
-        other => {
-            tracing::error!(
-                backend = other,
-                "unknown backend (expected 'mock' or 'macos')"
-            );
+    let (driver, use_motion, _launched, _proxy_forwarder) = match build_backend(cli) {
+        Ok(bundle) => bundle,
+        Err(msg) => {
+            tracing::error!(error = %msg, "failed to initialize backend");
             return ExitCode::FAILURE;
         }
     };

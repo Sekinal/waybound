@@ -18,7 +18,7 @@ from waybound.transport import UnixSocketTransport, WayboundDaemonError
 if TYPE_CHECKING:
     from types import TracebackType
 
-BackendName = Literal["mock", "macos"]
+BackendName = Literal["mock", "macos", "android"]
 _MIN_WORKSPACE_PARENTS = 4
 
 
@@ -28,6 +28,7 @@ class LaunchOptions:
 
     backend: BackendName = "mock"
     pid: int | None = None
+    serial: str | None = None
     launch_chrome: bool = False
     url: str | None = None
     profile_dir: Path | str | None = None
@@ -96,6 +97,38 @@ class Session:
         self._proc: subprocess.Popen[bytes] | None = None
         self._transport: UnixSocketTransport | None = None
 
+    def _build_daemon_cmd(self, socket_path: Path) -> list[str]:
+        opts = self._options
+        cmd = [
+            str(self._daemon_binary),
+            "--socket",
+            str(socket_path),
+            "--backend",
+            opts.backend,
+        ]
+        pairs: tuple[tuple[str, str | None], ...] = (
+            ("--pid", str(opts.pid) if opts.pid is not None else None),
+            ("--serial", opts.serial),
+            ("--url", opts.url),
+            (
+                "--profile-dir",
+                str(Path(opts.profile_dir)) if opts.profile_dir is not None else None,
+            ),
+            ("--ssl-keylog", str(Path(opts.ssl_keylog)) if opts.ssl_keylog is not None else None),
+            ("--timezone", opts.timezone),
+            ("--locale", opts.locale),
+        )
+        for flag, val in pairs:
+            if val is not None:
+                cmd.extend([flag, val])
+        if opts.launch_chrome:
+            cmd.append("--launch-chrome")
+        if opts.focus:
+            cmd.append("--focus")
+        if opts.no_motion:
+            cmd.append("--no-motion")
+        return cmd
+
     def __enter__(self) -> Page:
         if self._proc is not None or self._transport is not None:
             msg = "Session is already active and cannot be re-entered"
@@ -108,31 +141,7 @@ class Session:
         stderr_log = Path(tmp_dir.name) / "daemon.stderr.log"
 
         opts = self._options
-        cmd = [
-            str(self._daemon_binary),
-            "--socket",
-            str(socket_path),
-            "--backend",
-            opts.backend,
-        ]
-        if opts.pid is not None:
-            cmd.extend(["--pid", str(opts.pid)])
-        if opts.launch_chrome:
-            cmd.append("--launch-chrome")
-        if opts.url is not None:
-            cmd.extend(["--url", opts.url])
-        if opts.profile_dir is not None:
-            cmd.extend(["--profile-dir", str(Path(opts.profile_dir))])
-        if opts.ssl_keylog is not None:
-            cmd.extend(["--ssl-keylog", str(Path(opts.ssl_keylog))])
-        if opts.timezone is not None:
-            cmd.extend(["--timezone", opts.timezone])
-        if opts.locale is not None:
-            cmd.extend(["--locale", opts.locale])
-        if opts.focus:
-            cmd.append("--focus")
-        if opts.no_motion:
-            cmd.append("--no-motion")
+        cmd = self._build_daemon_cmd(socket_path)
 
         child_env = os.environ.copy()
         if opts.proxy is not None:

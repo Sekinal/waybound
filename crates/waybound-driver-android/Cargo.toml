@@ -1,0 +1,13 @@
+[package]
+name = "waybound-driver-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tracing.workspace = true
+waybound-core.workspace = true
+
+[lints]
+workspace = true

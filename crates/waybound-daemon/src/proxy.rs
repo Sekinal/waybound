@@ -8,7 +8,7 @@
 //! or TLS MITM.
 
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -349,17 +349,86 @@ fn forward_plain_http_over_socks(
 ) -> io::Result<()> {
     let mut outbound = Vec::with_capacity(total_bytes + 64);
     for (idx, line) in header_lines.iter().enumerate() {
-        if idx > 0 {
-            let lower = line.to_ascii_lowercase();
-            if lower.starts_with("proxy-") || lower.starts_with("connection:") {
-                continue;
-            }
+        if idx == 0 {
+            outbound.extend_from_slice(rewrite_origin_form(line).as_bytes());
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("proxy-") || lower.starts_with("connection:") {
+            continue;
         }
         outbound.extend_from_slice(line.as_bytes());
     }
     outbound.extend_from_slice(b"Connection: close\r\n\r\n");
     upstream_stream.write_all(&outbound)?;
     upstream_stream.flush()
+}
+
+/// Converts proxy-form (`GET http://host/path HTTP/1.1`) to origin-form (`GET /path HTTP/1.1`).
+fn rewrite_origin_form(request_line: &str) -> String {
+    let mut parts = request_line.split_whitespace();
+    let Some(method) = parts.next() else {
+        return request_line.to_owned();
+    };
+    let Some(target) = parts.next() else {
+        return request_line.to_owned();
+    };
+    let version = parts.next().unwrap_or("HTTP/1.1");
+
+    let origin_target = target
+        .strip_prefix("http://")
+        .or_else(|| target.strip_prefix("https://"))
+        .map_or(target, |rest| {
+            rest.find('/').map_or("/", |idx| &rest[idx..])
+        });
+    format!("{method} {origin_target} {version}\r\n")
+}
+
+fn split_host_port(authority: &str, default_port: Option<u16>) -> io::Result<(String, u16)> {
+    if let Some(after_open) = authority.strip_prefix('[') {
+        let Some((ipv6, remainder)) = after_open.split_once(']') else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "unterminated IPv6 bracket in target authority",
+            ));
+        };
+        if ipv6.is_empty() {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "empty IPv6 host"));
+        }
+        let port = if let Some(port_str) = remainder.strip_prefix(':') {
+            port_str
+                .parse::<u16>()
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid IPv6 port"))?
+        } else if remainder.is_empty() {
+            default_port.ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidInput, "CONNECT target missing port")
+            })?
+        } else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "invalid characters after IPv6 host",
+            ));
+        };
+        return Ok((ipv6.to_owned(), port));
+    }
+
+    if let Some((h, p)) = authority.rsplit_once(':') {
+        if h.is_empty() {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "empty target host"));
+        }
+        let port = p
+            .parse::<u16>()
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid target port"))?;
+        Ok((h.to_owned(), port))
+    } else {
+        if authority.is_empty() {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "empty target host"));
+        }
+        let port = default_port.ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidInput, "CONNECT target missing host:port")
+        })?;
+        Ok((authority.to_owned(), port))
+    }
 }
 
 fn parse_request_target(request_line: &str) -> io::Result<(String, u16, bool)> {
@@ -369,35 +438,44 @@ fn parse_request_target(request_line: &str) -> io::Result<(String, u16, bool)> {
     let is_connect = method.eq_ignore_ascii_case("CONNECT");
 
     if is_connect {
-        let Some((host, port_str)) = target.rsplit_once(':') else {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                "CONNECT target missing host:port",
-            ));
-        };
-        let port = port_str
-            .parse::<u16>()
-            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid CONNECT port"))?;
-        return Ok((host.to_owned(), port, true));
+        let (host, port) = split_host_port(target, None)?;
+        return Ok((host, port, true));
     }
 
-    let stripped = target
-        .strip_prefix("http://")
-        .or_else(|| target.strip_prefix("https://"))
-        .unwrap_or(target);
+    let (default_port, stripped) = target.strip_prefix("https://").map_or_else(
+        || {
+            target
+                .strip_prefix("http://")
+                .map_or((80u16, target), |rest| (80u16, rest))
+        },
+        |rest| (443u16, rest),
+    );
     let authority = stripped.split('/').next().unwrap_or("");
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (
-            h.to_owned(),
-            p.parse::<u16>()
-                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid HTTP port"))?,
-        ),
-        None => (authority.to_owned(), 80),
-    };
-    if host.is_empty() {
-        return Err(io::Error::new(ErrorKind::InvalidInput, "empty target host"));
-    }
+    let (host, port) = split_host_port(authority, Some(default_port))?;
     Ok((host, port, false))
+}
+
+fn drain_socks5_reply_addr(stream: &mut TcpStream, atyp: u8) -> io::Result<()> {
+    match atyp {
+        0x01 => {
+            let mut skip = [0u8; 6];
+            stream.read_exact(&mut skip)
+        }
+        0x03 => {
+            let mut len_buf = [0u8; 1];
+            stream.read_exact(&mut len_buf)?;
+            let mut skip = vec![0u8; usize::from(len_buf[0]) + 2];
+            stream.read_exact(&mut skip)
+        }
+        0x04 => {
+            let mut skip = [0u8; 18];
+            stream.read_exact(&mut skip)
+        }
+        _ => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid SOCKS5 reply address type",
+        )),
+    }
 }
 
 /// Performs RFC 1928 + RFC 1929 SOCKS5 handshake with remote domain resolution (`ATYP=0x03`).
@@ -450,7 +528,7 @@ fn socks5_handshake(
 
             let mut auth_resp = [0u8; 2];
             stream.read_exact(&mut auth_resp)?;
-            if auth_resp[1] != 0x00 {
+            if auth_resp[0] != 0x01 || auth_resp[1] != 0x00 {
                 return Err(io::Error::new(
                     ErrorKind::PermissionDenied,
                     "SOCKS5 username/password authentication rejected",
@@ -465,12 +543,27 @@ fn socks5_handshake(
         }
     }
 
-    let host_bytes = target_host.as_bytes();
-    let hlen = u8::try_from(host_bytes.len())
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "target domain exceeds 255 bytes"))?;
-    let mut connect_req = Vec::with_capacity(7 + host_bytes.len());
-    connect_req.extend_from_slice(&[0x05, 0x01, 0x00, 0x03, hlen]);
-    connect_req.extend_from_slice(host_bytes);
+    let mut connect_req = Vec::with_capacity(22);
+    connect_req.extend_from_slice(&[0x05, 0x01, 0x00]);
+    match target_host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            connect_req.push(0x01);
+            connect_req.extend_from_slice(&v4.octets());
+        }
+        Ok(IpAddr::V6(v6)) => {
+            connect_req.push(0x04);
+            connect_req.extend_from_slice(&v6.octets());
+        }
+        Err(_) => {
+            let host_bytes = target_host.as_bytes();
+            let hlen = u8::try_from(host_bytes.len()).map_err(|_| {
+                io::Error::new(ErrorKind::InvalidInput, "target domain exceeds 255 bytes")
+            })?;
+            connect_req.push(0x03);
+            connect_req.push(hlen);
+            connect_req.extend_from_slice(host_bytes);
+        }
+    }
     connect_req.extend_from_slice(&target_port.to_be_bytes());
     stream.write_all(&connect_req)?;
     stream.flush()?;
@@ -484,31 +577,7 @@ fn socks5_handshake(
         ));
     }
 
-    // Drain BND.ADDR + BND.PORT according to ATYP.
-    match hdr[3] {
-        0x01 => {
-            let mut skip = [0u8; 6];
-            stream.read_exact(&mut skip)?;
-        }
-        0x03 => {
-            let mut len_buf = [0u8; 1];
-            stream.read_exact(&mut len_buf)?;
-            let mut skip = vec![0u8; usize::from(len_buf[0]) + 2];
-            stream.read_exact(&mut skip)?;
-        }
-        0x04 => {
-            let mut skip = [0u8; 18];
-            stream.read_exact(&mut skip)?;
-        }
-        _ => {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "invalid SOCKS5 reply address type",
-            ));
-        }
-    }
-
-    Ok(())
+    drain_socks5_reply_addr(stream, hdr[3])
 }
 
 fn copy_stream(src: &mut TcpStream, dst: &mut TcpStream) -> io::Result<()> {

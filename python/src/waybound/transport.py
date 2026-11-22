@@ -156,16 +156,21 @@ class UnixSocketTransport:
         Uses a dedicated short-lived Unix socket connection so concurrent `asyncio.gather`
         calls (e.g., `wait_for_response` + `click`) run in true parallel without blocking.
         """
+        if self._sock is None:
+            raise WayboundDaemonError("closed", "transport is closed")
         clamped_ms = max(0, timeout_ms)
         dedicated_timeout = max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0)
-        with UnixSocketTransport(self._socket_path, timeout_s=dedicated_timeout) as dedicated:
-            response = dedicated._request(
-                {
-                    "method": "wait_for_response",
-                    "url_contains": url_contains,
-                    "timeout_ms": clamped_ms,
-                }
-            )
+        try:
+            with UnixSocketTransport(self._socket_path, timeout_s=dedicated_timeout) as dedicated:
+                response = dedicated._request(
+                    {
+                        "method": "wait_for_response",
+                        "url_contains": url_contains,
+                        "timeout_ms": clamped_ms,
+                    }
+                )
+        except OSError as exc:
+            raise WayboundDaemonError("io_error", str(exc)) from exc
         raw_resp = response.get("response")
         if not isinstance(raw_resp, dict):
             msg = f"unexpected wait_for_response payload: {response!r}"

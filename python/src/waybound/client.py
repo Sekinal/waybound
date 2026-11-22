@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from waybound.transport import WayboundDaemonError
 from waybound.types import AccessibilityNode, CapturedResponse, KeyModifier, LocatorQuery, Role
 
 if TYPE_CHECKING:
@@ -75,7 +76,7 @@ class Page:
                 return current
             if time.monotonic() >= deadline:
                 msg = f"timed out after {timeout_ms}ms waiting for URL containing {url_contains!r}"
-                raise TimeoutError(msg)
+                raise WayboundDaemonError("timeout", msg)
             time.sleep(0.075)
 
     def goto(self, url: str) -> None:

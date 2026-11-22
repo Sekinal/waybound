@@ -385,7 +385,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "waybound-core",
+ "waybound-driver-android",
  "waybound-driver-macos",
+]
+
+[[package]]
+name = "waybound-driver-android"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "waybound-core",
 ]
 
 [[package]]
