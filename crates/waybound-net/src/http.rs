@@ -1245,8 +1245,7 @@ mod tests {
         s2c.extend(h2_frame(H2_FRAME_DATA, H2_FLAG_END_STREAM, 1, b"[]"));
         corr.feed_server(&s2c);
 
-        let list = snapshot(&captured);
-        let last = list.last().cloned().unwrap_or_default();
+        let last = snapshot(&captured).pop().unwrap_or_default();
         assert_eq!(last.url, "https://www.example.com/api/search");
         assert_eq!(last.status, 200);
         assert_eq!(last.body.as_deref(), Some("[]"));
