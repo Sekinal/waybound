@@ -2,7 +2,7 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -333,7 +333,7 @@ fn coord_to_i32(value: f64) -> i32 {
 
 fn run_adb(args: &[String]) -> Result<Output> {
     debug!(?args, "executing adb command");
-    let mut cmd = Command::new("adb");
+    let mut cmd = waybound_core::process::command("adb");
     let _ = cmd
         .args(args)
         .stdin(Stdio::null())

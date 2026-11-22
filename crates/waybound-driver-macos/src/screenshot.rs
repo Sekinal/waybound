@@ -4,7 +4,7 @@
 
 use std::ffi::c_void;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use waybound_core::{Result, WayboundError};
 
@@ -114,7 +114,7 @@ pub fn capture_window_png(pid: i32, output_path: &Path) -> Result<()> {
         reason: format!("no on-screen browser window found for pid {pid}"),
     })?;
 
-    let output = Command::new("/usr/sbin/screencapture")
+    let output = waybound_core::process::command("/usr/sbin/screencapture")
         .args(["-x", "-o", "-l", &win_id.to_string()])
         .arg(&abs_path)
         .stdin(Stdio::null())
