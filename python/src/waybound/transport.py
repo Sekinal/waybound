@@ -274,6 +274,22 @@ class UnixSocketTransport:
             timeout_override_s=self._base_timeout_s + _FILL_SECONDS_PER_CHAR * len(text),
         )
 
+    def set_checked(self, query: LocatorQuery, *, checked: bool) -> AccessibilityNode:
+        """Idempotently drive a checkbox/radio/switch to `checked`; return the re-read node.
+
+        The daemon auto-waits for the element, refuses disabled elements
+        (`element_disabled`) and elements without a checked state (`invalid_element_state`),
+        clicks only when the state differs, and verifies the new state.
+        """
+        response = self._request(
+            {"method": "set_checked", "query": _encode_query(query), "checked": checked}
+        )
+        raw_node = response.get("node")
+        if not isinstance(raw_node, dict):
+            msg = f"unexpected set_checked response: {response!r}"
+            raise WayboundDaemonError("protocol_error", msg)
+        return _parse_node(raw_node)
+
     def navigate(self, url: str) -> None:
         """Navigate the active browser tab to `url`."""
         self._expect_ok({"method": "navigate", "url": url}, "navigate")
@@ -419,6 +435,9 @@ def _parse_node(item: dict[object, object]) -> AccessibilityNode:
     val = item.get("value")
     value = val if isinstance(val, str) else None
     focused = bool(item.get("focused", False))
+    checked = _parse_optional_bool(item.get("checked"))
+    disabled = item.get("disabled") is True
+    expanded = _parse_optional_bool(item.get("expanded"))
 
     raw_bounds = item.get("bounds")
     if isinstance(raw_bounds, dict):
@@ -438,7 +457,14 @@ def _parse_node(item: dict[object, object]) -> AccessibilityNode:
         value=value,
         bounds=bounds,
         focused=focused,
+        checked=checked,
+        disabled=disabled,
+        expanded=expanded,
     )
+
+
+def _parse_optional_bool(raw: object) -> bool | None:
+    return raw if isinstance(raw, bool) else None
 
 
 def _parse_http_response(item: dict[object, object]) -> CapturedResponse:

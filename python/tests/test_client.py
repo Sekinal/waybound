@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from waybound import (
@@ -12,8 +14,9 @@ from waybound import (
     LocatorQuery,
     Page,
     Role,
+    WayboundDaemonError,
 )
-from waybound.transport import WayboundDaemonError
+from waybound.transport import _parse_node
 
 
 class FakeTransport:
@@ -113,6 +116,31 @@ class FakeTransport:
     def screenshot(self, path: str) -> None:
         self.events.append(("screenshot", path))
 
+    def set_checked(self, query: LocatorQuery, *, checked: bool) -> AccessibilityNode:
+        self.events.append(("set_checked", (query, checked)))
+        return AccessibilityNode(
+            id="n1",
+            role=query.role or Role.UNKNOWN,
+            name=query.name,
+            value=None,
+            bounds=Bounds(10.0, 20.0, 100.0, 30.0),
+            focused=False,
+            checked=checked,
+        )
+
+
+class StatefulTransport(FakeTransport):
+    """Fake transport whose resolved node carries a configurable state."""
+
+    def __init__(self, *, checked: bool | None, disabled: bool = False) -> None:
+        super().__init__()
+        self.checked = checked
+        self.disabled = disabled
+
+    def wait_for(self, query: LocatorQuery, *, timeout_ms: int = 10_000) -> AccessibilityNode:
+        node = super().wait_for(query, timeout_ms=timeout_ms)
+        return replace(node, checked=self.checked, disabled=self.disabled)
+
 
 def test_bounds_center() -> None:
     bounds = Bounds(x=10.0, y=20.0, width=100.0, height=40.0)
@@ -182,3 +210,58 @@ def test_wait_for_url_raises_fatal_errors_immediately() -> None:
         Page(transport).wait_for_url("ok.test", timeout_ms=5_000)
     assert info.value is fatal
     assert transport.calls == 1
+
+
+def test_check_and_uncheck_delegate_to_daemon_set_checked() -> None:
+    transport = FakeTransport()
+    page = Page(transport)
+    box = page.get_by_role(Role.CHECKBOX, name="Nonstop")
+
+    box.check()
+    box.uncheck()
+
+    query = LocatorQuery(role=Role.CHECKBOX, name="Nonstop")
+    assert transport.events == [
+        ("set_checked", (query, True)),
+        ("set_checked", (query, False)),
+    ]
+
+
+def test_is_checked_and_is_enabled_read_node_state() -> None:
+    page = Page(StatefulTransport(checked=True, disabled=True))
+    box = page.get_by_role(Role.CHECKBOX, name="Nonstop")
+    assert box.is_checked() is True
+    assert box.is_enabled() is False
+
+    page = Page(StatefulTransport(checked=False))
+    assert page.get_by_role(Role.CHECKBOX).is_checked() is False
+    assert page.get_by_role(Role.CHECKBOX).is_enabled() is True
+
+
+def test_is_checked_raises_for_node_without_checked_state() -> None:
+    page = Page(StatefulTransport(checked=None))
+    with pytest.raises(WayboundDaemonError) as exc_info:
+        page.get_by_role(Role.BUTTON, name="Search").is_checked()
+    assert exc_info.value.code == "invalid_element_state"
+
+
+def test_parse_node_state_fields_are_optional_and_tolerant() -> None:
+    base: dict[object, object] = {
+        "id": "n",
+        "role": "check_box",
+        "bounds": {"x": 0, "y": 0, "width": 1, "height": 1},
+    }
+    legacy = _parse_node(base)
+    assert legacy.checked is None
+    assert legacy.disabled is False
+    assert legacy.expanded is None
+
+    full = _parse_node({**base, "checked": True, "disabled": True, "expanded": False})
+    assert full.checked is True
+    assert full.disabled is True
+    assert full.expanded is False
+
+    junk = _parse_node({**base, "checked": "yes", "disabled": 1, "expanded": None})
+    assert junk.checked is None
+    assert junk.disabled is False
+    assert junk.expanded is None
