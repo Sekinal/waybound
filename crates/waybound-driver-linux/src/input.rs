@@ -158,7 +158,7 @@ pub fn build_xdotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
             }
             cmds
         }
-        InputEvent::KeyPress { key, modifiers } => {
+        InputEvent::KeyPress { key, modifiers, .. } => {
             if modifiers.is_empty()
                 && let KeyCode::Char(ch) = key
                 && !ch.is_control()
@@ -308,7 +308,7 @@ pub fn build_ydotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
                 ]]
             }
         }
-        InputEvent::KeyPress { key, modifiers } => {
+        InputEvent::KeyPress { key, modifiers, .. } => {
             if modifiers.is_empty()
                 && let KeyCode::Char(ch) = key
                 && !ch.is_control()
@@ -468,6 +468,7 @@ mod tests {
             build_xdotool_commands(&InputEvent::KeyPress {
                 key: KeyCode::Char('a'),
                 modifiers: Vec::new(),
+                hold_ms: 0,
             }),
             vec![vec!["type", "--delay", "0", "--", "a"]]
         );
@@ -476,6 +477,7 @@ mod tests {
             build_xdotool_commands(&InputEvent::KeyPress {
                 key: KeyCode::Char('l'),
                 modifiers: vec![KeyModifier::Control],
+                hold_ms: 0,
             }),
             vec![vec!["key", "--clearmodifiers", "ctrl+l"]]
         );
@@ -484,6 +486,7 @@ mod tests {
             build_xdotool_commands(&InputEvent::KeyPress {
                 key: KeyCode::Enter,
                 modifiers: vec![KeyModifier::Meta, KeyModifier::Shift],
+                hold_ms: 0,
             }),
             vec![vec!["key", "--clearmodifiers", "super+shift+Return"]]
         );
@@ -526,6 +529,7 @@ mod tests {
             build_ydotool_commands(&InputEvent::KeyPress {
                 key: KeyCode::Char('l'),
                 modifiers: vec![KeyModifier::Control],
+                hold_ms: 0,
             }),
             vec![vec!["key", "29:1", "38:1", "38:0", "29:0"]]
         );
@@ -534,6 +538,7 @@ mod tests {
             build_ydotool_commands(&InputEvent::KeyPress {
                 key: KeyCode::Char('z'),
                 modifiers: Vec::new(),
+                hold_ms: 0,
             }),
             vec![vec!["type", "--key-delay", "0", "--", "z"]]
         );

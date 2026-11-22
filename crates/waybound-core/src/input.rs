@@ -84,5 +84,8 @@ pub enum InputEvent {
         /// Active modifiers for this keystroke.
         #[serde(default)]
         modifiers: Vec<KeyModifier>,
+        /// Optional hold duration in milliseconds between key-down and key-up.
+        #[serde(default)]
+        hold_ms: u64,
     },
 }

@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use waybound_core::{
     BackendKind, Driver, InputEvent, KeyCode, KeyModifier, LocatorQuery, MotionConfig, MouseButton,
     Point, Request, Response, Result, SplitMix64, WayboundError, hover_pause_before_click,
-    key_delay, mouse_hold_ms, pick_click_point, plan_human_pointer_path, plan_scroll_burst,
+    key_delay, key_hold_ms, mouse_hold_ms, pick_click_point, plan_human_pointer_path,
+    plan_scroll_burst,
 };
 
 use crate::net_tap::ResponseStore;
@@ -65,7 +66,8 @@ pub struct ServerOptions {
 }
 
 struct SessionState {
-    last_cursor: Mutex<Point>,
+    /// Last pointer position sent by the daemon; `None` until the first move.
+    last_cursor: Mutex<Option<Point>>,
     shutdown: AtomicBool,
     responses: Arc<ResponseStore>,
     options: ServerOptions,
@@ -74,7 +76,7 @@ struct SessionState {
 impl SessionState {
     const fn new(options: ServerOptions, responses: Arc<ResponseStore>) -> Self {
         Self {
-            last_cursor: Mutex::new(Point { x: 0.0, y: 0.0 }),
+            last_cursor: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             responses,
             options,
@@ -130,7 +132,16 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             }
         }
         Request::Press { key, modifiers } => {
-            match driver.dispatch_input(&InputEvent::KeyPress { key, modifiers }) {
+            let hold_ms = if state.options.use_motion {
+                key_hold_ms(&mut SplitMix64::from_entropy())
+            } else {
+                0
+            };
+            match driver.dispatch_input(&InputEvent::KeyPress {
+                key,
+                modifiers,
+                hold_ms,
+            }) {
                 Ok(()) => Response::Ok,
                 Err(err) => Response::from(&err),
             }
@@ -187,10 +198,15 @@ fn move_pointer(
     target: Point,
     rng: &mut SplitMix64,
 ) -> Result<()> {
-    let start = state
-        .last_cursor
-        .lock()
-        .map_or(Point { x: 0.0, y: 0.0 }, |g| *g);
+    // Start from where the cursor really is: the tracked position is stale whenever the
+    // physical mouse moved since the last request, and is (0, 0) before the first one.
+    let tracked = state.last_cursor.lock().map_or(None, |g| *g);
+    let start = driver
+        .cursor_position()
+        .ok()
+        .flatten()
+        .or(tracked)
+        .unwrap_or(target);
 
     if state.options.use_motion && driver.backend_kind() != BackendKind::AndroidWaydroid {
         let path = plan_human_pointer_path(start, target, MotionConfig::default(), rng);
@@ -205,7 +221,7 @@ fn move_pointer(
     }
 
     if let Ok(mut guard) = state.last_cursor.lock() {
-        *guard = target;
+        *guard = Some(target);
     }
     Ok(())
 }
@@ -323,9 +339,11 @@ fn type_text(driver: &dyn Driver, text: &str, pace: bool) -> Result<()> {
             '\t' => KeyCode::Tab,
             other => KeyCode::Char(other),
         };
+        let hold_ms = if pace { key_hold_ms(&mut rng) } else { 0 };
         driver.dispatch_input(&InputEvent::KeyPress {
             key,
             modifiers: Vec::new(),
+            hold_ms,
         })?;
         if pace {
             thread::sleep(key_delay(ch, &mut rng));
@@ -354,12 +372,14 @@ fn navigate_url(driver: &dyn Driver, url: &str) -> Result<()> {
     driver.dispatch_input(&InputEvent::KeyPress {
         key: KeyCode::Char('l'),
         modifiers: vec![focus_mod],
+        hold_ms: 0,
     })?;
     thread::sleep(Duration::from_millis(60));
     type_text(driver, url, false)?;
     driver.dispatch_input(&InputEvent::KeyPress {
         key: KeyCode::Enter,
         modifiers: Vec::new(),
+        hold_ms: 0,
     })
 }
 

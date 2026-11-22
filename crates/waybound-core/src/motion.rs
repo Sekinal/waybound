@@ -151,6 +151,12 @@ pub const fn mouse_hold_ms(rng: &mut SplitMix64) -> u64 {
     rng.range_u64(55, 115)
 }
 
+/// Returns a natural key-down dwell duration (`45..110ms`) between press and release.
+#[must_use]
+pub const fn key_hold_ms(rng: &mut SplitMix64) -> u64 {
+    rng.range_u64(45, 110)
+}
+
 /// Returns a non-uniform inter-keystroke delay (`35..125ms`, slightly longer on spaces/punctuation).
 #[must_use]
 pub const fn key_delay(ch: char, rng: &mut SplitMix64) -> Duration {
