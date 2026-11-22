@@ -30,6 +30,8 @@ const MAX_UNIX_PATH_BYTES: usize = 100;
 const MAX_FRAME_BYTES: u64 = 1024 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often an idle connection wakes up to check for shutdown.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(75);
 const MAX_WAIT_TIMEOUT_MS: u64 = 120_000;
@@ -68,16 +70,20 @@ pub struct ServerOptions {
 struct SessionState {
     /// Last pointer position sent by the daemon; `None` until the first move.
     last_cursor: Mutex<Option<Point>>,
-    shutdown: AtomicBool,
+    shutdown: Arc<AtomicBool>,
     responses: Arc<ResponseStore>,
     options: ServerOptions,
 }
 
 impl SessionState {
-    const fn new(options: ServerOptions, responses: Arc<ResponseStore>) -> Self {
+    const fn new(
+        options: ServerOptions,
+        responses: Arc<ResponseStore>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             last_cursor: Mutex::new(None),
-            shutdown: AtomicBool::new(false),
+            shutdown,
             responses,
             options,
         }
@@ -349,6 +355,7 @@ fn replace_field_content(driver: &dyn Driver, text: &str, pace: bool) -> Result<
     driver.dispatch_input(&InputEvent::KeyPress {
         key: KeyCode::Char('a'),
         modifiers: vec![select_all_mod],
+        hold_ms: 0,
     })?;
     thread::sleep(Duration::from_millis(40));
 
@@ -356,6 +363,7 @@ fn replace_field_content(driver: &dyn Driver, text: &str, pace: bool) -> Result<
         return driver.dispatch_input(&InputEvent::KeyPress {
             key: KeyCode::Backspace,
             modifiers: Vec::new(),
+            hold_ms: 0,
         });
     }
     type_text(driver, text, pace)
@@ -455,7 +463,8 @@ fn prepare_socket_path(socket_path: &Path) -> Result<()> {
 }
 
 /// Binds a Unix domain socket at `socket_path` and serves requests concurrently
-/// until a graceful [`Request::Shutdown`] is received.
+/// until a graceful [`Request::Shutdown`] is received or `shutdown` is set (for example
+/// by a termination signal handler).
 ///
 /// # Errors
 ///
@@ -466,6 +475,7 @@ pub fn serve_unix(
     driver: &Arc<dyn Driver>,
     responses: Arc<ResponseStore>,
     options: ServerOptions,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     prepare_socket_path(socket_path)?;
 
@@ -478,7 +488,7 @@ pub fn serve_unix(
     tracing::info!(socket = %socket_path.display(), "listening on unix socket");
 
     let active_connections = Arc::new(AtomicUsize::new(0));
-    let state = Arc::new(SessionState::new(options, responses));
+    let state = Arc::new(SessionState::new(options, responses, shutdown));
 
     while !state.shutdown.load(Ordering::Acquire) {
         match listener.accept() {
@@ -531,7 +541,8 @@ pub fn serve_unix(
 }
 
 /// Binds a loopback-only TCP socket at `bind_addr` (for example `127.0.0.1:49222`)
-/// and serves requests concurrently until a graceful [`Request::Shutdown`] is received.
+/// and serves requests concurrently until a graceful [`Request::Shutdown`] is received
+/// or `shutdown` is set (for example by a termination signal handler).
 ///
 /// # Errors
 ///
@@ -541,6 +552,7 @@ pub fn serve_tcp(
     driver: &Arc<dyn Driver>,
     responses: Arc<ResponseStore>,
     options: ServerOptions,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let addr: SocketAddr = bind_addr.parse().map_err(|_| {
         WayboundError::Io(std::io::Error::new(
@@ -561,7 +573,7 @@ pub fn serve_tcp(
     tracing::info!(tcp = %local_addr, "listening on loopback tcp socket");
 
     let active_connections = Arc::new(AtomicUsize::new(0));
-    let state = Arc::new(SessionState::new(options, responses));
+    let state = Arc::new(SessionState::new(options, responses, shutdown));
 
     while !state.shutdown.load(Ordering::Acquire) {
         match listener.accept() {
@@ -638,7 +650,9 @@ fn handle_unix_connection(
     driver: &dyn Driver,
     state: &SessionState,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    // Reads wake up periodically so an idle connection stays open (clients hold one
+    // long-lived connection) while still noticing shutdown promptly.
+    stream.set_read_timeout(Some(IDLE_POLL_INTERVAL))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let reader_stream = stream.try_clone()?;
     handle_io_streams(reader_stream, stream, driver, state)
@@ -649,7 +663,9 @@ fn handle_tcp_connection(
     driver: &dyn Driver,
     state: &SessionState,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    // Reads wake up periodically so an idle connection stays open (clients hold one
+    // long-lived connection) while still noticing shutdown promptly.
+    stream.set_read_timeout(Some(IDLE_POLL_INTERVAL))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let _ = stream.set_nodelay(true);
     let reader_stream = stream.try_clone()?;
@@ -663,17 +679,31 @@ fn handle_io_streams<R: Read, W: Write>(
     state: &SessionState,
 ) -> Result<()> {
     let mut reader = BufReader::new(reader_stream);
-    let mut line = String::new();
+    let mut frame: Vec<u8> = Vec::new();
+    let mut frame_started: Option<Instant> = None;
 
     loop {
-        line.clear();
-        let bytes_read = (&mut reader)
-            .take(MAX_FRAME_BYTES + 1)
-            .read_line(&mut line)?;
-        if bytes_read == 0 {
-            break;
+        let budget = (MAX_FRAME_BYTES + 1).saturating_sub(frame.len() as u64);
+        match (&mut reader).take(budget).read_until(b'\n', &mut frame) {
+            Ok(0) if frame.is_empty() => break,
+            Ok(_) => {}
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if state.shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                // Idle between requests is fine; a request that stalls mid-frame is not.
+                if frame.is_empty() {
+                    frame_started = None;
+                } else if frame_started.get_or_insert_with(Instant::now).elapsed() >= IO_TIMEOUT {
+                    return Err(WayboundError::Io(err));
+                }
+                continue;
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(WayboundError::Io(err)),
         }
-        if (bytes_read as u64) > MAX_FRAME_BYTES {
+
+        if (frame.len() as u64) > MAX_FRAME_BYTES {
             let err_resp = Response::Error {
                 code: "frame_too_large".to_owned(),
                 message: format!("request exceeded {MAX_FRAME_BYTES}-byte limit"),
@@ -681,9 +711,16 @@ fn handle_io_streams<R: Read, W: Write>(
             let _ = write_response(&mut writer_stream, &err_resp);
             break;
         }
+        let at_eof = frame.last() != Some(&b'\n');
+        let line = String::from_utf8_lossy(&frame).into_owned();
+        frame.clear();
+        frame_started = None;
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            if at_eof {
+                break;
+            }
             continue;
         }
 
@@ -696,7 +733,7 @@ fn handle_io_streams<R: Read, W: Write>(
         };
 
         write_response(&mut writer_stream, &response)?;
-        if state.shutdown.load(Ordering::Acquire) {
+        if at_eof || state.shutdown.load(Ordering::Acquire) {
             break;
         }
     }
@@ -715,6 +752,7 @@ mod tests {
         SessionState::new(
             ServerOptions { use_motion: false },
             Arc::new(ResponseStore::default()),
+            Arc::new(AtomicBool::new(false)),
         )
     }
 
@@ -723,7 +761,11 @@ mod tests {
             .recorded_events()
             .into_iter()
             .filter_map(|event| match event {
-                InputEvent::KeyPress { key, modifiers } => Some((key, modifiers)),
+                InputEvent::KeyPress {
+                    key,
+                    modifiers,
+                    hold_ms: _,
+                } => Some((key, modifiers)),
                 _ => None,
             })
             .collect()

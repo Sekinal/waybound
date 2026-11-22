@@ -17,6 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use tracing_subscriber::EnvFilter;
 use waybound_core::Driver;
@@ -305,6 +306,15 @@ fn build_backend(cli: CliArgs) -> Result<BackendBundle, String> {
     }
 }
 
+#[cfg(unix)]
+const TERMINATION_SIGNALS: &[i32] = &[
+    signal_hook::consts::SIGTERM,
+    signal_hook::consts::SIGINT,
+    signal_hook::consts::SIGHUP,
+];
+#[cfg(not(unix))]
+const TERMINATION_SIGNALS: &[i32] = &[signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT];
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -323,6 +333,16 @@ fn main() -> ExitCode {
 
     let tcp_addr = cli.tcp_addr.clone();
     let socket_path_arg = cli.socket_path.clone();
+
+    // Termination signals take the same graceful path as the `shutdown` request, so the
+    // RAII guards below (Chrome, tshark, proxy forwarder, Waydroid, Xvfb, socket file) are
+    // dropped. Registered before any child process is spawned.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for signal in TERMINATION_SIGNALS {
+        if let Err(err) = signal_hook::flag::register(*signal, Arc::clone(&shutdown)) {
+            tracing::warn!(signal, error = %err, "failed to install signal handler");
+        }
+    }
 
     let responses = Arc::new(ResponseStore::default());
     let _net_tap = cli.ssl_keylog_file.as_ref().and_then(|keylog| {
@@ -348,7 +368,7 @@ fn main() -> ExitCode {
     };
 
     if let Some(addr) = tcp_addr {
-        if let Err(err) = server::serve_tcp(&addr, &bundle.driver, responses, options) {
+        if let Err(err) = server::serve_tcp(&addr, &bundle.driver, responses, options, shutdown) {
             tracing::error!(error = %err, "daemon tcp server terminated with error");
             return ExitCode::FAILURE;
         }
@@ -367,7 +387,9 @@ fn main() -> ExitCode {
                 }
             },
         };
-        if let Err(err) = server::serve_unix(&socket_path, &bundle.driver, responses, options) {
+        if let Err(err) =
+            server::serve_unix(&socket_path, &bundle.driver, responses, options, shutdown)
+        {
             tracing::error!(error = %err, "daemon terminated with error");
             return ExitCode::FAILURE;
         }
@@ -377,7 +399,13 @@ fn main() -> ExitCode {
     #[cfg(not(unix))]
     {
         let _ = socket_path_arg;
-        if let Err(err) = server::serve_tcp("127.0.0.1:49222", &bundle.driver, responses, options) {
+        if let Err(err) = server::serve_tcp(
+            "127.0.0.1:49222",
+            &bundle.driver,
+            responses,
+            options,
+            shutdown,
+        ) {
             tracing::error!(error = %err, "daemon tcp server terminated with error");
             return ExitCode::FAILURE;
         }
