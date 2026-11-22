@@ -17,9 +17,15 @@ import platform
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from waybound import LaunchOptions, launch
-from waybound.session import BackendName
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from waybound.session import BackendName
+    from waybound.types import AccessibilityNode
 
 
 @dataclass(slots=True)
@@ -36,15 +42,13 @@ class BenchmarkReport:
     creepjs_stealth_pct: str | None
 
 
-def _collect_text(nodes: list[object]) -> str:
+def _collect_text(nodes: Sequence[AccessibilityNode]) -> str:
     parts: list[str] = []
     for node in nodes:
-        name = getattr(node, "name", None)
-        value = getattr(node, "value", None)
-        if isinstance(name, str) and name:
-            parts.append(name)
-        if isinstance(value, str) and value and value != name:
-            parts.append(value)
+        if node.name:
+            parts.append(node.name)
+        if node.value and node.value != node.name:
+            parts.append(node.value)
     return "\n".join(parts)
 
 
