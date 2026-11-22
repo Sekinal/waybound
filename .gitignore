@@ -21,3 +21,8 @@ build/
 .vscode/
 *.swp
 *.swo
+
+# Node / TypeScript
+node_modules/
+packages/waybound-ts/dist/
+packages/waybound-ts/build-test/

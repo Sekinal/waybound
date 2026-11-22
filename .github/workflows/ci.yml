@@ -76,3 +76,39 @@ jobs:
       - name: Run live Windows Chrome UIA + SendInput smoke test
         working-directory: python
         run: uv run python ../scripts/windows_live_smoke.py
+
+  typescript:
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/waybound-ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build daemon for end-to-end tests
+        run: cargo build -p waybound-daemon
+        working-directory: .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: packages/waybound-ts/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Biome lint and format check
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Tests
+        # The daemon is built above, so a missing binary must fail the run rather than
+        # silently skip the end-to-end tests.
+        env:
+          WAYBOUND_REQUIRE_DAEMON: "1"
+        run: npm test
