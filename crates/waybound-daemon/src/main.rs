@@ -6,6 +6,7 @@
 mod launcher;
 mod mock_driver;
 mod net_tap;
+mod proxy;
 mod server;
 
 use std::env;
@@ -22,6 +23,7 @@ use waybound_driver_macos::MacOsDriver;
 use crate::launcher::{ChromeLaunchOptions, launch_chrome};
 use crate::mock_driver::MockDriver;
 use crate::net_tap::{ResponseStore, start_passive_tap};
+use crate::proxy::{ProxyForwarder, UpstreamProxy};
 use crate::server::ServerOptions;
 
 struct CliArgs {
@@ -32,6 +34,9 @@ struct CliArgs {
     profile_dir: Option<PathBuf>,
     ssl_keylog_file: Option<PathBuf>,
     initial_url: Option<String>,
+    proxy: Option<String>,
+    timezone: Option<String>,
+    locale: Option<String>,
     no_motion: bool,
 }
 
@@ -43,6 +48,9 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut profile_dir = None;
     let mut ssl_keylog_file = None;
     let mut initial_url = None;
+    let mut proxy = None;
+    let mut timezone = None;
+    let mut locale = None;
     let mut no_motion = false;
 
     let mut args = env::args().skip(1);
@@ -91,6 +99,24 @@ fn parse_args() -> Result<CliArgs, String> {
                     .ok_or_else(|| "--url requires a URL argument".to_owned())?;
                 initial_url = Some(val);
             }
+            "--proxy" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--proxy requires a proxy URL argument".to_owned())?;
+                proxy = Some(val);
+            }
+            "--timezone" => {
+                let val = args.next().ok_or_else(|| {
+                    "--timezone requires an IANA timezone (e.g., America/New_York)".to_owned()
+                })?;
+                timezone = Some(val);
+            }
+            "--locale" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--locale requires a locale (e.g., en_US.UTF-8)".to_owned())?;
+                locale = Some(val);
+            }
             "--no-motion" => no_motion = true,
             unknown => return Err(format!("unknown argument: {unknown}")),
         }
@@ -104,6 +130,9 @@ fn parse_args() -> Result<CliArgs, String> {
         profile_dir,
         ssl_keylog_file,
         initial_url,
+        proxy,
+        timezone,
+        locale,
         no_motion,
     })
 }
@@ -113,6 +142,18 @@ fn default_user_socket_path() -> std::io::Result<PathBuf> {
     fs::create_dir_all(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     Ok(dir.join("w.sock"))
+}
+
+fn setup_proxy(raw: Option<String>) -> Result<(Option<String>, Option<ProxyForwarder>), String> {
+    match raw {
+        Some(raw_proxy) if raw_proxy.contains('@') => {
+            let upstream = UpstreamProxy::parse(&raw_proxy)?;
+            let fwd = ProxyForwarder::start(upstream).map_err(|e| e.to_string())?;
+            Ok((Some(fwd.chrome_proxy_arg()), Some(fwd)))
+        }
+        Some(raw_proxy) => Ok((Some(raw_proxy), None)),
+        None => Ok((None, None)),
+    }
 }
 
 fn main() -> ExitCode {
@@ -154,6 +195,14 @@ fn main() -> ExitCode {
         }
     });
 
+    let (chrome_proxy_server, _proxy_forwarder) = match setup_proxy(cli.proxy) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            tracing::error!(error = %msg, "failed to configure proxy");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Keep `_launched` alive for the full lifetime of the daemon so Chrome is cleaned up on exit.
     let (driver, use_motion, _launched): (Arc<dyn Driver>, bool, Option<launcher::LaunchedChrome>) =
         match cli.backend.as_str() {
@@ -165,6 +214,9 @@ fn main() -> ExitCode {
                         profile_dir: cli.profile_dir,
                         ssl_keylog_file: cli.ssl_keylog_file,
                         initial_url: cli.initial_url,
+                        proxy_server: chrome_proxy_server,
+                        timezone: cli.timezone,
+                        locale: cli.locale,
                     };
                     match launch_chrome(&opts) {
                         Ok(chrome) => {

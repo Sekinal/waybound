@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from waybound import KeyModifier, LaunchOptions, Role, WayboundDaemonError, launch
+from waybound import KeyModifier, LaunchOptions, Role, WayboundDaemonError, launch, launch_async
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DAEMON_BIN = REPO_ROOT / "target" / "debug" / "waybound-daemon"
@@ -44,3 +44,14 @@ def test_ergonomic_launch_full_workflow() -> None:
         with pytest.raises(WayboundDaemonError) as bad_url:
             page.goto("javascript:alert(1)")
         assert bad_url.value.code == "io_error"
+
+
+async def test_async_launch_workflow() -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    async with launch_async(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
+        assert await page.url() == "https://mock.waybound.local/"
+        assert await page.get_by_role(Role.BUTTON).nth(0).text_content() == "Search Flights"
+        await page.get_by_role(Role.TEXTBOX, name="Origin").fill("HND")
+        await page.get_by_role(Role.BUTTON, name="Search").click()

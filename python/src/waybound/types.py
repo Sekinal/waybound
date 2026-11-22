@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -73,6 +74,13 @@ class CapturedResponse:
     status: int
     content_type: str | None
     body: str | None
+
+    def json(self) -> object:
+        """Parse and return the captured response body as JSON."""
+        if self.body is None:
+            msg = f"captured response for {self.url!r} has no body"
+            raise ValueError(msg)
+        return json.loads(self.body)
 
 
 @dataclass(frozen=True, slots=True)

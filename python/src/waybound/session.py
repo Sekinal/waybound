@@ -31,6 +31,9 @@ class LaunchOptions:
     url: str | None = None
     profile_dir: Path | str | None = None
     ssl_keylog: Path | str | None = None
+    proxy: str | None = None
+    timezone: str | None = None
+    locale: str | None = None
     no_motion: bool = False
     daemon_binary: Path | str | None = None
     startup_timeout_s: float = 5.0
@@ -120,6 +123,12 @@ class Session:
             cmd.extend(["--profile-dir", str(Path(opts.profile_dir))])
         if opts.ssl_keylog is not None:
             cmd.extend(["--ssl-keylog", str(Path(opts.ssl_keylog))])
+        if opts.proxy is not None:
+            cmd.extend(["--proxy", opts.proxy])
+        if opts.timezone is not None:
+            cmd.extend(["--timezone", opts.timezone])
+        if opts.locale is not None:
+            cmd.extend(["--locale", opts.locale])
         if opts.no_motion:
             cmd.append("--no-motion")
 

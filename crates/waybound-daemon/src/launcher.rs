@@ -22,6 +22,12 @@ pub struct ChromeLaunchOptions {
     pub ssl_keylog_file: Option<PathBuf>,
     /// Optional initial URL opened at launch.
     pub initial_url: Option<String>,
+    /// Optional `--proxy-server` endpoint (e.g., `http://127.0.0.1:<port>` or `socks5://...`).
+    pub proxy_server: Option<String>,
+    /// Optional OS-level timezone (`TZ` env var, e.g., `America/New_York`).
+    pub timezone: Option<String>,
+    /// Optional OS-level locale (`LANG` / `LC_ALL` env vars, e.g., `en_US.UTF-8`).
+    pub locale: Option<String>,
 }
 
 /// RAII handle owning a spawned Google Chrome process.
@@ -106,6 +112,15 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
     }
     if let Some(keylog) = &options.ssl_keylog_file {
         let _ = cmd.env("SSLKEYLOGFILE", keylog);
+    }
+    if let Some(proxy_server) = &options.proxy_server {
+        let _ = cmd.arg(format!("--proxy-server={proxy_server}"));
+    }
+    if let Some(tz) = &options.timezone {
+        let _ = cmd.env("TZ", tz);
+    }
+    if let Some(locale) = &options.locale {
+        let _ = cmd.env("LANG", locale).env("LC_ALL", locale);
     }
     if let Some(url) = &options.initial_url {
         let _ = cmd.arg(url);

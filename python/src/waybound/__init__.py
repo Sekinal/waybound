@@ -1,5 +1,6 @@
 """waybound: Ergonomic, out-of-band OS-level browser automation."""
 
+from waybound.async_client import AsyncLocator, AsyncPage, AsyncSession, launch_async
 from waybound.client import Locator, Page
 from waybound.session import LaunchOptions, Session, launch
 from waybound.transport import UnixSocketTransport, WayboundDaemonError
@@ -16,6 +17,9 @@ from waybound.types import (
 
 __all__ = [
     "AccessibilityNode",
+    "AsyncLocator",
+    "AsyncPage",
+    "AsyncSession",
     "BackendKind",
     "Bounds",
     "CapturedResponse",
@@ -30,4 +34,5 @@ __all__ = [
     "UnixSocketTransport",
     "WayboundDaemonError",
     "launch",
+    "launch_async",
 ]
