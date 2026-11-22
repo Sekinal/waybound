@@ -22,45 +22,73 @@ const MAX_BODY_BYTES: usize = 512 * 1024;
 const MAX_DECOMPRESSED_BYTES: u64 = 4 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_WAIT_MS: u64 = 120_000;
+/// A matched response is returned once its body has stopped growing for this long.
+const BODY_SETTLE: Duration = Duration::from_millis(150);
+/// How long to wait for a body after headers before returning a body-less response.
+const BODY_GRACE: Duration = Duration::from_millis(500);
+
+struct StoredResponse {
+    /// Correlator stream sequence ID (monotonically increasing in arrival order).
+    seq: u64,
+    response: CapturedResponse,
+    first_seen: Instant,
+    updated: Instant,
+}
+
+#[derive(Default)]
+struct StoreInner {
+    entries: VecDeque<StoredResponse>,
+    /// Highest stream sequence ID ever stored; the baseline for [`ResponseStore::wait_for`].
+    last_seq: u64,
+}
 
 /// Thread-safe store of passively decrypted HTTP responses keyed by stream sequence ID.
 #[derive(Default)]
 pub struct ResponseStore {
-    responses: Mutex<VecDeque<(u64, CapturedResponse)>>,
+    inner: Mutex<StoreInner>,
 }
 
 impl ResponseStore {
     /// Inserts a new captured response or updates the exact same stream (`stream_seq`)
     /// when streaming `DATA` frames arrive after initial `HEADERS`.
     pub fn upsert(&self, stream_seq: u64, resp: CapturedResponse) {
-        if let Ok(mut guard) = self.responses.lock() {
-            if let Some((_, existing)) = guard.iter_mut().rev().find(|(seq, _)| *seq == stream_seq)
-            {
-                if resp.body.is_some() {
-                    existing.body = resp.body;
-                }
-                if existing.content_type.is_none() {
-                    existing.content_type = resp.content_type;
-                }
-                return;
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        if let Some(existing) = guard.entries.iter_mut().rev().find(|e| e.seq == stream_seq) {
+            if resp.body.is_some() {
+                existing.response.body = resp.body;
+                existing.updated = now;
             }
-            if guard.len() >= MAX_CAPTURED_RESPONSES {
-                let _ = guard.pop_front();
+            if existing.response.content_type.is_none() {
+                existing.response.content_type = resp.content_type;
             }
-            guard.push_back((stream_seq, resp));
+            return;
         }
+        if guard.entries.len() >= MAX_CAPTURED_RESPONSES {
+            let _ = guard.entries.pop_front();
+        }
+        guard.last_seq = guard.last_seq.max(stream_seq);
+        guard.entries.push_back(StoredResponse {
+            seq: stream_seq,
+            response: resp,
+            first_seen: now,
+            updated: now,
+        });
     }
 
     /// Returns all captured responses, optionally filtered by case-insensitive URL substring.
     #[must_use]
     pub fn list(&self, url_contains: Option<&str>) -> Vec<CapturedResponse> {
         let needle = url_contains.map(str::to_lowercase);
-        self.responses.lock().map_or_else(
+        self.inner.lock().map_or_else(
             |_| Vec::new(),
             |guard| {
                 guard
+                    .entries
                     .iter()
-                    .map(|(_, r)| r)
+                    .map(|e| &e.response)
                     .filter(|r| {
                         needle
                             .as_ref()
@@ -72,7 +100,13 @@ impl ResponseStore {
         )
     }
 
-    /// Polls until a captured response matches `url_contains` or `timeout_ms` elapses.
+    /// Waits for the first response matching `url_contains` that is captured *after* this
+    /// call starts, or until `timeout_ms` elapses.
+    ///
+    /// Responses already in the store are ignored, so start waiting before triggering the
+    /// request (as with Playwright's `expect_response`). Once a match is seen, the call
+    /// keeps waiting until its body has stopped growing for [`BODY_SETTLE`], or returns it
+    /// without a body after [`BODY_GRACE`] (for example `204`/`304` responses).
     ///
     /// # Errors
     ///
@@ -81,18 +115,26 @@ impl ResponseStore {
         let clamped_ms = timeout_ms.min(MAX_WAIT_MS);
         let needle = url_contains.to_lowercase();
         let deadline = Instant::now() + Duration::from_millis(clamped_ms);
+        let baseline = self.inner.lock().map_or(0, |g| g.last_seq);
 
         loop {
-            if let Ok(guard) = self.responses.lock()
-                && let Some((_, found)) = guard
+            let now = Instant::now();
+            let expired = now >= deadline;
+            if let Ok(guard) = self.inner.lock()
+                && let Some(found) = guard
+                    .entries
                     .iter()
-                    .rev()
-                    .find(|(_, r)| r.url.to_lowercase().contains(&needle))
+                    .find(|e| e.seq > baseline && e.response.url.to_lowercase().contains(&needle))
             {
-                return Ok(found.clone());
-            }
-
-            if Instant::now() >= deadline {
+                let settled = if found.response.body.is_some() {
+                    now.duration_since(found.updated) >= BODY_SETTLE
+                } else {
+                    now.duration_since(found.first_seen) >= BODY_GRACE
+                };
+                if settled || expired {
+                    return Ok(found.response.clone());
+                }
+            } else if expired {
                 return Err(WayboundError::Timeout {
                     timeout_ms: clamped_ms,
                     context: format!("no captured HTTP response matched {url_contains:?}"),
@@ -139,6 +181,18 @@ impl StreamCorrelator {
         self.next_seq
     }
 
+    /// Drops the oldest quarter of tracked streams (by sequence ID) so recent, possibly
+    /// in-flight streams survive when the map is full. Finished streams are never signalled
+    /// by the field output, so age is the only eviction signal available.
+    fn evict_oldest_streams(&mut self) {
+        let mut seqs: Vec<u64> = self.streams.values().map(|s| s.seq).collect();
+        seqs.sort_unstable();
+        let Some(&cutoff) = seqs.get(seqs.len() / 4) else {
+            return;
+        };
+        self.streams.retain(|_, s| s.seq > cutoff);
+    }
+
     fn ingest_line(&mut self, line: &str, store: &ResponseStore) {
         let cols: Vec<&str> = line.split('\t').collect();
         if cols.len() < 15 {
@@ -173,7 +227,7 @@ impl StreamCorrelator {
         };
 
         if self.streams.len() >= MAX_PENDING_STREAMS && !self.streams.contains_key(&key) {
-            self.streams.clear();
+            self.evict_oldest_streams();
         }
 
         if !self.streams.contains_key(&key) {
@@ -563,6 +617,93 @@ mod tests {
         assert_eq!(captured[1].url, "https://a.test/2");
         assert_eq!(captured[1].status, 201);
         assert_eq!(captured[1].body.as_deref(), Some("two"));
+    }
+
+    fn sample(url: &str, body: Option<&str>) -> CapturedResponse {
+        CapturedResponse {
+            url: url.to_owned(),
+            status: 200,
+            content_type: None,
+            body: body.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn wait_for_ignores_responses_captured_before_the_call() {
+        let store = Arc::new(ResponseStore::default());
+        store.upsert(1, sample("https://a.test/api?q=old", Some("old")));
+
+        // Only the stale response exists: the wait must time out rather than return it.
+        assert!(matches!(
+            store.wait_for("/api", 120),
+            Err(WayboundError::Timeout { .. })
+        ));
+
+        let writer = Arc::clone(&store);
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            writer.upsert(2, sample("https://a.test/api?q=new", Some("new")));
+        });
+        let got = store.wait_for("/api", 3_000);
+        assert!(handle.join().is_ok());
+        assert_eq!(got.ok().and_then(|r| r.body).as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn wait_for_waits_for_body_after_headers() {
+        let store = Arc::new(ResponseStore::default());
+        let writer = Arc::clone(&store);
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            writer.upsert(1, sample("https://a.test/data", None));
+            thread::sleep(Duration::from_millis(120));
+            writer.upsert(1, sample("https://a.test/data", Some("{}")));
+        });
+        let got = store.wait_for("/data", 3_000);
+        assert!(handle.join().is_ok());
+        assert_eq!(got.ok().and_then(|r| r.body).as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn wait_for_returns_bodyless_response_after_grace() {
+        let store = Arc::new(ResponseStore::default());
+        let writer = Arc::clone(&store);
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            writer.upsert(1, sample("https://a.test/empty", None));
+        });
+        let got = store.wait_for("/empty", 3_000);
+        assert!(handle.join().is_ok());
+        assert!(matches!(got, Ok(ref r) if r.body.is_none()));
+    }
+
+    #[test]
+    fn correlator_keeps_recent_streams_when_full() {
+        let store = ResponseStore::default();
+        let mut correlator = StreamCorrelator::default();
+
+        for id in 0..MAX_PENDING_STREAMS {
+            let stream = id * 2 + 1;
+            correlator.ingest_line(
+                &format!("3\t\t{stream}\t\t\t\t\t\tapi.example.com\t/old\t\t\t\t\t\t\t\t"),
+                &store,
+            );
+        }
+        // Request headers of an in-flight stream, then enough new streams to overflow the map.
+        correlator.ingest_line(
+            "4\t\t1\t\t\t\t\t\tapi.example.com\t/inflight\t\t\t\t\t\t\t\t",
+            &store,
+        );
+        assert!(correlator.streams.len() <= MAX_PENDING_STREAMS);
+        assert!(correlator.streams.len() > MAX_PENDING_STREAMS / 2);
+
+        correlator.ingest_line(
+            "4\t\t1\t\t\t200\t\t\t\t\t\t\t\tapplication/json\t\t\t7b7d\t",
+            &store,
+        );
+        let captured = store.list(Some("/inflight"));
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].body.as_deref(), Some("{}"));
     }
 
     #[test]
