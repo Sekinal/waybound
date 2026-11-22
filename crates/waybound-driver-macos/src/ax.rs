@@ -263,22 +263,22 @@ fn read_bounds(element: &OwnedCf) -> Bounds {
     }
 }
 
-fn map_ax_role(ax_role: &str) -> Role {
-    match ax_role {
-        "AXButton" | "AXPopUpButton" | "AXMenuButton" => Role::Button,
-        "AXLink" => Role::Link,
-        "AXTextField" | "AXTextArea" | "AXSearchField" => Role::TextBox,
-        "AXComboBox" => Role::ComboBox,
-        "AXList" | "AXOutline" => Role::ListBox,
-        "AXMenuItem" => Role::MenuItem,
-        "AXRadioButton" => Role::Radio,
-        "AXCheckBox" => Role::CheckBox,
-        "AXSwitch" => Role::Switch,
-        "AXTab" | "AXTabGroup" => Role::Tab,
-        "AXDialog" | "AXSheet" => Role::Dialog,
-        "AXWebArea" | "AXScrollArea" => Role::Document,
-        "AXHeading" => Role::Heading,
-        "AXStaticText" => Role::StaticText,
+fn map_ax_role(ax_role: &str, ax_subrole: Option<&str>) -> Role {
+    match (ax_role, ax_subrole) {
+        ("AXCheckBox", Some("AXSwitch")) | ("AXSwitch", _) => Role::Switch,
+        ("AXRadioButton", Some("AXTabButton")) | ("AXTab" | "AXTabGroup", _) => Role::Tab,
+        ("AXGroup", Some("AXApplicationDialog")) | ("AXDialog" | "AXSheet", _) => Role::Dialog,
+        ("AXButton" | "AXPopUpButton" | "AXMenuButton", _) => Role::Button,
+        ("AXLink", _) => Role::Link,
+        ("AXTextField" | "AXTextArea" | "AXSearchField", _) => Role::TextBox,
+        ("AXComboBox", _) => Role::ComboBox,
+        ("AXList" | "AXOutline", _) => Role::ListBox,
+        ("AXMenuItem", _) => Role::MenuItem,
+        ("AXRadioButton", _) => Role::Radio,
+        ("AXCheckBox", _) => Role::CheckBox,
+        ("AXWebArea" | "AXScrollArea", _) => Role::Document,
+        ("AXHeading", _) => Role::Heading,
+        ("AXStaticText", _) => Role::StaticText,
         _ => Role::Unknown,
     }
 }
@@ -295,7 +295,13 @@ fn walk_node(
     *visited += 1;
 
     let role_str = read_string_attr(element, "AXRole").unwrap_or_default();
-    let role = map_ax_role(&role_str);
+    let subrole_str = matches!(
+        role_str.as_str(),
+        "AXCheckBox" | "AXRadioButton" | "AXGroup"
+    )
+    .then(|| read_string_attr(element, "AXSubrole"))
+    .flatten();
+    let role = map_ax_role(&role_str, subrole_str.as_deref());
     let name = read_string_attr(element, "AXTitle")
         .filter(|s| !s.is_empty())
         .or_else(|| read_string_attr(element, "AXDescription").filter(|s| !s.is_empty()))

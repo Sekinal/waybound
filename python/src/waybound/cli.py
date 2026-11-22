@@ -73,7 +73,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args[0] == "fetch":
         version = args[1] if len(args) > 1 else DEFAULT_VERSION
-        path = download_daemon_binary(version=version)
+        try:
+            path = download_daemon_binary(version=version)
+        except (RuntimeError, ValueError, OSError) as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            return 1
         sys.stdout.write(f"Installed waybound-daemon ({version}) -> {path}\n")
         return 0
 

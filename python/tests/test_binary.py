@@ -24,3 +24,5 @@ def test_cached_daemon_path_validates_version() -> None:
 def test_download_daemon_binary_rejects_invalid_repo() -> None:
     with pytest.raises(ValueError, match="invalid GitHub repository slug"):
         download_daemon_binary(repo="not-a-valid-repo-slug")
+    with pytest.raises(ValueError, match="invalid GitHub repository slug"):
+        download_daemon_binary(repo="../..")

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from waybound.binary import cached_daemon_path
+from waybound.binary import find_cached_daemon
 from waybound.client import Page
 from waybound.transport import UnixSocketTransport, WayboundDaemonError
 
@@ -58,10 +58,6 @@ def _resolve_daemon_binary(explicit: Path | str | None) -> Path:
     if on_path is not None:
         return Path(on_path)
 
-    cached = cached_daemon_path()
-    if cached.exists():
-        return cached
-
     parents = Path(__file__).resolve().parents
     if len(parents) >= _MIN_WORKSPACE_PARENTS:
         repo_root = parents[3]
@@ -70,7 +66,14 @@ def _resolve_daemon_binary(explicit: Path | str | None) -> Path:
             if candidate.exists():
                 return candidate
 
-    msg = "waybound-daemon binary not found on PATH or in target/{release,debug}"
+    cached = find_cached_daemon()
+    if cached is not None:
+        return cached
+
+    msg = (
+        "waybound-daemon binary not found on PATH, in target/{release,debug}, "
+        "or in ~/.cache/waybound"
+    )
     raise FileNotFoundError(msg)
 
 
