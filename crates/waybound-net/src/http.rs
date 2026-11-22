@@ -12,20 +12,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flate2::read::{GzDecoder, ZlibDecoder};
 use fluke_hpack::Decoder as HpackDecoder;
-use waybound_core::{CapturedResponse, Http2Setting};
-
-use crate::fingerprint::FingerprintRecorder;
+use waybound_core::CapturedResponse;
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 const H2_FRAME_DATA: u8 = 0x0;
 const H2_FRAME_HEADERS: u8 = 0x1;
 const H2_FRAME_RST_STREAM: u8 = 0x3;
-const H2_FRAME_SETTINGS: u8 = 0x4;
-const H2_FRAME_WINDOW_UPDATE: u8 = 0x8;
 const H2_FRAME_CONTINUATION: u8 = 0x9;
 
-const H2_FLAG_ACK: u8 = 0x1;
 const H2_FLAG_END_STREAM: u8 = 0x1;
 const H2_FLAG_END_HEADERS: u8 = 0x4;
 const H2_FLAG_PADDED: u8 = 0x8;
@@ -111,7 +106,6 @@ pub struct HttpConnectionCorrelator {
     next_seq_base: u64,
     inflight: InflightCounter,
     on_response: ResponseCallback,
-    fingerprint: Option<FingerprintRecorder>,
 }
 
 impl std::fmt::Debug for HttpConnectionCorrelator {
@@ -147,18 +141,6 @@ impl HttpConnectionCorrelator {
         inflight: InflightCounter,
         on_response: ResponseCallback,
     ) -> Self {
-        Self::with_fingerprint(host_fallback, seq_base, inflight, on_response, None)
-    }
-
-    /// Creates a new correlator that also records HTTP/2, header, and cookie fingerprints.
-    #[must_use]
-    pub fn with_fingerprint(
-        host_fallback: String,
-        seq_base: u64,
-        inflight: InflightCounter,
-        on_response: ResponseCallback,
-        fingerprint: Option<FingerprintRecorder>,
-    ) -> Self {
         Self {
             host_fallback,
             mode: ProtoMode::Detecting,
@@ -174,7 +156,6 @@ impl HttpConnectionCorrelator {
             next_seq_base: seq_base,
             inflight,
             on_response,
-            fingerprint,
         }
     }
 
@@ -234,23 +215,6 @@ impl HttpConnectionCorrelator {
     fn drain_h2_client(&mut self) {
         while let Some((ftype, flags, stream_id, payload)) = pop_h2_frame(&mut self.c2s_buf) {
             if stream_id == 0 {
-                if let Some(ref rec) = self.fingerprint {
-                    if ftype == H2_FRAME_SETTINGS && (flags & H2_FLAG_ACK) == 0 {
-                        let settings: Vec<Http2Setting> = payload
-                            .chunks_exact(6)
-                            .map(|c| Http2Setting {
-                                id: u16::from_be_bytes([c[0], c[1]]),
-                                value: u32::from_be_bytes([c[2], c[3], c[4], c[5]]),
-                            })
-                            .collect();
-                        rec.record_h2_settings(settings);
-                    } else if ftype == H2_FRAME_WINDOW_UPDATE && payload.len() >= 4 {
-                        let inc =
-                            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
-                                & 0x7fff_ffff;
-                        rec.record_h2_window_update(inc);
-                    }
-                }
                 continue;
             }
             match ftype {
@@ -294,27 +258,15 @@ impl HttpConnectionCorrelator {
         };
         let mut authority = String::new();
         let mut path = String::new();
-        let mut pseudo_order = Vec::new();
-        let mut ordered_headers = Vec::new();
         for (name, value) in headers {
-            let n = String::from_utf8_lossy(&name).into_owned();
-            let v = String::from_utf8_lossy(&value).into_owned();
-            if n.starts_with(':') {
-                pseudo_order.push(n.clone());
+            if name.as_slice() == b":authority" || name.as_slice() == b"host" {
+                authority = String::from_utf8_lossy(&value).into_owned();
+            } else if name.as_slice() == b":path" {
+                path = String::from_utf8_lossy(&value).into_owned();
             }
-            if n == ":authority" || n.eq_ignore_ascii_case("host") {
-                authority.clone_from(&v);
-            } else if n == ":path" {
-                path.clone_from(&v);
-            }
-            ordered_headers.push((n, v));
         }
         if authority.is_empty() {
             authority.clone_from(&self.host_fallback);
-        }
-        if let Some(ref rec) = self.fingerprint {
-            rec.record_h2_pseudo_order(pseudo_order);
-            rec.record_request_headers(&authority, &ordered_headers);
         }
         let url = build_https_url(&authority, &path);
         let seq = self.alloc_seq();
@@ -401,16 +353,6 @@ impl HttpConnectionCorrelator {
                 }
                 "content-type" => st.content_type = Some(v),
                 "content-encoding" => st.content_encoding = Some(v),
-                "set-cookie" => {
-                    if let Some(ref rec) = self.fingerprint {
-                        let host = st
-                            .url
-                            .as_deref()
-                            .and_then(extract_url_host)
-                            .unwrap_or(&self.host_fallback);
-                        rec.record_set_cookie(host, &v);
-                    }
-                }
                 _ => {}
             }
         }
@@ -465,19 +407,12 @@ impl HttpConnectionCorrelator {
             };
             let path = req_line.split_whitespace().nth(1).unwrap_or("/");
             let mut host = self.host_fallback.clone();
-            let mut ordered_headers = Vec::new();
             for line in lines {
-                if let Some((k, v)) = line.split_once(':') {
-                    let k_trim = k.trim();
-                    let v_trim = v.trim();
-                    if k_trim.eq_ignore_ascii_case("host") {
-                        v_trim.clone_into(&mut host);
-                    }
-                    ordered_headers.push((k_trim.to_owned(), v_trim.to_owned()));
+                if let Some((k, v)) = line.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("host")
+                {
+                    v.trim().clone_into(&mut host);
                 }
-            }
-            if let Some(ref rec) = self.fingerprint {
-                rec.record_request_headers(&host, &ordered_headers);
             }
             let url = build_https_url(&host, path);
             self.h1_pending_urls.push(url);
@@ -506,7 +441,6 @@ impl HttpConnectionCorrelator {
             let mut content_encoding = None;
             let mut content_length: Option<usize> = None;
             let mut chunked = false;
-            let mut set_cookies = Vec::new();
             for line in lines {
                 if let Some((k, v)) = line.split_once(':') {
                     let key = k.trim().to_ascii_lowercase();
@@ -515,7 +449,6 @@ impl HttpConnectionCorrelator {
                         "content-type" => content_type = Some(val.to_owned()),
                         "content-encoding" => content_encoding = Some(val.to_owned()),
                         "content-length" => content_length = val.parse::<usize>().ok(),
-                        "set-cookie" => set_cookies.push(val.to_owned()),
                         "transfer-encoding" if val.to_ascii_lowercase().contains("chunked") => {
                             chunked = true;
                         }
@@ -550,12 +483,6 @@ impl HttpConnectionCorrelator {
                 self.inflight.dec();
                 self.h1_pending_urls.remove(0)
             };
-            if let Some(ref rec) = self.fingerprint {
-                let host = extract_url_host(&url).unwrap_or(&self.host_fallback);
-                for sc in &set_cookies {
-                    rec.record_set_cookie(host, sc);
-                }
-            }
             self.h1_current_seq = self.alloc_seq();
             let body = decode_body_bytes(&raw_body, content_encoding.as_deref());
             (self.on_response)(
@@ -642,15 +569,6 @@ fn decode_chunked(mut data: &[u8]) -> Option<(Vec<u8>, usize)> {
         }
         data = &data[size + 2..];
     }
-}
-
-fn extract_url_host(url: &str) -> Option<&str> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let authority = rest.split('/').next()?;
-    let host = authority.split(':').next()?;
-    if host.is_empty() { None } else { Some(host) }
 }
 
 fn build_https_url(authority: &str, path: &str) -> String {

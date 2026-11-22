@@ -22,7 +22,7 @@ use waybound_core::{
     key_delay, key_hold_ms, mouse_hold_ms, pick_click_point, plan_human_pointer_path,
     plan_scroll_burst,
 };
-use waybound_net::{FingerprintRecorder, InflightCounter, wait_for_network_idle};
+use waybound_net::{InflightCounter, wait_for_network_idle};
 
 use crate::net_tap::ResponseStore;
 
@@ -68,8 +68,6 @@ pub struct ServerOptions {
     pub use_motion: bool,
     /// Shared inflight HTTP/1.1–2 request counter for `wait_for_network_idle`.
     pub inflight: InflightCounter,
-    /// Shared session-wide TLS/HTTP2/header/cookie fingerprint recorder.
-    pub fingerprint: FingerprintRecorder,
 }
 
 struct SessionState {
@@ -231,9 +229,6 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
                 })
             }
         }
-        Request::ExportSessionFingerprint => Response::SessionFingerprint {
-            fingerprint: Box::new(state.options.fingerprint.snapshot()),
-        },
         Request::Screenshot { path } => match driver.screenshot(Path::new(&path)) {
             Ok(()) => Response::Ok,
             Err(err) => Response::from(&err),
@@ -954,7 +949,6 @@ mod tests {
             ServerOptions {
                 use_motion: false,
                 inflight: InflightCounter::default(),
-                fingerprint: FingerprintRecorder::new(),
             },
             Arc::new(ResponseStore::default()),
             Arc::new(AtomicBool::new(false)),

@@ -7,7 +7,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod fingerprint;
 pub mod http;
 pub mod keylog;
 pub mod tls13;
@@ -17,9 +16,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub use fingerprint::{
-    FingerprintRecorder, compute_akamai_h2, compute_ja4, is_grease, parse_client_hello,
-};
 pub use http::{HttpConnectionCorrelator, InflightCounter, ResponseCallback, decode_body_bytes};
 pub use keylog::{KeyLogStore, TrafficSecrets};
 pub use tls13::{Direction, PassiveTls13Decoder, Tls13CipherSuite};
@@ -47,31 +43,13 @@ impl PassiveConnectionTap {
         inflight: InflightCounter,
         on_response: ResponseCallback,
     ) -> Self {
-        Self::new_with_fingerprint(host, keylog, inflight, on_response, None)
-    }
-
-    /// Creates a new passive tap that also records live TLS/HTTP2/header/cookie fingerprints.
-    #[must_use]
-    pub fn new_with_fingerprint(
-        host: String,
-        keylog: KeyLogStore,
-        inflight: InflightCounter,
-        on_response: ResponseCallback,
-        fingerprint: Option<FingerprintRecorder>,
-    ) -> Self {
         let seq_base = NEXT_CONN_SEQ
             .fetch_add(1_000_000, Ordering::Relaxed)
             .saturating_add(1);
         Self {
             inner: Arc::new(Mutex::new(TapInner {
-                tls: PassiveTls13Decoder::with_fingerprint(keylog, fingerprint.clone()),
-                http: HttpConnectionCorrelator::with_fingerprint(
-                    host,
-                    seq_base,
-                    inflight,
-                    on_response,
-                    fingerprint,
-                ),
+                tls: PassiveTls13Decoder::new(keylog),
+                http: HttpConnectionCorrelator::new(host, seq_base, inflight, on_response),
             })),
         }
     }
