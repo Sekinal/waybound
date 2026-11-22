@@ -9,9 +9,10 @@ pub use waydroid::{WaydroidConfig, WaydroidSession};
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use waybound_core::{
-    AccessibilityNode, BackendKind, Driver, InputEvent, Point, Result, WayboundError,
+    AccessibilityNode, BackendKind, Driver, InputEvent, LocatorQuery, Point, Result, WayboundError,
 };
 
 /// Android / Waydroid browser driver communicating with an unmodified Android Chrome
@@ -19,6 +20,11 @@ use waybound_core::{
 pub struct AndroidDriver {
     serial: Option<String>,
     cursor: Mutex<Point>,
+    /// Serialises `uiautomator dump`: two concurrent dumps on one device make each other
+    /// fail (`UiAutomationService ... already registered`).
+    dump_lock: Mutex<()>,
+    /// Device API level decides how modifier chords are sent; probed once on first use.
+    chords: adb::ChordSupportCache,
 }
 
 impl AndroidDriver {
@@ -31,6 +37,8 @@ impl AndroidDriver {
         Self {
             serial,
             cursor: Mutex::new(Point { x: 0.0, y: 0.0 }),
+            dump_lock: Mutex::new(()),
+            chords: adb::ChordSupportCache::new(),
         }
     }
 
@@ -49,6 +57,30 @@ impl AndroidDriver {
     pub fn open_url(&self, url: &str) -> Result<()> {
         adb::open_chrome_url(self.serial.as_deref(), url)
     }
+
+    /// Dumps the UI hierarchy, retrying transient `uiautomator` failures.
+    ///
+    /// The retry budget is [`adb::snapshot_retry_budget`] of `caller_remaining`.
+    ///
+    /// The dump lock is taken per attempt, so another connection can dump between this
+    /// call's retries instead of queueing behind the whole loop.
+    fn dump_xml(&self, caller_remaining: Option<Duration>) -> Result<String> {
+        let serial = self.serial.as_deref();
+        adb::retry_dump(
+            &adb::SystemClock,
+            adb::snapshot_retry_budget(caller_remaining),
+            || {
+                let _guard =
+                    self.dump_lock
+                        .lock()
+                        .map_err(|_| WayboundError::BackendUnavailable {
+                            backend: "android_waydroid".to_owned(),
+                            reason: "uiautomator dump mutex poisoned".to_owned(),
+                        })?;
+                adb::dump_ui_xml(serial)
+            },
+        )
+    }
 }
 
 impl Driver for AndroidDriver {
@@ -57,12 +89,27 @@ impl Driver for AndroidDriver {
     }
 
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
-        let raw_xml = adb::dump_ui_xml(self.serial.as_deref())?;
+        let raw_xml = self.dump_xml(None)?;
         Ok(xml::parse_uiautomator_xml(&raw_xml))
     }
 
+    fn locate_within(
+        &self,
+        query: &LocatorQuery,
+        remaining: Duration,
+    ) -> Result<AccessibilityNode> {
+        let raw_xml = self.dump_xml(Some(remaining))?;
+        let nodes = xml::parse_uiautomator_xml(&raw_xml);
+        query
+            .resolve_one(&nodes)
+            .cloned()
+            .ok_or_else(|| WayboundError::ElementNotFound {
+                query: format!("{query:?}"),
+            })
+    }
+
     fn current_url(&self) -> Result<Option<String>> {
-        let raw_xml = adb::dump_ui_xml(self.serial.as_deref())?;
+        let raw_xml = self.dump_xml(None)?;
         Ok(xml::extract_chrome_url(&raw_xml))
     }
 
@@ -83,7 +130,7 @@ impl Driver for AndroidDriver {
                 backend: "android_waydroid".to_owned(),
                 reason: "cursor state mutex poisoned".to_owned(),
             })?;
-        adb::dispatch_input(self.serial.as_deref(), event, &mut guard)
+        adb::dispatch_input(self.serial.as_deref(), event, &mut guard, &self.chords)
     }
 }
 

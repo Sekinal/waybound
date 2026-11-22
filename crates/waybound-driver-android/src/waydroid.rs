@@ -9,7 +9,7 @@ use std::process::{Child, Stdio};
 #[cfg(target_os = "linux")]
 use std::thread;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use tracing::{debug, info, warn};
@@ -226,32 +226,105 @@ impl Drop for WaydroidSession {
     }
 }
 
+/// Classifies `adb -s <serial> get-state` output while waiting for a booting container.
+///
+/// `device` means ready. While the container boots, adb reports the device as offline or
+/// not found; those are transient here (unlike during normal operation). An unauthorized
+/// device or a missing `adb` server cannot heal by waiting and is fatal.
+///
+/// # Errors
+///
+/// [`WayboundError::Transient`] for "not ready yet", [`WayboundError::BackendUnavailable`]
+/// for fatal states.
+pub fn classify_get_state(success: bool, stdout: &str, stderr: &str) -> Result<()> {
+    let state = stdout.trim();
+    if success && state == "device" {
+        return Ok(());
+    }
+    let combined = format!("{state} {}", stderr.trim());
+    let lower = combined.to_ascii_lowercase();
+    let reason = format!("adb get-state: {}", combined.trim());
+    if [
+        "unauthorized",
+        "insufficient permissions",
+        "cannot connect to daemon",
+        "failed to start daemon",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
+    {
+        return Err(WayboundError::BackendUnavailable {
+            backend: BACKEND_NAME.to_owned(),
+            reason,
+        });
+    }
+    Err(WayboundError::Transient {
+        backend: BACKEND_NAME.to_owned(),
+        reason,
+    })
+}
+
+/// Classifies `adb shell getprop sys.boot_completed` output: `1` means Android finished
+/// booting (package manager and activity manager are up).
+///
+/// # Errors
+///
+/// [`WayboundError::Transient`] until the property reads `1`.
+pub fn classify_boot_completed(stdout: &str) -> Result<()> {
+    if stdout.trim() == "1" {
+        return Ok(());
+    }
+    Err(WayboundError::Transient {
+        backend: BACKEND_NAME.to_owned(),
+        reason: format!(
+            "Android has not finished booting (sys.boot_completed={:?})",
+            stdout.trim()
+        ),
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn wait_for_adb_device(serial: &str) -> Result<()> {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    while Instant::now() < deadline {
-        let _ = waybound_core::process::command("adb")
-            .args(["connect", serial])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    let probe = || -> Result<()> {
+        // `adb connect` fails while the container is still starting; get-state decides.
+        let _ = run_adb_transient(&adb::build_adb_args(None, &["connect", serial]))?;
+        let state = run_adb_transient(&adb::build_adb_args(Some(serial), &["get-state"]))?;
+        classify_get_state(
+            state.status.success(),
+            &String::from_utf8_lossy(&state.stdout),
+            &String::from_utf8_lossy(&state.stderr),
+        )?;
+        let boot = run_adb_transient(&adb::build_adb_args(
+            Some(serial),
+            &["shell", "getprop", "sys.boot_completed"],
+        ))?;
+        classify_boot_completed(&String::from_utf8_lossy(&boot.stdout))
+    };
 
-        if let Ok(output) = waybound_core::process::command("adb")
-            .args(["-s", serial, "get-state"])
-            .stdin(Stdio::null())
-            .output()
-            && output.status.success()
-            && String::from_utf8_lossy(&output.stdout).trim() == "device"
-        {
-            return Ok(());
-        }
-        thread::sleep(POLL_INTERVAL);
+    match adb::poll_transient(&adb::SystemClock, STARTUP_TIMEOUT, POLL_INTERVAL, probe) {
+        Ok(()) => Ok(()),
+        Err(adb::PollError::Fatal(err)) => Err(err),
+        Err(adb::PollError::Exhausted { attempts, last }) => Err(WayboundError::Timeout {
+            timeout_ms: u64::try_from(STARTUP_TIMEOUT.as_millis()).unwrap_or(30_000),
+            context: format!(
+                "waydroid ADB device {serial} did not become ready after {attempts} checks; \
+                 last error: {}",
+                adb::error_reason(&last)
+            ),
+        }),
     }
+}
 
-    Err(WayboundError::Timeout {
-        timeout_ms: u64::try_from(STARTUP_TIMEOUT.as_millis()).unwrap_or(30_000),
-        context: format!("waydroid ADB device {serial} did not become ready"),
+/// Runs `adb`, treating a per-command timeout as transient (the container may be busy
+/// booting). A missing `adb` binary stays fatal.
+#[cfg(target_os = "linux")]
+fn run_adb_transient(args: &[String]) -> Result<std::process::Output> {
+    adb::run_adb(args).map_err(|err| match err {
+        WayboundError::Timeout { context, .. } => WayboundError::Transient {
+            backend: BACKEND_NAME.to_owned(),
+            reason: context,
+        },
+        other => other,
     })
 }
 
@@ -333,5 +406,48 @@ mod tests {
             timezone: None,
         };
         assert!(zero_port.validate().is_err());
+    }
+
+    #[test]
+    fn readiness_treats_booting_states_as_transient_and_auth_as_fatal() {
+        assert!(classify_get_state(true, "device\n", "").is_ok());
+
+        for (stdout, stderr) in [
+            ("", "error: device '127.0.0.1:5555' not found"),
+            ("offline\n", ""),
+            ("", "error: device offline"),
+            ("bootloader\n", ""),
+        ] {
+            assert!(
+                matches!(
+                    classify_get_state(false, stdout, stderr),
+                    Err(WayboundError::Transient { .. })
+                ),
+                "{stdout:?} {stderr:?}"
+            );
+        }
+
+        assert!(matches!(
+            classify_get_state(
+                false,
+                "",
+                "error: device unauthorized.\nThis adb server's $ADB_VENDOR_KEYS is not set"
+            ),
+            Err(WayboundError::BackendUnavailable { .. })
+        ));
+        assert!(matches!(
+            classify_get_state(
+                false,
+                "",
+                "* failed to start daemon\nadb: cannot connect to daemon"
+            ),
+            Err(WayboundError::BackendUnavailable { .. })
+        ));
+
+        assert!(classify_boot_completed("1\n").is_ok());
+        assert!(matches!(
+            classify_boot_completed("\n"),
+            Err(WayboundError::Transient { .. })
+        ));
     }
 }

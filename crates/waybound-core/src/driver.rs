@@ -89,6 +89,24 @@ pub trait Driver: Send + Sync {
             })
     }
 
+    /// Like [`Driver::locate`], called from a wait loop that has `remaining` time left.
+    ///
+    /// Backends that retry internally (Android retries transient UI dumps) cap that retry
+    /// at `remaining`, so nested retries cannot outlast the caller's deadline by more than
+    /// the backend call in flight. The default ignores `remaining`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Driver::locate`].
+    fn locate_within(
+        &self,
+        query: &LocatorQuery,
+        remaining: std::time::Duration,
+    ) -> Result<AccessibilityNode> {
+        let _ = remaining;
+        self.locate(query)
+    }
+
     /// Returns the URL currently loaded in the active browser tab, if available.
     ///
     /// # Errors

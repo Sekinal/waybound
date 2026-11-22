@@ -110,15 +110,29 @@ class Page:
         return self._transport.current_url()
 
     def wait_for_url(self, url_contains: str, *, timeout_ms: int = 10_000) -> str:
-        """Poll until the active tab URL contains `url_contains` or `timeout_ms` elapses."""
+        """Poll until the active tab URL contains `url_contains` or `timeout_ms` elapses.
+
+        Transient backend failures (daemon error code ``transient``, for example an
+        Android UI dump taken mid-animation) count as "not there yet"; any other error
+        is raised at once. On timeout the message includes the last transient error.
+        """
         needle = url_contains.lower()
         deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+        last_transient: WayboundDaemonError | None = None
         while True:
-            current = self._transport.current_url()
+            try:
+                current = self._transport.current_url()
+            except WayboundDaemonError as exc:
+                if exc.code != "transient":
+                    raise
+                last_transient = exc
+                current = None
             if current is not None and needle in current.lower():
                 return current
             if time.monotonic() >= deadline:
                 msg = f"timed out after {timeout_ms}ms waiting for URL containing {url_contains!r}"
+                if last_transient is not None:
+                    msg += f"; last backend error: {last_transient}"
                 raise WayboundDaemonError("timeout", msg)
             time.sleep(0.075)
 
