@@ -49,7 +49,9 @@ def main() -> int:
         sys.stdout.write(f"4. After SendInput click -> HEADING: {clicked.name!r}\n")
 
         inp = page.get_by_role(waybound.Role.TEXTBOX, name="Search")
-        sys.stdout.write(f"5. Input before fill: {inp.input_value()!r}\n")
+        before = inp.input_value()
+        sys.stdout.write(f"5. Input before fill: {before!r}\n")
+        assert before == "old", f"expected web input value 'old', got {before!r}"
         inp.fill("windows works")
         time.sleep(0.4)
         after = inp.input_value()

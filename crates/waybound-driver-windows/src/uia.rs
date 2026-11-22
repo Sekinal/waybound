@@ -250,12 +250,60 @@ if ($null -eq $targetWindow) {
 }
 
 $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
-$queue = New-Object System.Collections.Generic.Queue[System.Windows.Automation.AutomationElement]
-$queue.Enqueue($targetWindow)
-
-$nodes = New-Object System.Collections.Generic.List[object]
 $currentUrl = $null
 $viewportBounds = $null
+$webRoot = $null
+
+# Extract omnibox URL and active web document root so web locators don't match browser chrome.
+try {
+    $editCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit
+    )
+    $edits = $targetWindow.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCond)
+    foreach ($ed in $edits) {
+        try {
+            $edName = $ed.Current.Name
+            $vp = $null
+            if ($ed.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+                $edVal = $vp.Current.Value
+                if ($edVal -and (($edName -and $edName -match 'Address|URL') -or $edVal -match '^https?://')) {
+                    $currentUrl = $edVal
+                    break
+                }
+            }
+        } catch {}
+    }
+} catch {}
+
+try {
+    $docCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Document
+    )
+    $docs = $targetWindow.FindAll([System.Windows.Automation.TreeScope]::Descendants, $docCond)
+    $bestArea = -1.0
+    foreach ($doc in $docs) {
+        try {
+            $r = $doc.Current.BoundingRectangle
+            if (-not [double]::IsInfinity($r.Width) -and -not [double]::IsNaN($r.Width) -and $r.Width -gt 0 -and $r.Height -gt 0) {
+                $area = [double]$r.Width * [double]$r.Height
+                if ($area -gt $bestArea) {
+                    $bestArea = $area
+                    $webRoot = $doc
+                    $viewportBounds = @{ x = [double]$r.X; y = [double]$r.Y; width = [double]$r.Width; height = [double]$r.Height }
+                }
+            } elseif ($null -eq $webRoot) {
+                $webRoot = $doc
+            }
+        } catch {}
+    }
+} catch {}
+
+$queue = New-Object System.Collections.Generic.Queue[System.Windows.Automation.AutomationElement]
+$queue.Enqueue($(if ($null -ne $webRoot) { $webRoot } else { $targetWindow }))
+
+$nodes = New-Object System.Collections.Generic.List[object]
 
 while ($queue.Count -gt 0 -and $nodes.Count -lt $maxNodes) {
     $el = $queue.Dequeue()
