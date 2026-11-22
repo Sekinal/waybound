@@ -1352,6 +1352,7 @@ dependencies = [
  "flate2",
  "fluke-hpack",
  "hkdf",
+ "hmac",
  "ruzstd",
  "sha2",
  "tracing",

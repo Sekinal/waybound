@@ -1,4 +1,4 @@
-//! Pure-Rust passive TLS 1.3 + HTTP/1.1–2 + SSE decryptor and L4 hostname blocker.
+//! Pure-Rust passive TLS 1.2/1.3 + HTTP/1.1–2 + SSE decryptor and L4 hostname blocker.
 //!
 //! Designed for zero-MITM, zero-`CAP_NET_RAW`, zero-`tshark` passive HTTPS inspection:
 //! a local pass-through TCP relay forwards unmodified Chrome ciphertext bytes while
@@ -9,6 +9,8 @@
 
 pub mod http;
 pub mod keylog;
+pub mod tls;
+pub mod tls12;
 pub mod tls13;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,11 +20,13 @@ use std::time::{Duration, Instant};
 
 pub use http::{HttpConnectionCorrelator, InflightCounter, ResponseCallback, decode_body_bytes};
 pub use keylog::{KeyLogStore, TrafficSecrets};
+pub use tls::{PassiveTlsDecoder, Plaintext, TlsVersion};
+pub use tls12::{PassiveTls12Decoder, Tls12CipherSuite};
 pub use tls13::{Direction, PassiveTls13Decoder, Tls13CipherSuite};
 
 static NEXT_CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// Passive per-connection TLS 1.3 + HTTP/1.1–2 tap fed directly from a zero-MITM TCP relay.
+/// Passive per-connection TLS 1.2/1.3 + HTTP/1.1–2 tap fed directly from a zero-MITM TCP relay.
 #[derive(Debug, Clone)]
 pub struct PassiveConnectionTap {
     inner: Arc<Mutex<TapInner>>,
@@ -30,7 +34,7 @@ pub struct PassiveConnectionTap {
 
 #[derive(Debug)]
 struct TapInner {
-    tls: PassiveTls13Decoder,
+    tls: PassiveTlsDecoder,
     http: HttpConnectionCorrelator,
 }
 
@@ -48,7 +52,7 @@ impl PassiveConnectionTap {
             .saturating_add(1);
         Self {
             inner: Arc::new(Mutex::new(TapInner {
-                tls: PassiveTls13Decoder::new(keylog),
+                tls: PassiveTlsDecoder::new(keylog),
                 http: HttpConnectionCorrelator::new(host, seq_base, inflight, on_response),
             })),
         }
@@ -61,11 +65,14 @@ impl PassiveConnectionTap {
         }
         if let Ok(mut guard) = self.inner.lock() {
             let plain = guard.tls.feed(dir, ciphertext);
-            if !plain.is_empty() {
-                match dir {
-                    Direction::ClientToServer => guard.http.feed_client(&plain),
-                    Direction::ServerToClient => guard.http.feed_server(&plain),
-                }
+            // One feed can release plaintext for both directions (version detection replay,
+            // or records queued until the keylog line appeared). Always hand the correlator
+            // the client side first so requests are known before their responses.
+            if !plain.client_to_server.is_empty() {
+                guard.http.feed_client(&plain.client_to_server);
+            }
+            if !plain.server_to_client.is_empty() {
+                guard.http.feed_server(&plain.server_to_client);
             }
         }
     }
