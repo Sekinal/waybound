@@ -14,9 +14,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flate2::read::{GzDecoder, ZlibDecoder};
-use waybound_core::{CapturedResponse, Result, WayboundError};
+use waybound_core::{CapturedResponse, CapturedWebSocketFrame, Result, WayboundError};
 
 const MAX_CAPTURED_RESPONSES: usize = 500;
+/// Maximum retained WebSocket messages across all connections (oldest dropped first).
+const MAX_CAPTURED_WS_FRAMES: usize = 1_000;
 const MAX_PENDING_STREAMS: usize = 1_000;
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
@@ -38,11 +40,13 @@ struct StoredResponse {
 #[derive(Default)]
 struct StoreInner {
     entries: VecDeque<StoredResponse>,
+    websocket_frames: VecDeque<CapturedWebSocketFrame>,
     /// Highest stream sequence ID ever stored; the baseline for [`ResponseStore::wait_for`].
     last_seq: u64,
 }
 
-/// Thread-safe store of passively decrypted HTTP responses keyed by stream sequence ID.
+/// Thread-safe store of passively decrypted HTTP responses keyed by stream sequence ID,
+/// plus a bounded log of decrypted WebSocket messages.
 #[derive(Default)]
 pub struct ResponseStore {
     inner: Mutex<StoreInner>,
@@ -64,6 +68,18 @@ impl ResponseStore {
             if existing.response.content_type.is_none() {
                 existing.response.content_type = resp.content_type;
             }
+            if !resp.headers.is_empty() {
+                existing.response.headers = resp.headers;
+            }
+            if resp.request_method.is_some() {
+                existing.response.request_method = resp.request_method;
+            }
+            if !resp.request_headers.is_empty() {
+                existing.response.request_headers = resp.request_headers;
+            }
+            if resp.request_body.is_some() {
+                existing.response.request_body = resp.request_body;
+            }
             return;
         }
         if guard.entries.len() >= MAX_CAPTURED_RESPONSES {
@@ -76,6 +92,40 @@ impl ResponseStore {
             first_seen: now,
             updated: now,
         });
+    }
+
+    /// Appends a decrypted WebSocket message, dropping the oldest once
+    /// [`MAX_CAPTURED_WS_FRAMES`] are retained.
+    pub fn push_websocket_frame(&self, frame: CapturedWebSocketFrame) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        if guard.websocket_frames.len() >= MAX_CAPTURED_WS_FRAMES {
+            let _ = guard.websocket_frames.pop_front();
+        }
+        guard.websocket_frames.push_back(frame);
+    }
+
+    /// Returns captured WebSocket messages (oldest first), optionally filtered by
+    /// case-insensitive URL substring.
+    #[must_use]
+    pub fn list_websocket_frames(&self, url_contains: Option<&str>) -> Vec<CapturedWebSocketFrame> {
+        let needle = url_contains.map(str::to_lowercase);
+        self.inner.lock().map_or_else(
+            |_| Vec::new(),
+            |guard| {
+                guard
+                    .websocket_frames
+                    .iter()
+                    .filter(|f| {
+                        needle
+                            .as_ref()
+                            .is_none_or(|n| f.url.to_lowercase().contains(n))
+                    })
+                    .cloned()
+                    .collect()
+            },
+        )
     }
 
     /// Returns all captured responses, optionally filtered by case-insensitive URL substring.
@@ -304,6 +354,7 @@ impl StreamCorrelator {
                     status,
                     content_type: entry.content_type.clone(),
                     body,
+                    ..CapturedResponse::default()
                 },
             );
             entry.emitted = true;
@@ -688,6 +739,7 @@ mod tests {
             status: 200,
             content_type: None,
             body: body.map(str::to_owned),
+            ..CapturedResponse::default()
         }
     }
 
@@ -738,6 +790,57 @@ mod tests {
         let got = store.wait_for("/empty", 3_000);
         assert!(handle.join().is_ok());
         assert!(matches!(got, Ok(ref r) if r.body.is_none()));
+    }
+
+    #[test]
+    fn upsert_merges_headers_and_request_metadata_into_existing_entry() {
+        use waybound_core::HttpHeader;
+
+        let store = ResponseStore::default();
+        store.upsert(7, sample("https://a.test/form", None));
+        store.upsert(
+            7,
+            CapturedResponse {
+                headers: vec![HttpHeader::new("set-cookie", "a=1")],
+                request_method: Some("POST".to_owned()),
+                request_headers: vec![HttpHeader::new("content-type", "text/plain")],
+                request_body: Some("x=1".to_owned()),
+                ..sample("https://a.test/form", Some("ok"))
+            },
+        );
+        let got = store.list(None);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body.as_deref(), Some("ok"));
+        assert_eq!(got[0].headers, vec![HttpHeader::new("set-cookie", "a=1")]);
+        assert_eq!(got[0].request_method.as_deref(), Some("POST"));
+        assert_eq!(got[0].request_body.as_deref(), Some("x=1"));
+    }
+
+    #[test]
+    fn websocket_frames_are_bounded_and_filterable() {
+        use waybound_core::{WebSocketDirection, WebSocketOpcode};
+
+        let store = ResponseStore::default();
+        for i in 0..=MAX_CAPTURED_WS_FRAMES {
+            let host = if i % 2 == 0 { "even" } else { "odd" };
+            store.push_websocket_frame(CapturedWebSocketFrame {
+                url: format!("wss://{host}.test/ws"),
+                direction: WebSocketDirection::Received,
+                opcode: WebSocketOpcode::Text,
+                payload: Some(i.to_string()),
+                payload_len: 1,
+                compressed: false,
+                truncated: false,
+                close_code: None,
+            });
+        }
+        let all = store.list_websocket_frames(None);
+        assert_eq!(all.len(), MAX_CAPTURED_WS_FRAMES);
+        assert_eq!(all[0].payload.as_deref(), Some("1"));
+        let odd = store.list_websocket_frames(Some("ODD.test"));
+        assert_eq!(odd.len(), MAX_CAPTURED_WS_FRAMES / 2);
+        // The legacy tshark path never produces WebSocket frames or the new response fields.
+        assert!(store.list(None).is_empty());
     }
 
     #[test]

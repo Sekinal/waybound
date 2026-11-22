@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::WayboundError;
 use crate::input::{KeyCode, KeyModifier};
 use crate::locator::{AccessibilityNode, LocatorQuery};
-use crate::network::CapturedResponse;
+use crate::network::{CapturedResponse, CapturedWebSocketFrame};
 
 /// Wire-level request sent from a client SDK to `waybound-daemon`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -112,6 +112,12 @@ pub enum Request {
         /// Maximum wait time in milliseconds.
         timeout_ms: u64,
     },
+    /// Return passively captured WebSocket messages (optionally filtered by URL substring).
+    CapturedWebsocketFrames {
+        /// Optional case-insensitive URL substring filter.
+        #[serde(default)]
+        url_contains: Option<String>,
+    },
     /// Wait until zero HTTP/1.1–2 requests are inflight for at least `idle_ms` (or until `timeout_ms`).
     WaitForNetworkIdle {
         /// Continuous idle duration in milliseconds (e.g. 500).
@@ -164,6 +170,11 @@ pub enum Response {
         /// Captured HTTP responses matching the filter.
         responses: Vec<CapturedResponse>,
     },
+    /// Response to [`Request::CapturedWebsocketFrames`].
+    WebsocketFrames {
+        /// Captured WebSocket messages matching the filter, oldest first.
+        frames: Vec<CapturedWebSocketFrame>,
+    },
     /// Structured error returned when a request fails.
     Error {
         /// Machine-readable error code.
@@ -207,5 +218,20 @@ mod tests {
                 assert_eq!(parsed, req);
             }
         }
+    }
+
+    #[test]
+    fn websocket_frames_request_and_response_json() {
+        let req: Result<Request, _> =
+            serde_json::from_str(r#"{"method":"captured_websocket_frames"}"#);
+        assert_eq!(
+            req.ok(),
+            Some(Request::CapturedWebsocketFrames { url_contains: None })
+        );
+        let resp = Response::WebsocketFrames { frames: Vec::new() };
+        assert_eq!(
+            serde_json::to_string(&resp).unwrap_or_default(),
+            r#"{"status":"websocket_frames","frames":[]}"#
+        );
     }
 }

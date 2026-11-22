@@ -17,6 +17,7 @@ use std::time::Duration;
 use waybound_core::Result;
 use waybound_net::{
     Direction, HostBlocker, InflightCounter, KeyLogStore, PassiveConnectionTap, ResponseCallback,
+    WebSocketCallback,
 };
 
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
@@ -143,6 +144,24 @@ pub struct PassiveTapConfig {
     pub inflight: InflightCounter,
     /// Callback invoked with each decrypted HTTP response.
     pub on_response: ResponseCallback,
+    /// Callback invoked with each decrypted WebSocket message (`None` disables WebSocket capture).
+    pub on_websocket: Option<WebSocketCallback>,
+}
+
+impl PassiveTapConfig {
+    /// Creates the per-connection passive tap for a tunnel to `host`.
+    fn connection_tap(&self, host: String) -> PassiveConnectionTap {
+        let tap = PassiveConnectionTap::new(
+            host,
+            self.keylog.clone(),
+            self.inflight.clone(),
+            Arc::clone(&self.on_response),
+        );
+        match &self.on_websocket {
+            Some(cb) => tap.with_websocket_callback(Arc::clone(cb)),
+            None => tap,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -343,14 +362,9 @@ fn handle_client(mut client: TcpStream, cfg: &ForwarderConfig) -> io::Result<()>
     )?;
 
     let tap = if is_connect && !strip_http_connect_reply {
-        cfg.tap.as_ref().map(|t| {
-            PassiveConnectionTap::new(
-                target_host.clone(),
-                t.keylog.clone(),
-                t.inflight.clone(),
-                Arc::clone(&t.on_response),
-            )
-        })
+        cfg.tap
+            .as_ref()
+            .map(|t| t.connection_tap(target_host.clone()))
     } else {
         None
     };

@@ -10,13 +10,17 @@
 pub mod http;
 pub mod keylog;
 pub mod tls13;
+pub mod websocket;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub use http::{HttpConnectionCorrelator, InflightCounter, ResponseCallback, decode_body_bytes};
+pub use http::{
+    HttpConnectionCorrelator, InflightCounter, ResponseCallback, WebSocketCallback,
+    decode_body_bytes,
+};
 pub use keylog::{KeyLogStore, TrafficSecrets};
 pub use tls13::{Direction, PassiveTls13Decoder, Tls13CipherSuite};
 
@@ -52,6 +56,16 @@ impl PassiveConnectionTap {
                 http: HttpConnectionCorrelator::new(host, seq_base, inflight, on_response),
             })),
         }
+    }
+
+    /// Enables WebSocket message capture on this connection, delivering every decrypted
+    /// message to `on_websocket`.
+    #[must_use]
+    pub fn with_websocket_callback(self, on_websocket: WebSocketCallback) -> Self {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.http.set_websocket_callback(on_websocket);
+        }
+        self
     }
 
     /// Feeds raw unmodified ciphertext bytes observed in `dir`.
