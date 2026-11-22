@@ -9,9 +9,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from waybound.transport import WayboundDaemonError
-from waybound.types import AccessibilityNode, CapturedResponse, KeyModifier, LocatorQuery, Role
+from waybound.types import (
+    AccessibilityNode,
+    CapturedResponse,
+    KeyModifier,
+    LocatorQuery,
+    Role,
+    SessionFingerprint,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from waybound.handoff import HandoffHttpClient
     from waybound.types import Transport
 
 
@@ -183,6 +193,37 @@ class Page:
     def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
         """Wait until zero HTTP/1.1 or HTTP/2 requests remain inflight for `idle_ms`."""
         self._transport.wait_for_network_idle(idle_ms=idle_ms, timeout_ms=timeout_ms)
+
+    def export_fingerprint(self) -> SessionFingerprint:
+        """Export the live TLS, HTTP/2, header, and cookie fingerprint captured from the session."""
+        return self._transport.export_fingerprint()
+
+    def handoff_http_client(  # noqa: PLR0913
+        self,
+        *,
+        proxy: str | None = None,
+        timeout_ms: int = 30_000,
+        follow_redirects: bool = True,
+        daemon_binary: Path | str | None = None,
+        on_refresh: Callable[[], SessionFingerprint] | None = None,
+        refresh_statuses: tuple[int, ...] = (403,),
+    ) -> HandoffHttpClient:
+        """Export the live browser fingerprint and create a standalone BoringSSL/H2 HTTP client.
+
+        The returned [`HandoffHttpClient`] continues working after the browser session closes.
+        """
+        from waybound.handoff import HandoffHttpClient  # noqa: PLC0415
+
+        fp = self.export_fingerprint()
+        return HandoffHttpClient(
+            fp,
+            proxy=proxy,
+            timeout_ms=timeout_ms,
+            follow_redirects=follow_redirects,
+            daemon_binary=daemon_binary,
+            on_refresh=on_refresh,
+            refresh_statuses=refresh_statuses,
+        )
 
     def screenshot(self, path: Path | str | None = None) -> bytes:
         """Capture a native OS PNG screenshot of the browser window and return PNG bytes."""

@@ -12,10 +12,16 @@ from typing import TYPE_CHECKING, Self
 from waybound.types import (
     AccessibilityNode,
     Bounds,
+    CapturedCookie,
     CapturedResponse,
+    HeaderEntry,
+    Http2Fingerprint,
+    Http2Setting,
     KeyModifier,
     LocatorQuery,
     Role,
+    SessionFingerprint,
+    TlsFingerprint,
 )
 
 if TYPE_CHECKING:
@@ -310,6 +316,15 @@ class UnixSocketTransport:
         """Capture a native OS PNG screenshot of the browser window to `path`."""
         self._expect_ok({"method": "screenshot", "path": path}, "screenshot")
 
+    def export_fingerprint(self) -> SessionFingerprint:
+        """Export the live TLS, HTTP/2, header, and cookie fingerprint captured from the session."""
+        response = self._request({"method": "export_session_fingerprint"})
+        raw_fp = response.get("fingerprint")
+        if response.get("status") != "session_fingerprint" or not isinstance(raw_fp, dict):
+            msg = f"unexpected export_session_fingerprint response: {response!r}"
+            raise WayboundDaemonError("protocol_error", msg)
+        return parse_session_fingerprint(raw_fp)
+
     def scroll(self, delta_x: float, delta_y: float) -> None:
         """Emit a native scroll event."""
         self._expect_ok({"method": "scroll", "delta_x": delta_x, "delta_y": delta_y}, "scroll")
@@ -450,6 +465,115 @@ def _parse_http_response(item: dict[object, object]) -> CapturedResponse:
     body_val = item.get("body")
     body = body_val if isinstance(body_val, str) else None
     return CapturedResponse(url=url, status=status, content_type=content_type, body=body)
+
+
+def _parse_int(raw: object, default: int = 0) -> int:
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    return default
+
+
+def _parse_int_tuple(raw: object) -> tuple[int, ...]:
+    if not isinstance(raw, list):
+        return ()
+    return tuple(x for x in raw if isinstance(x, int) and not isinstance(x, bool))
+
+
+def _parse_str_tuple(raw: object) -> tuple[str, ...]:
+    if not isinstance(raw, list):
+        return ()
+    return tuple(x for x in raw if isinstance(x, str))
+
+
+def parse_session_fingerprint(item: dict[object, object]) -> SessionFingerprint:
+    """Parse a JSON dict matching `waybound_core::SessionFingerprint` into typed dataclasses."""
+    raw_tls = item.get("tls")
+    tls: TlsFingerprint | None = None
+    if isinstance(raw_tls, dict):
+        tls = TlsFingerprint(
+            tls_version=_parse_int(raw_tls.get("tls_version")),
+            cipher_suites=_parse_int_tuple(raw_tls.get("cipher_suites")),
+            extensions=_parse_int_tuple(raw_tls.get("extensions")),
+            supported_groups=_parse_int_tuple(raw_tls.get("supported_groups")),
+            ec_point_formats=_parse_int_tuple(raw_tls.get("ec_point_formats")),
+            signature_algorithms=_parse_int_tuple(raw_tls.get("signature_algorithms")),
+            alpn_protocols=_parse_str_tuple(raw_tls.get("alpn_protocols")),
+            supported_versions=_parse_int_tuple(raw_tls.get("supported_versions")),
+            cert_compression_algorithms=_parse_int_tuple(
+                raw_tls.get("cert_compression_algorithms")
+            ),
+            alps_protocols=_parse_str_tuple(raw_tls.get("alps_protocols")),
+            alps_use_new_codepoint=bool(raw_tls.get("alps_use_new_codepoint", False)),
+            psk_key_exchange_modes=_parse_int_tuple(raw_tls.get("psk_key_exchange_modes")),
+            grease_present=bool(raw_tls.get("grease_present", False)),
+            has_status_request=bool(raw_tls.get("has_status_request", False)),
+            has_signed_cert_timestamp=bool(raw_tls.get("has_signed_cert_timestamp", False)),
+            has_session_ticket=bool(raw_tls.get("has_session_ticket", False)),
+            has_extended_master_secret=bool(raw_tls.get("has_extended_master_secret", False)),
+            has_renegotiation_info=bool(raw_tls.get("has_renegotiation_info", False)),
+            has_ech=bool(raw_tls.get("has_ech", False)),
+            ja3_string=str(raw_tls.get("ja3_string", "")),
+            ja3_hash=str(raw_tls.get("ja3_hash", "")),
+            ja4=str(raw_tls.get("ja4", "")),
+        )
+
+    raw_h2 = item.get("http2")
+    http2: Http2Fingerprint | None = None
+    if isinstance(raw_h2, dict):
+        raw_settings = raw_h2.get("settings")
+        settings: list[Http2Setting] = []
+        if isinstance(raw_settings, list):
+            for entry in raw_settings:
+                if isinstance(entry, dict):
+                    settings.append(
+                        Http2Setting(
+                            id=_parse_int(entry.get("id")),
+                            value=_parse_int(entry.get("value")),
+                        )
+                    )
+        raw_wu = raw_h2.get("initial_window_update")
+        wu = raw_wu if isinstance(raw_wu, int) and not isinstance(raw_wu, bool) else None
+        http2 = Http2Fingerprint(
+            settings=tuple(settings),
+            initial_window_update=wu,
+            pseudo_header_order=_parse_str_tuple(raw_h2.get("pseudo_header_order")),
+            akamai_fingerprint=str(raw_h2.get("akamai_fingerprint", "")),
+        )
+
+    headers: list[HeaderEntry] = []
+    raw_headers = item.get("default_headers")
+    if isinstance(raw_headers, list):
+        for entry in raw_headers:
+            if isinstance(entry, dict):
+                headers.append(
+                    HeaderEntry(
+                        name=str(entry.get("name", "")),
+                        value=str(entry.get("value", "")),
+                    )
+                )
+
+    cookies: list[CapturedCookie] = []
+    raw_cookies = item.get("cookies")
+    if isinstance(raw_cookies, list):
+        for entry in raw_cookies:
+            if isinstance(entry, dict):
+                cookies.append(
+                    CapturedCookie(
+                        name=str(entry.get("name", "")),
+                        value=str(entry.get("value", "")),
+                        domain=str(entry.get("domain", "")),
+                        path=str(entry.get("path", "/")),
+                        secure=bool(entry.get("secure", False)),
+                        http_only=bool(entry.get("http_only", False)),
+                    )
+                )
+
+    return SessionFingerprint(
+        tls=tls,
+        http2=http2,
+        default_headers=tuple(headers),
+        cookies=tuple(cookies),
+    )
 
 
 def _encode_query(query: LocatorQuery) -> dict[str, object]:

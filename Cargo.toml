@@ -7,6 +7,7 @@ members = [
   "crates/waybound-driver-linux",
   "crates/waybound-driver-macos",
   "crates/waybound-driver-windows",
+  "crates/waybound-http",
   "crates/waybound-net",
 ]
 
@@ -30,6 +31,7 @@ waybound-driver-android = { path = "crates/waybound-driver-android" }
 waybound-driver-linux = { path = "crates/waybound-driver-linux" }
 waybound-driver-macos = { path = "crates/waybound-driver-macos" }
 waybound-driver-windows = { path = "crates/waybound-driver-windows" }
+waybound-http = { path = "crates/waybound-http" }
 waybound-net = { path = "crates/waybound-net" }
 
 [workspace.lints.rust]
