@@ -59,6 +59,14 @@ impl MockDriver {
             events: Mutex::new(Vec::new()),
         }
     }
+
+    /// Returns every input event dispatched to this driver so far.
+    #[cfg(test)]
+    pub fn recorded_events(&self) -> Vec<InputEvent> {
+        self.events
+            .lock()
+            .map_or_else(|_| Vec::new(), |g| g.clone())
+    }
 }
 
 impl Driver for MockDriver {

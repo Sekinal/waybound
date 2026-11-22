@@ -312,7 +312,37 @@ fn fill_element(
     text: &str,
 ) -> Result<()> {
     click_element(driver, state, query)?;
-    type_text(driver, text, state.options.use_motion)
+    replace_field_content(driver, text, state.options.use_motion)
+}
+
+/// Replaces the focused field's content with `text` (Playwright `fill` semantics).
+///
+/// The click lands at an arbitrary point inside the field, so typing straight away would
+/// insert into the middle of any existing value. Select everything first; the first typed
+/// character then replaces the selection, or Backspace clears it when `text` is empty.
+fn replace_field_content(driver: &dyn Driver, text: &str, pace: bool) -> Result<()> {
+    let select_all_mod = match driver.backend_kind() {
+        BackendKind::MacOsNative => KeyModifier::Meta,
+        // `adb shell input` cannot send modifier chords (they are dropped), so a select-all
+        // would type a literal "a". Keep append semantics there until the driver supports it.
+        BackendKind::AndroidWaydroid => return type_text(driver, text, pace),
+        _ => KeyModifier::Control,
+    };
+
+    thread::sleep(Duration::from_millis(40));
+    driver.dispatch_input(&InputEvent::KeyPress {
+        key: KeyCode::Char('a'),
+        modifiers: vec![select_all_mod],
+    })?;
+    thread::sleep(Duration::from_millis(40));
+
+    if text.is_empty() {
+        return driver.dispatch_input(&InputEvent::KeyPress {
+            key: KeyCode::Backspace,
+            modifiers: Vec::new(),
+        });
+    }
+    type_text(driver, text, pace)
 }
 
 fn type_text(driver: &dyn Driver, text: &str, pace: bool) -> Result<()> {
@@ -652,4 +682,62 @@ fn handle_io_streams<R: Read, W: Write>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use waybound_core::Role;
+
+    use super::*;
+    use crate::mock_driver::MockDriver;
+
+    fn state() -> SessionState {
+        SessionState::new(
+            ServerOptions { use_motion: false },
+            Arc::new(ResponseStore::default()),
+        )
+    }
+
+    fn key_events(driver: &MockDriver) -> Vec<(KeyCode, Vec<KeyModifier>)> {
+        driver
+            .recorded_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                InputEvent::KeyPress { key, modifiers } => Some((key, modifiers)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fill_selects_existing_content_before_typing() {
+        let driver = MockDriver::sample_page();
+        let query = LocatorQuery::by_role(Role::TextBox, Some("Origin".to_owned()));
+        assert!(fill_element(&driver, &state(), &query, "NRT").is_ok());
+
+        assert_eq!(
+            key_events(&driver),
+            vec![
+                (KeyCode::Char('a'), vec![KeyModifier::Meta]),
+                (KeyCode::Char('N'), Vec::new()),
+                (KeyCode::Char('R'), Vec::new()),
+                (KeyCode::Char('T'), Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn fill_with_empty_text_clears_the_field() {
+        let driver = MockDriver::sample_page();
+        let query = LocatorQuery::by_role(Role::TextBox, Some("Origin".to_owned()));
+        assert!(fill_element(&driver, &state(), &query, "").is_ok());
+
+        assert_eq!(
+            key_events(&driver),
+            vec![
+                (KeyCode::Char('a'), vec![KeyModifier::Meta]),
+                (KeyCode::Backspace, Vec::new()),
+            ]
+        );
+    }
 }
