@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Sekinal/waybound/actions/workflows/ci.yml/badge.svg)](https://github.com/Sekinal/waybound/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/waybound.svg)](https://pypi.org/project/waybound/)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](Cargo.toml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/Sekinal/waybound#license)
 
 **Zero-fork, zero-CDP, out-of-band OS-level browser automation** built in Rust with a typed sync/`async` Python SDK and stdio MCP server.
 
@@ -114,3 +114,9 @@ make setup   # Install Python dev deps + pre-commit hooks
 make fix     # Auto-format and auto-fix Rust & Python
 make check   # Run fmt, clippy (-D warnings), ruff, mypy --strict, build, and all tests
 ```
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](https://github.com/Sekinal/waybound/blob/main/LICENSE-APACHE) or [MIT license](https://github.com/Sekinal/waybound/blob/main/LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
