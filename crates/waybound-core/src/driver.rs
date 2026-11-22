@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::input::{InputEvent, Point};
+use crate::input::{InputEvent, MouseButton, Point};
 use crate::locator::{AccessibilityNode, Bounds, LocatorQuery};
 
 /// Supported execution backends.
@@ -153,4 +153,18 @@ pub trait Driver: Send + Sync {
     ///
     /// Returns an error if the OS input subsystem rejects the event.
     fn dispatch_input(&self, event: &InputEvent) -> Result<()>;
+
+    /// Abandons a press started with [`InputEvent::MouseDown`] without completing it, for
+    /// example when a drag is aborted by an error or a daemon shutdown.
+    ///
+    /// The default sends an ordinary [`InputEvent::MouseUp`]. Backends that replay the
+    /// whole gesture on release (Android's single `adb` drag command) override this to drop
+    /// the buffered gesture instead, so an abort never performs an unrequested drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OS input subsystem rejects the release.
+    fn cancel_pointer_gesture(&self, button: MouseButton) -> Result<()> {
+        self.dispatch_input(&InputEvent::MouseUp { button })
+    }
 }

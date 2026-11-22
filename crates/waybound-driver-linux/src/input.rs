@@ -557,9 +557,11 @@ pub fn dispatch_input(
         return Ok(());
     }
 
+    let mut next_cursor = *ydotool_cursor;
     let (program, commands) = match server {
         DisplayServer::X11 => ("xdotool", build_xdotool_commands(event)),
-        DisplayServer::Wayland => ("ydotool", build_ydotool_commands(event, ydotool_cursor)?),
+        // Plan against a copy: the tracked position only advances once the move succeeded.
+        DisplayServer::Wayland => ("ydotool", build_ydotool_commands(event, &mut next_cursor)?),
     };
 
     let mut envs: Vec<(&str, &str)> = Vec::new();
@@ -591,6 +593,7 @@ pub fn dispatch_input(
         }
     }
 
+    *ydotool_cursor = next_cursor;
     Ok(())
 }
 

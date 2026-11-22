@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use waybound_core::{
@@ -33,6 +33,8 @@ pub struct MockDriver {
     /// Flag raised as soon as the first [`InputEvent::PointerDrag`] is dispatched, to
     /// simulate a daemon shutdown arriving mid-drag.
     raise_on_drag: Option<Arc<AtomicBool>>,
+    /// Number of [`Driver::cancel_pointer_gesture`] calls (aborted drags).
+    cancels: AtomicUsize,
 }
 
 impl MockDriver {
@@ -73,6 +75,7 @@ impl MockDriver {
             fail_press: false,
             viewport: None,
             raise_on_drag: None,
+            cancels: AtomicUsize::new(0),
         }
     }
 
@@ -116,6 +119,12 @@ impl MockDriver {
         }
     }
 
+    /// Returns how many aborted gestures were cancelled.
+    #[cfg(test)]
+    pub fn cancelled_gestures(&self) -> usize {
+        self.cancels.load(Ordering::Acquire)
+    }
+
     /// Returns every input event dispatched to this driver so far.
     #[cfg(test)]
     pub fn recorded_events(&self) -> Vec<InputEvent> {
@@ -136,6 +145,12 @@ impl Driver for MockDriver {
 
     fn current_url(&self) -> Result<Option<String>> {
         Ok(Some("https://mock.waybound.local/".to_owned()))
+    }
+
+    fn cancel_pointer_gesture(&self, button: waybound_core::MouseButton) -> Result<()> {
+        let _ = self.cancels.fetch_add(1, Ordering::AcqRel);
+        // Same as the trait default: an ordinary release.
+        self.dispatch_input(&InputEvent::MouseUp { button })
     }
 
     fn viewport_bounds(&self) -> Result<Option<Bounds>> {
