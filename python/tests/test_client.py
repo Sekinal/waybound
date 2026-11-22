@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from waybound import AccessibilityNode, Bounds, KeyModifier, LocatorQuery, Page, Role
+from waybound import (
+    AccessibilityNode,
+    Bounds,
+    CapturedResponse,
+    KeyModifier,
+    LocatorQuery,
+    Page,
+    Role,
+)
 
 
 class FakeTransport:
@@ -46,6 +54,19 @@ class FakeTransport:
 
     def press(self, key: str, *, modifiers: tuple[KeyModifier, ...] = ()) -> None:
         self.events.append(("press", (key, modifiers)))
+
+    def captured_responses(self, *, url_contains: str | None = None) -> list[CapturedResponse]:
+        self.events.append(("captured_responses", url_contains))
+        return []
+
+    def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
+        self.events.append(("wait_for_response", (url_contains, timeout_ms)))
+        return CapturedResponse(
+            url=f"https://example.com/{url_contains}",
+            status=200,
+            content_type="application/json",
+            body="{}",
+        )
 
 
 def test_bounds_center() -> None:

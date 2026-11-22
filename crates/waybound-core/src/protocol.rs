@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::WayboundError;
 use crate::input::{KeyCode, KeyModifier};
 use crate::locator::{AccessibilityNode, LocatorQuery};
+use crate::network::CapturedResponse;
 
 /// Wire-level request sent from a client SDK to `waybound-daemon`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,6 +61,18 @@ pub enum Request {
         #[serde(default)]
         modifiers: Vec<KeyModifier>,
     },
+    /// Return passively captured HTTP responses (optionally filtered by URL substring).
+    CapturedResponses {
+        /// Optional case-insensitive URL substring filter.
+        url_contains: Option<String>,
+    },
+    /// Wait until a passively captured HTTP response matches `url_contains` or `timeout_ms` elapses.
+    WaitForResponse {
+        /// Case-insensitive URL substring filter.
+        url_contains: String,
+        /// Maximum wait time in milliseconds.
+        timeout_ms: u64,
+    },
     /// Request a graceful daemon shutdown (unwinds RAII browser & socket guards).
     Shutdown,
 }
@@ -89,6 +102,16 @@ pub enum Response {
     Url {
         /// Current URL string, if known.
         url: Option<String>,
+    },
+    /// Response to [`Request::WaitForResponse`].
+    HttpResponse {
+        /// Matched captured HTTP response.
+        response: CapturedResponse,
+    },
+    /// Response to [`Request::CapturedResponses`].
+    HttpResponses {
+        /// Captured HTTP responses matching the filter.
+        responses: Vec<CapturedResponse>,
     },
     /// Structured error returned when a request fails.
     Error {

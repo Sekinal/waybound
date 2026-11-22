@@ -5,6 +5,7 @@
 
 mod launcher;
 mod mock_driver;
+mod net_tap;
 mod server;
 
 use std::env;
@@ -20,6 +21,7 @@ use waybound_driver_macos::MacOsDriver;
 
 use crate::launcher::{ChromeLaunchOptions, launch_chrome};
 use crate::mock_driver::MockDriver;
+use crate::net_tap::{ResponseStore, start_passive_tap};
 use crate::server::ServerOptions;
 
 struct CliArgs {
@@ -140,6 +142,18 @@ fn main() -> ExitCode {
         },
     };
 
+    let responses = Arc::new(ResponseStore::default());
+    // Start passive wire tap before launching Chrome so initial TLS handshakes are captured.
+    let _net_tap = cli.ssl_keylog_file.as_ref().and_then(|keylog| {
+        match start_passive_tap(keylog, Arc::clone(&responses)) {
+            Ok(tap) => Some(tap),
+            Err(err) => {
+                tracing::warn!(error = %err, "passive network tap unavailable; continuing without capture");
+                None
+            }
+        }
+    });
+
     // Keep `_launched` alive for the full lifetime of the daemon so Chrome is cleaned up on exit.
     let (driver, use_motion, _launched): (Arc<dyn Driver>, bool, Option<launcher::LaunchedChrome>) =
         match cli.backend.as_str() {
@@ -188,7 +202,7 @@ fn main() -> ExitCode {
         };
 
     let options = ServerOptions { use_motion };
-    if let Err(err) = server::serve_unix(&socket_path, &driver, options) {
+    if let Err(err) = server::serve_unix(&socket_path, &driver, responses, options) {
         tracing::error!(error = %err, "daemon terminated with error");
         return ExitCode::FAILURE;
     }

@@ -66,6 +66,16 @@ class AccessibilityNode:
 
 
 @dataclass(frozen=True, slots=True)
+class CapturedResponse:
+    """Passively decrypted HTTP/1.1, HTTP/2, or HTTP/3 response."""
+
+    url: str
+    status: int
+    content_type: str | None
+    body: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class LocatorQuery:
     """Semantic query resolved by the Rust control daemon."""
 
@@ -112,4 +122,12 @@ class Transport(Protocol):
 
     def press(self, key: str, *, modifiers: tuple[KeyModifier, ...] = ()) -> None:
         """Emit a key press (`enter`, `tab`, `escape`, `backspace`, or single char)."""
+        ...
+
+    def captured_responses(self, *, url_contains: str | None = None) -> list[CapturedResponse]:
+        """Return passively captured HTTP responses, optionally filtered by URL substring."""
+        ...
+
+    def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
+        """Wait until a passively captured HTTP response matches `url_contains`."""
         ...

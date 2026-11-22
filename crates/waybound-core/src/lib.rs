@@ -9,6 +9,7 @@ pub mod error;
 pub mod input;
 pub mod locator;
 pub mod motion;
+pub mod network;
 pub mod protocol;
 
 pub use driver::{BackendKind, Driver, SessionConfig};
@@ -16,4 +17,5 @@ pub use error::{Result, WayboundError};
 pub use input::{InputEvent, KeyCode, KeyModifier, MouseButton, Point};
 pub use locator::{AccessibilityNode, Bounds, LocatorQuery, Role};
 pub use motion::{MotionConfig, MotionStep, plan_pointer_path};
+pub use network::CapturedResponse;
 pub use protocol::{Request, Response};

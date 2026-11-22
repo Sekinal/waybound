@@ -15,6 +15,8 @@ use waybound_core::{
     Point, Request, Response, Result, WayboundError, plan_pointer_path,
 };
 
+use crate::net_tap::ResponseStore;
+
 const MAX_UNIX_PATH_BYTES: usize = 100;
 const MAX_FRAME_BYTES: u64 = 1024 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
@@ -55,14 +57,16 @@ pub struct ServerOptions {
 struct SessionState {
     last_cursor: Mutex<Point>,
     shutdown: AtomicBool,
+    responses: Arc<ResponseStore>,
     options: ServerOptions,
 }
 
 impl SessionState {
-    const fn new(options: ServerOptions) -> Self {
+    const fn new(options: ServerOptions, responses: Arc<ResponseStore>) -> Self {
         Self {
             last_cursor: Mutex::new(Point { x: 0.0, y: 0.0 }),
             shutdown: AtomicBool::new(false),
+            responses,
             options,
         }
     }
@@ -121,6 +125,16 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
                 Err(err) => Response::from(&err),
             }
         }
+        Request::CapturedResponses { url_contains } => Response::HttpResponses {
+            responses: state.responses.list(url_contains.as_deref()),
+        },
+        Request::WaitForResponse {
+            url_contains,
+            timeout_ms,
+        } => match state.responses.wait_for(&url_contains, timeout_ms) {
+            Ok(response) => Response::HttpResponse { response },
+            Err(err) => Response::from(&err),
+        },
         Request::Shutdown => {
             state.shutdown.store(true, Ordering::Release);
             Response::Ok
@@ -301,6 +315,7 @@ fn prepare_socket_path(socket_path: &Path) -> Result<()> {
 pub fn serve_unix(
     socket_path: &Path,
     driver: &Arc<dyn Driver>,
+    responses: Arc<ResponseStore>,
     options: ServerOptions,
 ) -> Result<()> {
     prepare_socket_path(socket_path)?;
@@ -314,7 +329,7 @@ pub fn serve_unix(
     tracing::info!(socket = %socket_path.display(), "listening on unix socket");
 
     let active_connections = Arc::new(AtomicUsize::new(0));
-    let state = Arc::new(SessionState::new(options));
+    let state = Arc::new(SessionState::new(options, responses));
 
     while !state.shutdown.load(Ordering::Acquire) {
         match listener.accept() {

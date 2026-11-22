@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from waybound.types import AccessibilityNode, KeyModifier, LocatorQuery, Role
+from waybound.types import AccessibilityNode, CapturedResponse, KeyModifier, LocatorQuery, Role
 
 if TYPE_CHECKING:
     from waybound.types import Transport
@@ -77,6 +77,14 @@ class Page:
     def snapshot_tree(self) -> list[AccessibilityNode]:
         """Return a snapshot of the live web-content accessibility tree."""
         return self._transport.snapshot_tree()
+
+    def captured_responses(self, *, url_contains: str | None = None) -> list[CapturedResponse]:
+        """Return passively captured HTTP responses, optionally filtered by URL substring."""
+        return self._transport.captured_responses(url_contains=url_contains)
+
+    def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
+        """Wait until a passively decrypted HTTP response matches `url_contains`."""
+        return self._transport.wait_for_response(url_contains, timeout_ms=timeout_ms)
 
     def get_by_role(self, role: Role, *, name: str | None = None, exact: bool = False) -> Locator:
         """Return a locator targeting an element by its semantic accessibility role."""

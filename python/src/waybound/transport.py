@@ -8,7 +8,14 @@ import socket
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
-from waybound.types import AccessibilityNode, Bounds, KeyModifier, LocatorQuery, Role
+from waybound.types import (
+    AccessibilityNode,
+    Bounds,
+    CapturedResponse,
+    KeyModifier,
+    LocatorQuery,
+    Role,
+)
 
 if TYPE_CHECKING:
     from io import TextIOWrapper
@@ -138,6 +145,38 @@ class UnixSocketTransport:
         """Request a graceful daemon shutdown so RAII browser & socket guards run."""
         self._expect_ok({"method": "shutdown"}, "shutdown")
 
+    def captured_responses(self, *, url_contains: str | None = None) -> list[CapturedResponse]:
+        """Return passively captured HTTP responses, optionally filtered by URL substring."""
+        response = self._request({"method": "captured_responses", "url_contains": url_contains})
+        raw_items = response.get("responses")
+        if not isinstance(raw_items, list):
+            msg = f"unexpected captured_responses payload: {response!r}"
+            raise WayboundDaemonError("protocol_error", msg)
+        return [_parse_http_response(item) for item in raw_items if isinstance(item, dict)]
+
+    def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
+        """Wait until a passively captured HTTP response matches `url_contains`."""
+        clamped_ms = max(0, timeout_ms)
+        sock = self._sock
+        if sock is not None:
+            sock.settimeout(max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0))
+        try:
+            response = self._request(
+                {
+                    "method": "wait_for_response",
+                    "url_contains": url_contains,
+                    "timeout_ms": clamped_ms,
+                }
+            )
+        finally:
+            if self._sock is not None:
+                self._sock.settimeout(self._base_timeout_s)
+        raw_resp = response.get("response")
+        if not isinstance(raw_resp, dict):
+            msg = f"unexpected wait_for_response payload: {response!r}"
+            raise WayboundDaemonError("protocol_error", msg)
+        return _parse_http_response(raw_resp)
+
     def click(self, query: LocatorQuery) -> None:
         """Locate the target element and dispatch a native click."""
         self._expect_ok({"method": "click", "query": _encode_query(query)}, "click")
@@ -254,6 +293,17 @@ def _parse_node(item: dict[object, object]) -> AccessibilityNode:
         bounds=bounds,
         focused=focused,
     )
+
+
+def _parse_http_response(item: dict[object, object]) -> CapturedResponse:
+    url = str(item.get("url", ""))
+    raw_status = item.get("status", 0)
+    status = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else 0
+    ct = item.get("content_type")
+    content_type = ct if isinstance(ct, str) else None
+    body_val = item.get("body")
+    body = body_val if isinstance(body_val, str) else None
+    return CapturedResponse(url=url, status=status, content_type=content_type, body=body)
 
 
 def _encode_query(query: LocatorQuery) -> dict[str, object]:
