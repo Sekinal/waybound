@@ -481,7 +481,7 @@ pub fn start_passive_tap(ssl_keylog: &Path, store: Arc<ResponseStore>) -> Result
             "-e",
             "http2.streamid",
             "-e",
-            "http3.frame_streamid",
+            "quic.stream.stream_id",
             "-e",
             "http.response.code",
             "-e",
