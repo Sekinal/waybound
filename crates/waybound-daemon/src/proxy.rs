@@ -17,6 +17,7 @@ use std::time::Duration;
 use waybound_core::Result;
 
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
 const HEADER_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -45,7 +46,7 @@ pub enum ProxyProtocol {
 }
 
 /// Parsed upstream proxy endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UpstreamProxy {
     /// Upstream protocol (`http` or `socks5`).
     pub protocol: ProxyProtocol,
@@ -55,6 +56,19 @@ pub struct UpstreamProxy {
     pub credentials: Option<(Vec<u8>, Vec<u8>)>,
     /// Optional `Basic <base64>` `Proxy-Authorization` header value (for HTTP upstream).
     pub auth_header: Option<String>,
+}
+
+impl std::fmt::Debug for UpstreamProxy {
+    /// Redacts credentials so they cannot reach logs through `{:?}`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |present: bool| if present { "<redacted>" } else { "<none>" };
+        f.debug_struct("UpstreamProxy")
+            .field("protocol", &self.protocol)
+            .field("host_port", &self.host_port)
+            .field("credentials", &redacted(self.credentials.is_some()))
+            .field("auth_header", &redacted(self.auth_header.is_some()))
+            .finish()
+    }
 }
 
 impl UpstreamProxy {
@@ -82,11 +96,14 @@ impl UpstreamProxy {
             (ProxyProtocol::Http, trimmed)
         };
 
-        let authority = rest.split('/').next().unwrap_or(rest);
-        let (creds, host_port) = match authority.rsplit_once('@') {
+        // Split userinfo at the last `@` before touching `/`: a password may contain `/`,
+        // and cutting the path first would put part of the credentials into `host_port`
+        // (and from there into error messages and logs).
+        let (creds, after_creds) = match rest.rsplit_once('@') {
             Some((c, h)) => (Some(c), h),
-            None => (None, authority),
+            None => (None, rest),
         };
+        let host_port = after_creds.split('/').next().unwrap_or(after_creds);
 
         let Some((host, port_str)) = host_port.rsplit_once(':') else {
             return Err(format!("proxy must include host:port, got {host_port:?}"));
@@ -171,8 +188,11 @@ impl ProxyForwarder {
                         }
                         Err(err) if err.kind() == ErrorKind::Interrupted => {}
                         Err(err) => {
+                            // ECONNABORTED, EMFILE and friends are transient. Exiting here
+                            // would leave Chrome pointed at a dead proxy for the rest of
+                            // the session, so back off briefly and keep accepting.
                             tracing::warn!(error = %err, "proxy listener accept error");
-                            break;
+                            thread::sleep(ACCEPT_ERROR_BACKOFF);
                         }
                     }
                 }
@@ -378,9 +398,14 @@ fn rewrite_origin_form(request_line: &str) -> String {
     let origin_target = target
         .strip_prefix("http://")
         .or_else(|| target.strip_prefix("https://"))
-        .map_or(target, |rest| {
-            rest.find('/').map_or("/", |idx| &rest[idx..])
-        });
+        .map_or_else(
+            || target.to_owned(),
+            |rest| match rest.find(['/', '?']) {
+                Some(idx) if rest[idx..].starts_with('?') => format!("/{}", &rest[idx..]),
+                Some(idx) => rest[idx..].to_owned(),
+                None => "/".to_owned(),
+            },
+        );
     format!("{method} {origin_target} {version}\r\n")
 }
 
@@ -647,6 +672,44 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn password_with_slash_is_parsed_and_never_leaks() {
+        let parsed = UpstreamProxy::parse("socks5://bob:pa/ss@proxy.example.com:1080/");
+        assert!(parsed.is_ok());
+        if let Ok(p) = parsed {
+            assert_eq!(p.host_port, "proxy.example.com:1080");
+            assert_eq!(p.credentials, Some((b"bob".to_vec(), b"pa/ss".to_vec())));
+            let debug = format!("{p:?}");
+            assert!(
+                !debug.contains("pa/ss") && !debug.contains("bob"),
+                "{debug}"
+            );
+        }
+
+        // A malformed host must not echo any part of the credentials.
+        let err = UpstreamProxy::parse("http://bob:s3/cret@nohostport");
+        assert!(
+            matches!(&err, Err(e) if !e.contains("s3") && !e.contains("cret") && !e.contains("bob")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_origin_form_keeps_query_without_path() {
+        assert_eq!(
+            rewrite_origin_form("GET http://example.com?x=1 HTTP/1.1"),
+            "GET /?x=1 HTTP/1.1\r\n"
+        );
+        assert_eq!(
+            rewrite_origin_form("GET http://example.com/a?x=1 HTTP/1.1"),
+            "GET /a?x=1 HTTP/1.1\r\n"
+        );
+        assert_eq!(
+            rewrite_origin_form("GET http://example.com HTTP/1.1"),
+            "GET / HTTP/1.1\r\n"
+        );
+    }
 
     #[test]
     fn parses_http_and_socks5_and_redacts_bad_schemes() {
