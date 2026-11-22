@@ -35,7 +35,12 @@ jobs:
         working-directory: python
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v5
+      - name: Build daemon for end-to-end tests
+        run: cargo build -p waybound-daemon
+        working-directory: .
       - name: Sync dependencies
         run: uv sync --dev
       - name: Ruff format check
@@ -45,4 +50,13 @@ jobs:
       - name: Mypy strict typecheck
         run: uv run mypy src tests
       - name: Pytest
-        run: uv run pytest
+        # The end-to-end tests skip themselves when the daemon binary is missing. With the
+        # daemon built above, any skip means they silently stopped running, so fail on it.
+        shell: bash
+        run: |
+          set -o pipefail
+          uv run pytest -rs | tee pytest.log
+          if grep -q "SKIPPED" pytest.log; then
+            echo "::error::tests were skipped; the daemon end-to-end tests must run in CI"
+            exit 1
+          fi
