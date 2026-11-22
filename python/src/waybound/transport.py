@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from types import TracebackType
 
 _NAMED_KEYS = frozenset({"enter", "tab", "escape", "backspace"})
+# The daemon paces typing at up to ~180 ms per key; allow headroom on top of the base timeout.
+_FILL_SECONDS_PER_CHAR = 0.25
 
 
 class WayboundDaemonError(RuntimeError):
@@ -210,7 +212,11 @@ class UnixSocketTransport:
 
     def fill(self, query: LocatorQuery, text: str) -> None:
         """Focus the target element and type text via native keyboard events."""
-        self._expect_ok({"method": "fill", "query": _encode_query(query), "text": text}, "fill")
+        self._expect_ok(
+            {"method": "fill", "query": _encode_query(query), "text": text},
+            "fill",
+            timeout_override_s=self._base_timeout_s + _FILL_SECONDS_PER_CHAR * len(text),
+        )
 
     def navigate(self, url: str) -> None:
         """Navigate the active browser tab to `url`."""
@@ -239,8 +245,14 @@ class UnixSocketTransport:
             "press",
         )
 
-    def _expect_ok(self, payload: dict[str, object], op: str) -> None:
-        response = self._request(payload)
+    def _expect_ok(
+        self,
+        payload: dict[str, object],
+        op: str,
+        *,
+        timeout_override_s: float | None = None,
+    ) -> None:
+        response = self._request(payload, timeout_override_s=timeout_override_s)
         if response.get("status") != "ok":
             msg = f"unexpected {op} response: {response!r}"
             raise WayboundDaemonError("protocol_error", msg)
@@ -265,6 +277,12 @@ class UnixSocketTransport:
                 except OSError as exc:
                     self.close()
                     raise WayboundDaemonError("io_error", str(exc)) from exc
+                except BaseException:
+                    # Interrupted between write and read (e.g. KeyboardInterrupt): the reply
+                    # is still in flight, so reusing this connection would hand the next
+                    # request the previous request's reply.
+                    self.close()
+                    raise
 
                 if not raw_line:
                     self.close()
