@@ -1,9 +1,14 @@
-//! Line-delimited JSON-RPC server over a local Unix domain socket.
+//! Line-delimited JSON-RPC server over a local Unix domain socket or loopback TCP socket.
 
+#[cfg(unix)]
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +23,7 @@ use waybound_core::{
 
 use crate::net_tap::ResponseStore;
 
+#[cfg(unix)]
 const MAX_UNIX_PATH_BYTES: usize = 100;
 const MAX_FRAME_BYTES: u64 = 1024 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
@@ -27,10 +33,12 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(75);
 const MAX_WAIT_TIMEOUT_MS: u64 = 120_000;
 
 /// RAII guard that removes a bound Unix socket file on drop.
+#[cfg(unix)]
 struct SocketGuard {
     path: PathBuf,
 }
 
+#[cfg(unix)]
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
@@ -354,6 +362,7 @@ fn navigate_url(driver: &dyn Driver, url: &str) -> Result<()> {
     })
 }
 
+#[cfg(unix)]
 fn prepare_socket_path(socket_path: &Path) -> Result<()> {
     let path_len = socket_path.as_os_str().as_encoded_bytes().len();
     if path_len >= MAX_UNIX_PATH_BYTES {
@@ -400,6 +409,7 @@ fn prepare_socket_path(socket_path: &Path) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the socket path is invalid, already in use, or cannot be bound.
+#[cfg(unix)]
 pub fn serve_unix(
     socket_path: &Path,
     driver: &Arc<dyn Driver>,
@@ -442,7 +452,7 @@ pub fn serve_unix(
                 let _ = thread::spawn(move || {
                     let _guard = conn_guard;
                     if let Err(err) =
-                        handle_connection(stream, driver_ref.as_ref(), state_ref.as_ref())
+                        handle_unix_connection(stream, driver_ref.as_ref(), state_ref.as_ref())
                     {
                         tracing::warn!(error = %err, "client connection closed with error");
                     }
@@ -465,15 +475,102 @@ pub fn serve_unix(
         }
     }
 
+    drain_connections(&active_connections);
+    Ok(())
+}
+
+/// Binds a loopback-only TCP socket at `bind_addr` (for example `127.0.0.1:49222`)
+/// and serves requests concurrently until a graceful [`Request::Shutdown`] is received.
+///
+/// # Errors
+///
+/// Returns an error if `bind_addr` is not a valid loopback socket address or cannot be bound.
+pub fn serve_tcp(
+    bind_addr: &str,
+    driver: &Arc<dyn Driver>,
+    responses: Arc<ResponseStore>,
+    options: ServerOptions,
+) -> Result<()> {
+    let addr: SocketAddr = bind_addr.parse().map_err(|_| {
+        WayboundError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid --tcp socket address: {bind_addr}"),
+        ))
+    })?;
+    if !addr.ip().is_loopback() {
+        return Err(WayboundError::Io(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("refusing to bind --tcp to non-loopback address {addr}"),
+        )));
+    }
+
+    let listener = TcpListener::bind(addr)?;
+    let local_addr = listener.local_addr()?;
+    listener.set_nonblocking(true)?;
+    tracing::info!(tcp = %local_addr, "listening on loopback tcp socket");
+
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let state = Arc::new(SessionState::new(options, responses));
+
+    while !state.shutdown.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _peer)) => {
+                if let Err(err) = stream.set_nonblocking(false) {
+                    tracing::warn!(error = %err, "failed to configure accepted tcp stream");
+                    continue;
+                }
+
+                let current = active_connections.fetch_add(1, Ordering::AcqRel);
+                if current >= MAX_CONCURRENT_CONNECTIONS {
+                    let _ = active_connections.fetch_sub(1, Ordering::AcqRel);
+                    tracing::warn!("rejecting tcp connection: max concurrent connections reached");
+                    continue;
+                }
+
+                let driver_ref = Arc::clone(driver);
+                let state_ref = Arc::clone(&state);
+                let conn_guard = ConnectionGuard {
+                    counter: Arc::clone(&active_connections),
+                };
+                let _ = thread::spawn(move || {
+                    let _guard = conn_guard;
+                    if let Err(err) =
+                        handle_tcp_connection(stream, driver_ref.as_ref(), state_ref.as_ref())
+                    {
+                        tracing::warn!(error = %err, "tcp client connection closed with error");
+                    }
+                });
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::Interrupted
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::ConnectionReset
+                ) =>
+            {
+                tracing::debug!(error = %err, "transient tcp accept error, continuing");
+            }
+            Err(err) => return Err(WayboundError::Io(err)),
+        }
+    }
+
+    drain_connections(&active_connections);
+    Ok(())
+}
+
+fn drain_connections(active_connections: &AtomicUsize) {
     tracing::info!("shutdown requested; draining active connections");
     let drain_deadline = Instant::now() + Duration::from_millis(250);
     while active_connections.load(Ordering::Acquire) > 0 && Instant::now() < drain_deadline {
         thread::sleep(Duration::from_millis(10));
     }
-    Ok(())
 }
 
-fn write_response(stream: &mut UnixStream, response: &Response) -> Result<()> {
+fn write_response<W: Write>(stream: &mut W, response: &Response) -> Result<()> {
     let mut encoded = serde_json::to_string(response).unwrap_or_else(|_| {
         r#"{"status":"error","code":"serialization_error","message":"failed to encode response"}"#
             .to_owned()
@@ -484,15 +581,36 @@ fn write_response(stream: &mut UnixStream, response: &Response) -> Result<()> {
     Ok(())
 }
 
-fn handle_connection(
-    mut stream: UnixStream,
+#[cfg(unix)]
+fn handle_unix_connection(
+    stream: UnixStream,
     driver: &dyn Driver,
     state: &SessionState,
 ) -> Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
-
     let reader_stream = stream.try_clone()?;
+    handle_io_streams(reader_stream, stream, driver, state)
+}
+
+fn handle_tcp_connection(
+    stream: TcpStream,
+    driver: &dyn Driver,
+    state: &SessionState,
+) -> Result<()> {
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    let _ = stream.set_nodelay(true);
+    let reader_stream = stream.try_clone()?;
+    handle_io_streams(reader_stream, stream, driver, state)
+}
+
+fn handle_io_streams<R: Read, W: Write>(
+    reader_stream: R,
+    mut writer_stream: W,
+    driver: &dyn Driver,
+    state: &SessionState,
+) -> Result<()> {
     let mut reader = BufReader::new(reader_stream);
     let mut line = String::new();
 
@@ -509,7 +627,7 @@ fn handle_connection(
                 code: "frame_too_large".to_owned(),
                 message: format!("request exceeded {MAX_FRAME_BYTES}-byte limit"),
             };
-            let _ = write_response(&mut stream, &err_resp);
+            let _ = write_response(&mut writer_stream, &err_resp);
             break;
         }
 
@@ -526,7 +644,7 @@ fn handle_connection(
             },
         };
 
-        write_response(&mut stream, &response)?;
+        write_response(&mut writer_stream, &response)?;
         if state.shutdown.load(Ordering::Acquire) {
             break;
         }

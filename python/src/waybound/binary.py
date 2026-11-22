@@ -24,6 +24,10 @@ _MAX_SHA_BYTES = 4096
 _CHUNK_BYTES = 65536
 
 
+def _daemon_filename() -> str:
+    return "waybound-daemon.exe" if sys.platform == "win32" else "waybound-daemon"
+
+
 def platform_artifact_name() -> str:
     """Return the GitHub Release artifact base name for the current host OS/arch."""
     machine = platform.machine().lower()
@@ -34,6 +38,8 @@ def platform_artifact_name() -> str:
             return "waybound-daemon-linux-x86_64"
         if machine in ("aarch64", "arm64"):
             return "waybound-daemon-linux-arm64"
+    if sys.platform == "win32" and machine in ("x86_64", "amd64"):
+        return "waybound-daemon-windows-x86_64"
     msg = (
         f"no prebuilt waybound-daemon binary for {sys.platform}/{machine}; "
         "build with `cargo build --release`"
@@ -46,7 +52,7 @@ def cached_daemon_path(version: str = DEFAULT_VERSION) -> Path:
     if not _SAFE_VERSION_RE.match(version) or version in (".", ".."):
         msg = f"invalid version tag: {version!r}"
         raise ValueError(msg)
-    return Path.home() / ".cache" / "waybound" / version / "waybound-daemon"
+    return Path.home() / ".cache" / "waybound" / version / _daemon_filename()
 
 
 def find_cached_daemon() -> Path | None:
@@ -59,7 +65,8 @@ def find_cached_daemon() -> Path | None:
     if not cache_root.is_dir():
         return None
 
-    candidates = [p for p in cache_root.glob("*/waybound-daemon") if p.is_file()]
+    bin_name = _daemon_filename()
+    candidates = [p for p in cache_root.glob(f"*/{bin_name}") if p.is_file()]
     if not candidates:
         return None
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -93,7 +100,8 @@ def _download_bounded(url: str, dest: Path, *, max_bytes: int) -> str:
 
 def _extract_and_install(tar_path: Path, dest: Path) -> None:
     """Extract `waybound-daemon` from `tar_path` and atomically install to `dest`."""
-    valid_names = ("waybound-daemon", "./waybound-daemon")
+    bin_name = _daemon_filename()
+    valid_names = (bin_name, f"./{bin_name}")
     with tarfile.open(tar_path, "r:gz") as archive:
         member = next((m for m in archive.getmembers() if m.name in valid_names), None)
         if member is None or not member.isfile():

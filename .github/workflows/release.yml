@@ -17,12 +17,19 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: waybound-daemon-macos-arm64
+            bin: waybound-daemon
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: waybound-daemon-linux-x86_64
+            bin: waybound-daemon
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: waybound-daemon-linux-arm64
+            bin: waybound-daemon
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: waybound-daemon-windows-x86_64
+            bin: waybound-daemon.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,9 +40,10 @@ jobs:
       - name: Build release daemon
         run: cargo build --release --bin waybound-daemon --target ${{ matrix.target }}
       - name: Package tarball + SHA-256
+        shell: bash
         run: |
           mkdir -p dist
-          tar -C target/${{ matrix.target }}/release -czf dist/${{ matrix.artifact }}.tar.gz waybound-daemon
+          tar -C target/${{ matrix.target }}/release -czf dist/${{ matrix.artifact }}.tar.gz ${{ matrix.bin }}
           (
             cd dist
             if command -v sha256sum >/dev/null 2>&1; then

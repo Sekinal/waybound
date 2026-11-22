@@ -28,6 +28,8 @@ pub struct ChromeLaunchOptions {
     pub timezone: Option<String>,
     /// Optional OS-level locale (`LANG` / `LC_ALL` env vars, e.g., `en_US.UTF-8`).
     pub locale: Option<String>,
+    /// Optional X11 `DISPLAY` environment variable (e.g., `:99` for headless Xvfb on Linux).
+    pub display: Option<String>,
     /// Whether to bring the launched browser window to the foreground on macOS.
     pub focus: bool,
 }
@@ -67,20 +69,38 @@ pub fn resolve_chrome_binary(explicit: Option<&Path>) -> Option<PathBuf> {
         }
     }
 
-    let candidates: &[&str] = if cfg!(target_os = "macos") {
-        &[
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+    let candidates: Vec<PathBuf> = if cfg!(target_os = "macos") {
+        vec![
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            PathBuf::from(
+                "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            ),
         ]
+    } else if cfg!(target_os = "windows") {
+        let mut win_paths = vec![
+            PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+        ];
+        if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
+            win_paths.push(
+                PathBuf::from(local_app_data)
+                    .join("Google")
+                    .join("Chrome")
+                    .join("Application")
+                    .join("chrome.exe"),
+            );
+        }
+        win_paths
     } else {
-        &[
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-            "/usr/bin/chromium",
+        vec![
+            PathBuf::from("/usr/bin/google-chrome"),
+            PathBuf::from("/usr/bin/google-chrome-stable"),
+            PathBuf::from("/usr/bin/chromium"),
+            PathBuf::from("/usr/bin/chromium-browser"),
         ]
     };
 
-    candidates.iter().map(PathBuf::from).find(|p| p.exists())
+    candidates.into_iter().find(|p| p.exists())
 }
 
 /// Spawns an unmodified Google Chrome process with zero automation/CDP flags.
@@ -117,6 +137,9 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
     }
     if let Some(proxy_server) = &options.proxy_server {
         let _ = cmd.arg(format!("--proxy-server={proxy_server}"));
+    }
+    if let Some(display) = &options.display {
+        let _ = cmd.env("DISPLAY", display);
     }
     if let Some(tz) = &options.timezone {
         let _ = cmd.env("TZ", tz);

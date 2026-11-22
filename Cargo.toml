@@ -4,7 +4,9 @@ members = [
   "crates/waybound-core",
   "crates/waybound-daemon",
   "crates/waybound-driver-android",
+  "crates/waybound-driver-linux",
   "crates/waybound-driver-macos",
+  "crates/waybound-driver-windows",
 ]
 
 [workspace.package]
@@ -23,7 +25,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 waybound-core = { path = "crates/waybound-core" }
 waybound-driver-android = { path = "crates/waybound-driver-android" }
+waybound-driver-linux = { path = "crates/waybound-driver-linux" }
 waybound-driver-macos = { path = "crates/waybound-driver-macos" }
+waybound-driver-windows = { path = "crates/waybound-driver-windows" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -386,7 +386,9 @@ dependencies = [
  "tracing-subscriber",
  "waybound-core",
  "waybound-driver-android",
+ "waybound-driver-linux",
  "waybound-driver-macos",
+ "waybound-driver-windows",
 ]
 
 [[package]]
@@ -398,9 +400,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "waybound-driver-linux"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tracing",
+ "waybound-core",
+]
+
+[[package]]
 name = "waybound-driver-macos"
 version = "0.1.0"
 dependencies = [
+ "tracing",
+ "waybound-core",
+]
+
+[[package]]
+name = "waybound-driver-windows"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "tracing",
  "waybound-core",
 ]

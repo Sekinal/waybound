@@ -19,7 +19,7 @@ from waybound.transport import UnixSocketTransport, WayboundDaemonError
 if TYPE_CHECKING:
     from types import TracebackType
 
-BackendName = Literal["mock", "macos", "android"]
+BackendName = Literal["mock", "macos", "linux", "windows", "android"]
 _MIN_WORKSPACE_PARENTS = 4
 
 
@@ -30,6 +30,8 @@ class LaunchOptions:
     backend: BackendName = "mock"
     pid: int | None = None
     serial: str | None = None
+    display: str | None = None
+    headless_xvfb: bool = False
     launch_chrome: bool = False
     launch_waydroid: bool = False
     instance_id: str | None = None
@@ -124,6 +126,7 @@ class Session:
         pairs: tuple[tuple[str, str | None], ...] = (
             ("--pid", str(opts.pid) if opts.pid is not None else None),
             ("--serial", opts.serial),
+            ("--display", opts.display),
             ("--instance-id", opts.instance_id),
             ("--adb-port", str(opts.adb_port) if opts.adb_port is not None else None),
             ("--url", opts.url),
@@ -138,6 +141,8 @@ class Session:
         for flag, val in pairs:
             if val is not None:
                 cmd.extend([flag, val])
+        if opts.headless_xvfb:
+            cmd.append("--headless-xvfb")
         if opts.launch_chrome:
             cmd.append("--launch-chrome")
         if opts.launch_waydroid:

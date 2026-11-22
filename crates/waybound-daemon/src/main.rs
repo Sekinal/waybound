@@ -10,7 +10,9 @@ mod proxy;
 mod server;
 
 use std::env;
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,7 +21,9 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use waybound_core::Driver;
 use waybound_driver_android::{AndroidDriver, WaydroidConfig, WaydroidSession};
+use waybound_driver_linux::{HeadlessDisplayConfig, HeadlessDisplaySession, LinuxDriver};
 use waybound_driver_macos::MacOsDriver;
+use waybound_driver_windows::WindowsDriver;
 
 use crate::launcher::{ChromeLaunchOptions, launch_chrome};
 use crate::mock_driver::MockDriver;
@@ -30,9 +34,12 @@ use crate::server::ServerOptions;
 #[allow(clippy::struct_excessive_bools)]
 struct CliArgs {
     socket_path: Option<PathBuf>,
+    tcp_addr: Option<String>,
     backend: String,
     pid: Option<i32>,
     serial: Option<String>,
+    display: Option<String>,
+    headless_xvfb: bool,
     launch_chrome: bool,
     launch_waydroid: bool,
     instance_id: Option<String>,
@@ -55,9 +62,12 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 fn parse_args() -> Result<CliArgs, String> {
     let mut cli = CliArgs {
         socket_path: env::var("WAYBOUND_SOCKET").ok().map(PathBuf::from),
+        tcp_addr: env::var("WAYBOUND_TCP_ADDR").ok(),
         backend: "mock".to_owned(),
         pid: None,
         serial: None,
+        display: None,
+        headless_xvfb: false,
         launch_chrome: false,
         launch_waydroid: false,
         instance_id: None,
@@ -76,6 +86,7 @@ fn parse_args() -> Result<CliArgs, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => cli.socket_path = Some(PathBuf::from(next_arg(&mut args, "--socket")?)),
+            "--tcp" => cli.tcp_addr = Some(next_arg(&mut args, "--tcp")?),
             "--backend" => cli.backend = next_arg(&mut args, "--backend")?,
             "--pid" => {
                 let val = next_arg(&mut args, "--pid")?;
@@ -88,6 +99,8 @@ fn parse_args() -> Result<CliArgs, String> {
                 cli.pid = Some(parsed);
             }
             "--serial" => cli.serial = Some(next_arg(&mut args, "--serial")?),
+            "--display" => cli.display = Some(next_arg(&mut args, "--display")?),
+            "--headless-xvfb" => cli.headless_xvfb = true,
             "--launch-chrome" => cli.launch_chrome = true,
             "--launch-waydroid" => cli.launch_waydroid = true,
             "--instance-id" => cli.instance_id = Some(next_arg(&mut args, "--instance-id")?),
@@ -117,6 +130,7 @@ fn parse_args() -> Result<CliArgs, String> {
     Ok(cli)
 }
 
+#[cfg(unix)]
 fn default_user_socket_path() -> std::io::Result<PathBuf> {
     let dir = PathBuf::from(format!("/tmp/waybound-{}", std::process::id()));
     fs::create_dir_all(&dir)?;
@@ -136,17 +150,47 @@ fn setup_proxy(raw: Option<String>) -> Result<(Option<String>, Option<ProxyForwa
     }
 }
 
-type BackendBundle = (
-    Arc<dyn Driver>,
-    bool,
-    Option<launcher::LaunchedChrome>,
-    Option<ProxyForwarder>,
-    Option<WaydroidSession>,
-);
+struct BackendBundle {
+    driver: Arc<dyn Driver>,
+    use_motion: bool,
+    _launched: Option<launcher::LaunchedChrome>,
+    _proxy_forwarder: Option<ProxyForwarder>,
+    _waydroid: Option<WaydroidSession>,
+    _xvfb: Option<HeadlessDisplaySession>,
+}
 
+fn launch_desktop_chrome(
+    cli: &CliArgs,
+    display: Option<String>,
+) -> Result<(i32, launcher::LaunchedChrome, Option<ProxyForwarder>), String> {
+    let (chrome_proxy_server, proxy_fwd) = setup_proxy(cli.proxy.clone())?;
+    let opts = ChromeLaunchOptions {
+        binary_path: None,
+        profile_dir: cli.profile_dir.clone(),
+        ssl_keylog_file: cli.ssl_keylog_file.clone(),
+        initial_url: cli.initial_url.clone(),
+        proxy_server: chrome_proxy_server,
+        timezone: cli.timezone.clone(),
+        locale: cli.locale.clone(),
+        display,
+        focus: cli.focus,
+    };
+    let chrome = launch_chrome(&opts).map_err(|e| e.to_string())?;
+    let pid = chrome.pid();
+    Ok((pid, chrome, proxy_fwd))
+}
+
+#[allow(clippy::too_many_lines)]
 fn build_backend(cli: CliArgs) -> Result<BackendBundle, String> {
     match cli.backend.as_str() {
-        "mock" => Ok((Arc::new(MockDriver::sample_page()), false, None, None, None)),
+        "mock" => Ok(BackendBundle {
+            driver: Arc::new(MockDriver::sample_page()),
+            use_motion: false,
+            _launched: None,
+            _proxy_forwarder: None,
+            _waydroid: None,
+            _xvfb: None,
+        }),
         "android" => {
             let (serial, waydroid_session, proxy_fwd) = if cli.launch_waydroid {
                 let (local_proxy, fwd) = setup_proxy(cli.proxy)?;
@@ -180,29 +224,18 @@ fn build_backend(cli: CliArgs) -> Result<BackendBundle, String> {
                 android.open_url(url).map_err(|e| e.to_string())?;
             }
             tracing::info!(serial = ?android.serial(), "starting android/waydroid driver");
-            Ok((
-                Arc::new(android),
-                !cli.no_motion,
-                None,
-                proxy_fwd,
-                waydroid_session,
-            ))
+            Ok(BackendBundle {
+                driver: Arc::new(android),
+                use_motion: !cli.no_motion,
+                _launched: None,
+                _proxy_forwarder: proxy_fwd,
+                _waydroid: waydroid_session,
+                _xvfb: None,
+            })
         }
         "macos" => {
             let (target_pid, launched, fwd) = if cli.launch_chrome {
-                let (chrome_proxy_server, proxy_fwd) = setup_proxy(cli.proxy)?;
-                let opts = ChromeLaunchOptions {
-                    binary_path: None,
-                    profile_dir: cli.profile_dir,
-                    ssl_keylog_file: cli.ssl_keylog_file,
-                    initial_url: cli.initial_url,
-                    proxy_server: chrome_proxy_server,
-                    timezone: cli.timezone,
-                    locale: cli.locale,
-                    focus: cli.focus,
-                };
-                let chrome = launch_chrome(&opts).map_err(|e| e.to_string())?;
-                let pid = chrome.pid();
+                let (pid, chrome, proxy_fwd) = launch_desktop_chrome(&cli, None)?;
                 (pid, Some(chrome), proxy_fwd)
             } else if let Some(pid) = cli.pid {
                 (pid, None, None)
@@ -212,16 +245,62 @@ fn build_backend(cli: CliArgs) -> Result<BackendBundle, String> {
                 );
             };
             tracing::info!(pid = target_pid, "starting macos native driver");
-            Ok((
-                Arc::new(MacOsDriver::new(target_pid)),
-                !cli.no_motion,
-                launched,
-                fwd,
-                None,
-            ))
+            Ok(BackendBundle {
+                driver: Arc::new(MacOsDriver::new(target_pid)),
+                use_motion: !cli.no_motion,
+                _launched: launched,
+                _proxy_forwarder: fwd,
+                _waydroid: None,
+                _xvfb: None,
+            })
+        }
+        "linux" => {
+            let (xvfb_session, display_env) = if cli.headless_xvfb {
+                let session = HeadlessDisplaySession::start(HeadlessDisplayConfig::default())
+                    .map_err(|e| e.to_string())?;
+                let disp = session.display();
+                (Some(session), Some(disp))
+            } else {
+                (None, cli.display.clone())
+            };
+
+            let (target_pid, launched, fwd) = if cli.launch_chrome {
+                let (pid, chrome, proxy_fwd) = launch_desktop_chrome(&cli, display_env.clone())?;
+                (Some(pid), Some(chrome), proxy_fwd)
+            } else {
+                (cli.pid, None, None)
+            };
+
+            tracing::info!(pid = ?target_pid, ?display_env, "starting linux desktop driver");
+            Ok(BackendBundle {
+                driver: Arc::new(LinuxDriver::with_display(target_pid, display_env)),
+                use_motion: !cli.no_motion,
+                _launched: launched,
+                _proxy_forwarder: fwd,
+                _waydroid: None,
+                _xvfb: xvfb_session,
+            })
+        }
+        "windows" => {
+            let (target_pid, launched, fwd) = if cli.launch_chrome {
+                let (pid, chrome, proxy_fwd) = launch_desktop_chrome(&cli, None)?;
+                (Some(pid), Some(chrome), proxy_fwd)
+            } else {
+                (cli.pid, None, None)
+            };
+
+            tracing::info!(pid = ?target_pid, "starting windows native driver");
+            Ok(BackendBundle {
+                driver: Arc::new(WindowsDriver::new(target_pid)),
+                use_motion: !cli.no_motion,
+                _launched: launched,
+                _proxy_forwarder: fwd,
+                _waydroid: None,
+                _xvfb: None,
+            })
         }
         other => Err(format!(
-            "unknown backend {other:?} (expected 'mock', 'macos', or 'android')"
+            "unknown backend {other:?} (expected 'mock', 'macos', 'linux', 'windows', or 'android')"
         )),
     }
 }
@@ -242,16 +321,8 @@ fn main() -> ExitCode {
         }
     };
 
-    let socket_path = match cli.socket_path.clone() {
-        Some(p) => p,
-        None => match default_user_socket_path() {
-            Ok(p) => p,
-            Err(err) => {
-                tracing::error!(error = %err, "failed to create private socket directory");
-                return ExitCode::FAILURE;
-            }
-        },
-    };
+    let tcp_addr = cli.tcp_addr.clone();
+    let socket_path_arg = cli.socket_path.clone();
 
     let responses = Arc::new(ResponseStore::default());
     let _net_tap = cli.ssl_keylog_file.as_ref().and_then(|keylog| {
@@ -264,7 +335,7 @@ fn main() -> ExitCode {
         }
     });
 
-    let (driver, use_motion, _launched, _proxy_forwarder, _waydroid) = match build_backend(cli) {
+    let bundle = match build_backend(cli) {
         Ok(bundle) => bundle,
         Err(msg) => {
             tracing::error!(error = %msg, "failed to initialize backend");
@@ -272,11 +343,44 @@ fn main() -> ExitCode {
         }
     };
 
-    let options = ServerOptions { use_motion };
-    if let Err(err) = server::serve_unix(&socket_path, &driver, responses, options) {
-        tracing::error!(error = %err, "daemon terminated with error");
-        return ExitCode::FAILURE;
+    let options = ServerOptions {
+        use_motion: bundle.use_motion,
+    };
+
+    if let Some(addr) = tcp_addr {
+        if let Err(err) = server::serve_tcp(&addr, &bundle.driver, responses, options) {
+            tracing::error!(error = %err, "daemon tcp server terminated with error");
+            return ExitCode::FAILURE;
+        }
+        return ExitCode::SUCCESS;
     }
 
-    ExitCode::SUCCESS
+    #[cfg(unix)]
+    {
+        let socket_path = match socket_path_arg {
+            Some(p) => p,
+            None => match default_user_socket_path() {
+                Ok(p) => p,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to create private socket directory");
+                    return ExitCode::FAILURE;
+                }
+            },
+        };
+        if let Err(err) = server::serve_unix(&socket_path, &bundle.driver, responses, options) {
+            tracing::error!(error = %err, "daemon terminated with error");
+            return ExitCode::FAILURE;
+        }
+        ExitCode::SUCCESS
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = socket_path_arg;
+        if let Err(err) = server::serve_tcp("127.0.0.1:49222", &bundle.driver, responses, options) {
+            tracing::error!(error = %err, "daemon tcp server terminated with error");
+            return ExitCode::FAILURE;
+        }
+        ExitCode::SUCCESS
+    }
 }
