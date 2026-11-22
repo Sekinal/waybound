@@ -49,6 +49,10 @@ def _resolve_daemon_binary(explicit: Path | str | None) -> Path:
     if explicit is not None:
         return Path(explicit)
 
+    env_bin = os.environ.get("WAYBOUND_DAEMON_BIN")
+    if env_bin:
+        return Path(env_bin)
+
     on_path = shutil.which("waybound-daemon")
     if on_path is not None:
         return Path(on_path)

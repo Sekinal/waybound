@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-daemon:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: waybound-daemon-macos-arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: waybound-daemon-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: waybound-daemon-linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release daemon
+        run: cargo build --release --bin waybound-daemon --target ${{ matrix.target }}
+      - name: Package tarball + SHA-256
+        run: |
+          mkdir -p dist
+          tar -C target/${{ matrix.target }}/release -czf dist/${{ matrix.artifact }}.tar.gz waybound-daemon
+          shasum -a 256 dist/${{ matrix.artifact }}.tar.gz > dist/${{ matrix.artifact }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+
+  build-python:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build Python sdist and wheel
+        run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: python/dist/*
+
+  publish-release:
+    needs: [build-daemon, build-python]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
