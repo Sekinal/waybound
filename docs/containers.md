@@ -60,6 +60,10 @@ podman run --rm \
   python3 your_script.py
 ```
 
+## Reusing a Logged-In Session
+
+Mount a session bundle read-only and restore it with `waybound profile import` before launching Chrome. Only bundles created by a Linux Chrome using the `basic` password store (`LaunchOptions(password_store="basic")`) decrypt inside the container; see [profile-portability.md](profile-portability.md).
+
 ## Compose
 
 [`compose.yaml`](../compose.yaml) builds the image and runs `waybound doctor` with the capture capabilities added. The entrypoint only starts a D-Bus session and the AT-SPI2 bus; Xvfb is started by the daemon for sessions with `headless_xvfb=True`, always on display `:99`, so run one such session per container.

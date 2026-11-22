@@ -67,6 +67,8 @@ docker run --rm --shm-size=2g --security-opt seccomp=unconfined ghcr.io/sekinal/
 
 See [docs/containers.md](docs/containers.md) for headless Linux scripting and passive capture inside containers.
 
+To log in once and reuse the session in other runs or containers, see [docs/profile-portability.md](docs/profile-portability.md) (`waybound profile export` / `import`, with the per-OS portability matrix and security notes: bundles contain live session cookies).
+
 ---
 
 ## Why `waybound`? (Honest Comparison)

@@ -4,6 +4,7 @@ from waybound.async_client import AsyncLocator, AsyncPage, AsyncSession, launch_
 from waybound.client import Locator, Page
 from waybound.handoff import AsyncHandoffHttpClient, HandoffHttpClient, HandoffResponse
 from waybound.pool import BrowserPool, DisplayBackend, PoolSlotConfig, PoolStats
+from waybound.profile import ProfileError, export_profile, import_profile
 from waybound.profiles import (
     DEFAULT_MAX_SNAPSHOT_BYTES,
     EXCLUDED_PROFILE_NAMES,
@@ -76,6 +77,7 @@ __all__ = [
     "Page",
     "PoolSlotConfig",
     "PoolStats",
+    "ProfileError",
     "ProfileStore",
     "Role",
     "Session",
@@ -90,6 +92,8 @@ __all__ = [
     "WayboundDaemonError",
     "WebSocketDirection",
     "WebSocketOpcode",
+    "export_profile",
+    "import_profile",
     "launch",
     "launch_async",
     "responses_to_har",
