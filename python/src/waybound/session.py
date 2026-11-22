@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import socket
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -44,8 +46,13 @@ class LaunchOptions:
     locale: str | None = None
     focus: bool = False
     no_motion: bool = False
+    use_tcp: bool = False
     daemon_binary: Path | str | None = None
     startup_timeout_s: float = 5.0
+
+
+def _daemon_bin_name() -> str:
+    return "waybound-daemon.exe" if sys.platform == "win32" else "waybound-daemon"
 
 
 def _resolve_daemon_binary(explicit: Path | str | None) -> Path:
@@ -56,7 +63,8 @@ def _resolve_daemon_binary(explicit: Path | str | None) -> Path:
     if env_bin:
         return Path(env_bin)
 
-    on_path = shutil.which("waybound-daemon")
+    bin_name = _daemon_bin_name()
+    on_path = shutil.which(bin_name)
     if on_path is not None:
         return Path(on_path)
 
@@ -64,7 +72,7 @@ def _resolve_daemon_binary(explicit: Path | str | None) -> Path:
     if len(parents) >= _MIN_WORKSPACE_PARENTS:
         repo_root = parents[3]
         for profile in ("release", "debug"):
-            candidate = repo_root / "target" / profile / "waybound-daemon"
+            candidate = repo_root / "target" / profile / bin_name
             if candidate.exists():
                 return candidate
 
@@ -73,14 +81,22 @@ def _resolve_daemon_binary(explicit: Path | str | None) -> Path:
         return cached
 
     msg = (
-        "waybound-daemon binary not found on PATH, in target/{release,debug}, "
-        "or in ~/.cache/waybound"
+        f"{bin_name} binary not found on PATH, in target/{{release,debug}}, or in ~/.cache/waybound"
     )
     raise FileNotFoundError(msg)
 
 
+def _reserve_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        addr: tuple[str, int] = probe.getsockname()
+        return addr[1]
+
+
 def _connect_with_retry(
-    socket_path: Path,
+    *,
+    socket_path: Path | None,
+    tcp_addr: tuple[str, int] | None,
     stderr_log: Path,
     proc: subprocess.Popen[bytes],
     timeout_s: float,
@@ -93,13 +109,19 @@ def _connect_with_retry(
                 stderr_text = stderr_log.read_text(encoding="utf-8", errors="replace").strip()
             msg = f"waybound-daemon exited early (code {proc.returncode}): {stderr_text}"
             raise RuntimeError(msg)
-        if socket_path.exists():
+        if tcp_addr is not None:
+            try:
+                return UnixSocketTransport(tcp_addr=tcp_addr)
+            except (ConnectionRefusedError, OSError):
+                pass
+        elif socket_path is not None and socket_path.exists():
             try:
                 return UnixSocketTransport(socket_path)
             except (FileNotFoundError, ConnectionRefusedError, PermissionError):
                 pass
         time.sleep(0.02)
-    msg = f"timed out waiting for waybound-daemon socket at {socket_path}"
+    target = f"{tcp_addr[0]}:{tcp_addr[1]}" if tcp_addr is not None else str(socket_path)
+    msg = f"timed out waiting for waybound-daemon at {target}"
     raise TimeoutError(msg)
 
 
@@ -114,15 +136,19 @@ class Session:
         self._proc: subprocess.Popen[bytes] | None = None
         self._transport: UnixSocketTransport | None = None
 
-    def _build_daemon_cmd(self, socket_path: Path) -> list[str]:
+    def _build_daemon_cmd(
+        self,
+        *,
+        socket_path: Path | None,
+        tcp_addr: tuple[str, int] | None,
+    ) -> list[str]:
         opts = self._options
-        cmd = [
-            str(self._daemon_binary),
-            "--socket",
-            str(socket_path),
-            "--backend",
-            opts.backend,
-        ]
+        cmd = [str(self._daemon_binary)]
+        if tcp_addr is not None:
+            cmd.extend(["--tcp", f"{tcp_addr[0]}:{tcp_addr[1]}"])
+        elif socket_path is not None:
+            cmd.extend(["--socket", str(socket_path)])
+        cmd.extend(["--backend", opts.backend])
         pairs: tuple[tuple[str, str | None], ...] = (
             ("--pid", str(opts.pid) if opts.pid is not None else None),
             ("--serial", opts.serial),
@@ -158,14 +184,22 @@ class Session:
             msg = "Session is already active and cannot be re-entered"
             raise RuntimeError(msg)
 
-        # Keep socket path short to stay within macOS's 104-byte AF_UNIX sun_path limit.
-        tmp_dir = tempfile.TemporaryDirectory(prefix="wb-", dir="/tmp")
-        self._tmp_dir = tmp_dir
-        socket_path = Path(tmp_dir.name) / "w.sock"
-        stderr_log = Path(tmp_dir.name) / "daemon.stderr.log"
-
         opts = self._options
-        cmd = self._build_daemon_cmd(socket_path)
+        use_tcp = opts.use_tcp or sys.platform == "win32" or not hasattr(socket, "AF_UNIX")
+
+        if use_tcp:
+            tmp_dir = tempfile.TemporaryDirectory(prefix="wb-")
+            socket_path: Path | None = None
+            tcp_addr: tuple[str, int] | None = ("127.0.0.1", _reserve_loopback_port())
+        else:
+            # Keep socket path short to stay within macOS's 104-byte AF_UNIX sun_path limit.
+            tmp_dir = tempfile.TemporaryDirectory(prefix="wb-", dir="/tmp")
+            socket_path = Path(tmp_dir.name) / "w.sock"
+            tcp_addr = None
+
+        self._tmp_dir = tmp_dir
+        stderr_log = Path(tmp_dir.name) / "daemon.stderr.log"
+        cmd = self._build_daemon_cmd(socket_path=socket_path, tcp_addr=tcp_addr)
 
         child_env = os.environ.copy()
         if opts.proxy is not None:
@@ -181,7 +215,13 @@ class Session:
                     env=child_env,
                 )
             self._proc = proc
-            transport = _connect_with_retry(socket_path, stderr_log, proc, opts.startup_timeout_s)
+            transport = _connect_with_retry(
+                socket_path=socket_path,
+                tcp_addr=tcp_addr,
+                stderr_log=stderr_log,
+                proc=proc,
+                timeout_s=opts.startup_timeout_s,
+            )
             self._transport = transport
             return Page(transport)
         except BaseException:

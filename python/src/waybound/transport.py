@@ -35,18 +35,41 @@ class WayboundDaemonError(RuntimeError):
 
 
 class UnixSocketTransport:
-    """Line-delimited JSON transport connected to waybound-daemon over AF_UNIX."""
+    """Line-delimited JSON transport connected to waybound-daemon over AF_UNIX or loopback TCP."""
 
-    def __init__(self, socket_path: Path | str, *, timeout_s: float = 30.0) -> None:
-        self._socket_path = Path(socket_path)
+    def __init__(
+        self,
+        socket_path: Path | str | None = None,
+        *,
+        tcp_addr: tuple[str, int] | None = None,
+        timeout_s: float = 30.0,
+    ) -> None:
+        if (socket_path is None) == (tcp_addr is None):
+            msg = "provide exactly one of `socket_path` or `tcp_addr`"
+            raise ValueError(msg)
+
+        self._socket_path = Path(socket_path) if socket_path is not None else None
+        self._tcp_addr = tcp_addr
         self._base_timeout_s = timeout_s
         self._lock = threading.Lock()
-        self._sock: socket.socket | None = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock: socket.socket | None = None
         self._reader: TextIOWrapper | None = None
         self._writer: TextIOWrapper | None = None
         try:
-            self._sock.settimeout(timeout_s)
-            self._sock.connect(str(self._socket_path))
+            if tcp_addr is not None:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sock = sock
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(timeout_s)
+                sock.connect(tcp_addr)
+            else:
+                if not hasattr(socket, "AF_UNIX") or self._socket_path is None:
+                    msg = "AF_UNIX sockets are not supported on this platform; use tcp_addr"
+                    raise OSError(msg)
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self._sock = sock
+                sock.settimeout(timeout_s)
+                sock.connect(str(self._socket_path))
             self._reader = self._sock.makefile("r", encoding="utf-8", newline="\n")
             self._writer = self._sock.makefile("w", encoding="utf-8", newline="\n")
         except BaseException:
@@ -161,7 +184,11 @@ class UnixSocketTransport:
         clamped_ms = max(0, timeout_ms)
         dedicated_timeout = max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0)
         try:
-            with UnixSocketTransport(self._socket_path, timeout_s=dedicated_timeout) as dedicated:
+            with UnixSocketTransport(
+                self._socket_path,
+                tcp_addr=self._tcp_addr,
+                timeout_s=dedicated_timeout,
+            ) as dedicated:
                 response = dedicated._request(
                     {
                         "method": "wait_for_response",
