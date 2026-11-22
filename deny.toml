@@ -1,17 +1,28 @@
 # cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+# Run locally with `make deny` (needs `cargo install cargo-deny`); CI runs it on every push.
 [graph]
 all-features = true
 
 [advisories]
-ignore = []
+# Report unmaintained crates anywhere in the graph, not just direct dependencies. Explicit
+# because cargo-deny 0.22 changed the default to "workspace".
+unmaintained = "all"
+ignore = [
+  # zbus 5.x depends on zbus_names, zvariant and zvariant_derive, which were folded into zbus 6.0
+  # and are no longer maintained as standalone crates. These are "unmaintained" notices, not
+  # vulnerabilities. zbus 6 removes the blocking API that waybound-driver-linux is built on
+  # (`zbus::blocking::Connection`) and needs Rust 1.89, so the move is a driver rewrite tracked
+  # separately. Drop these entries once waybound-driver-linux is on zbus 6.
+  { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained, merged into zbus 6; pulled in by zbus 5" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained, merged into zbus 6; pulled in by zbus 5" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained, merged into zbus 6; pulled in by zbus 5" },
+]
 
 [licenses]
 allow = [
   "MIT",
   "Apache-2.0",
-  "BSD-2-Clause",
   "BSD-3-Clause",
-  "ISC",
   "Unicode-3.0",
   "Zlib",
 ]
@@ -19,9 +30,13 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace crates depend on each other by path only. They are all `publish = false`, so the
+# missing version requirement can never reach crates.io.
+allow-wildcard-paths = true
 highlight = "all"
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
