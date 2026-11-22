@@ -39,6 +39,14 @@ pub fn key_to_vk(key: KeyCode) -> Option<u16> {
         KeyCode::Backspace => Some(0x08),  // VK_BACK
         KeyCode::ArrowLeft => Some(0x25),  // VK_LEFT
         KeyCode::ArrowRight => Some(0x27), // VK_RIGHT
+        KeyCode::ArrowUp => Some(0x26),    // VK_UP
+        KeyCode::ArrowDown => Some(0x28),  // VK_DOWN
+        KeyCode::Space => Some(0x20),      // VK_SPACE
+        KeyCode::Delete => Some(0x2E),     // VK_DELETE
+        KeyCode::Home => Some(0x24),       // VK_HOME
+        KeyCode::End => Some(0x23),        // VK_END
+        KeyCode::PageUp => Some(0x21),     // VK_PRIOR
+        KeyCode::PageDown => Some(0x22),   // VK_NEXT
         KeyCode::Char(c) => match c {
             'a'..='z' => Some(u16::from(c.to_ascii_uppercase() as u8)),
             'A'..='Z' | '0'..='9' => Some(u16::from(c as u8)),

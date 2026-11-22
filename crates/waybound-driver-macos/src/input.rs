@@ -175,6 +175,14 @@ fn post_key(key: &KeyCode, modifiers: &[KeyModifier], hold_ms: u64) -> Result<()
         KeyCode::Backspace => post_chord(0x33, None, &held, hold_ms),
         KeyCode::ArrowLeft => post_chord(0x7B, None, &held, hold_ms),
         KeyCode::ArrowRight => post_chord(0x7C, None, &held, hold_ms),
+        KeyCode::ArrowUp => post_chord(0x7E, None, &held, hold_ms),
+        KeyCode::ArrowDown => post_chord(0x7D, None, &held, hold_ms),
+        KeyCode::Space => post_chord(0x31, Some(' '), &held, hold_ms),
+        KeyCode::Delete => post_chord(0x75, None, &held, hold_ms),
+        KeyCode::Home => post_chord(0x73, None, &held, hold_ms),
+        KeyCode::End => post_chord(0x77, None, &held, hold_ms),
+        KeyCode::PageUp => post_chord(0x74, None, &held, hold_ms),
+        KeyCode::PageDown => post_chord(0x79, None, &held, hold_ms),
         KeyCode::Char(ch) => match (ansi_keycode(*ch), held.is_empty()) {
             // Plain typing: the real ANSI key (so `KeyboardEvent.code` is right), Shift held
             // for capitals and shifted symbols, and the character pinned via the Unicode

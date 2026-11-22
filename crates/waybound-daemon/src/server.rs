@@ -288,6 +288,25 @@ fn scroll_viewport(
 }
 
 const MAX_SCROLL_INTO_VIEW_ATTEMPTS: usize = 6;
+/// Default actionability auto-wait duration for `hover`, `click`, and `fill`.
+const DEFAULT_ACTION_WAIT: Duration = Duration::from_secs(5);
+const ACTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn locate_with_auto_wait(
+    driver: &dyn Driver,
+    query: &LocatorQuery,
+) -> Result<waybound_core::AccessibilityNode> {
+    let deadline = Instant::now() + DEFAULT_ACTION_WAIT;
+    loop {
+        match driver.locate(query) {
+            Ok(node) => return Ok(node),
+            Err(WayboundError::ElementNotFound { .. }) if Instant::now() < deadline => {
+                thread::sleep(ACTION_POLL_INTERVAL);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
 
 fn validate_bounds(b: waybound_core::Bounds, query: &LocatorQuery) -> Result<()> {
     if !b.x.is_finite()
@@ -305,7 +324,7 @@ fn validate_bounds(b: waybound_core::Bounds, query: &LocatorQuery) -> Result<()>
 }
 
 fn hover_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery) -> Result<()> {
-    let mut node = driver.locate(query)?;
+    let mut node = locate_with_auto_wait(driver, query)?;
     validate_bounds(node.bounds, query)?;
 
     // Auto-scroll off-screen elements into the visible viewport when viewport bounds are known.

@@ -14,6 +14,8 @@ pub enum Role {
     Link,
     /// Single-line or multi-line text input.
     TextBox,
+    /// Search input field (`<input type="search">` / `role="searchbox"`).
+    SearchBox,
     /// Checkbox toggle.
     CheckBox,
     /// Radio button option.
@@ -26,10 +28,20 @@ pub enum Role {
     ListBox,
     /// Individual option inside a listbox or select menu.
     Option,
+    /// Generic list container (`<ul>` / `<ol>` / `role="list"`).
+    List,
+    /// Individual item inside a list (`<li>` / `role="listitem"`).
+    ListItem,
     /// Tab selector inside a tablist.
     Tab,
     /// Modal or dialog container.
     Dialog,
+    /// Named landmark region (`role="region"` / `<section aria-label="...">`).
+    Region,
+    /// Generic grouping container (`role="group"` / `<fieldset>`).
+    Group,
+    /// Image element (`<img>` / `role="img"`).
+    Img,
     /// Menu item entry.
     MenuItem,
     /// Document root or web area.

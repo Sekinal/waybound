@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     scrot \
     tshark \
+    xclip \
     xdotool \
     xvfb \
     && if [ "${TARGETARCH}" = "amd64" ]; then \

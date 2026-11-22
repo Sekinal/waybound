@@ -183,6 +183,14 @@ pub fn build_xdotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
                 KeyCode::Backspace => "BackSpace".to_owned(),
                 KeyCode::ArrowLeft => "Left".to_owned(),
                 KeyCode::ArrowRight => "Right".to_owned(),
+                KeyCode::ArrowUp => "Up".to_owned(),
+                KeyCode::ArrowDown => "Down".to_owned(),
+                KeyCode::Space => "space".to_owned(),
+                KeyCode::Delete => "Delete".to_owned(),
+                KeyCode::Home => "Home".to_owned(),
+                KeyCode::End => "End".to_owned(),
+                KeyCode::PageUp => "Prior".to_owned(),
+                KeyCode::PageDown => "Next".to_owned(),
                 KeyCode::Char(ch) => xdotool_keysym(*ch),
             };
             parts.push(key_part);
@@ -331,6 +339,14 @@ pub fn build_ydotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
                 KeyCode::Backspace => Some(14),
                 KeyCode::ArrowLeft => Some(105),
                 KeyCode::ArrowRight => Some(106),
+                KeyCode::ArrowUp => Some(103),
+                KeyCode::ArrowDown => Some(108),
+                KeyCode::Space => Some(57),
+                KeyCode::Delete => Some(111),
+                KeyCode::Home => Some(102),
+                KeyCode::End => Some(107),
+                KeyCode::PageUp => Some(104),
+                KeyCode::PageDown => Some(109),
                 KeyCode::Char(ch) => linux_char_keycode(*ch),
             };
 
@@ -361,6 +377,77 @@ pub fn build_ydotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
     }
 }
 
+/// Pastes a single non-ASCII Unicode character via `xclip -selection clipboard` + `Ctrl+v`.
+///
+/// `xdotool type` dynamically remaps temporary X11 keycodes for non-ASCII / CJK characters
+/// and frees them before Chromium finishes processing the event, silently dropping characters.
+/// Returns `Ok(true)` if `xclip` succeeded, or `Ok(false)` if `xclip` is unavailable.
+fn try_paste_unicode_x11(ch: char, display: Option<&str>) -> Result<bool> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+
+    let mut cmd = Command::new("xclip");
+    let _ = cmd
+        .args(["-selection", "clipboard"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(disp) = display {
+        let _ = cmd.env("DISPLAY", disp);
+    }
+
+    let Ok(mut child) = cmd.spawn() else {
+        return Ok(false);
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        if stdin.write_all(s.as_bytes()).is_err() {
+            return Ok(false);
+        }
+    }
+
+    let Ok(status) = child.wait() else {
+        return Ok(false);
+    };
+    if !status.success() {
+        return Ok(false);
+    }
+
+    thread::sleep(Duration::from_millis(15));
+    let mut envs: Vec<(&str, &str)> = Vec::new();
+    if let Some(disp) = display {
+        envs.push(("DISPLAY", disp));
+    }
+    let paste_args = vec![
+        "key".to_owned(),
+        "--clearmodifiers".to_owned(),
+        "ctrl+v".to_owned(),
+    ];
+    let output = run_with_timeout(
+        "xdotool",
+        &paste_args,
+        &envs,
+        DEFAULT_TIMEOUT,
+        "Linux X11 Unicode paste",
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(WayboundError::BackendUnavailable {
+            backend: BACKEND_NAME.to_owned(),
+            reason: format!(
+                "`xdotool` paste failed ({}): {}",
+                output.status,
+                truncate_for_log(&stderr)
+            ),
+        });
+    }
+    Ok(true)
+}
+
 /// Dispatches an [`InputEvent`] via `xdotool` (X11/Xvfb) or `ydotool` (Wayland).
 ///
 /// # Errors
@@ -372,6 +459,20 @@ pub fn dispatch_input(
     server: DisplayServer,
     display: Option<&str>,
 ) -> Result<()> {
+    if server == DisplayServer::X11
+        && let InputEvent::KeyPress {
+            key: KeyCode::Char(ch),
+            modifiers,
+            ..
+        } = event
+        && modifiers.is_empty()
+        && !ch.is_ascii()
+        && !ch.is_control()
+        && try_paste_unicode_x11(*ch, display)?
+    {
+        return Ok(());
+    }
+
     let (program, commands) = match server {
         DisplayServer::X11 => ("xdotool", build_xdotool_commands(event)),
         DisplayServer::Wayland => ("ydotool", build_ydotool_commands(event)),

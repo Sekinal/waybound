@@ -212,6 +212,14 @@ fn build_key_shell_args(key: &KeyCode) -> Vec<String> {
         KeyCode::Backspace => keyevent_args(KEYCODE_BACKSPACE),
         KeyCode::ArrowLeft => keyevent_args(21),
         KeyCode::ArrowRight => keyevent_args(22),
+        KeyCode::ArrowUp => keyevent_args(19),
+        KeyCode::ArrowDown => keyevent_args(20),
+        KeyCode::Space => keyevent_args(62),
+        KeyCode::Delete => keyevent_args(112),
+        KeyCode::Home => keyevent_args(122),
+        KeyCode::End => keyevent_args(123),
+        KeyCode::PageUp => keyevent_args(92),
+        KeyCode::PageDown => keyevent_args(93),
         KeyCode::Char(ch) => {
             let mut buf = [0u8; 4];
             let s = ch.encode_utf8(&mut buf);

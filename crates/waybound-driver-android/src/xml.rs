@@ -254,6 +254,7 @@ pub fn map_class_to_role(class_name: &str, clickable: bool, resource_id: Option<
         "RadioButton" => Role::Radio,
         "Switch" | "ToggleButton" => Role::Switch,
         "Button" | "ImageButton" => Role::Button,
+        "ImageView" => Role::Img,
         "ListView" | "RecyclerView" => Role::ListBox,
         "TabWidget" => Role::Tab,
         "WebView" => Role::Document,

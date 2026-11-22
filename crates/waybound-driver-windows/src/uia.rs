@@ -50,6 +50,12 @@ pub fn map_uia_control_type(control_type: &str, localized: Option<&str>) -> Role
         {
             return Role::Heading;
         }
+        if loc == "searchbox" || loc == "search" {
+            return Role::SearchBox;
+        }
+        if loc == "region" || loc == "landmark" {
+            return Role::Region;
+        }
     }
 
     match base.to_ascii_lowercase().as_str() {
@@ -64,6 +70,8 @@ pub fn map_uia_control_type(control_type: &str, localized: Option<&str>) -> Role
         "listitem" => Role::Option,
         "tabitem" | "tab" => Role::Tab,
         "dialog" => Role::Dialog,
+        "group" => Role::Group,
+        "image" => Role::Img,
         "menuitem" => Role::MenuItem,
         "document" => Role::Document,
         "header" | "headeritem" => Role::Heading,

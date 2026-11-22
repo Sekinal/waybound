@@ -53,6 +53,22 @@ pub enum KeyCode {
     ArrowLeft,
     /// Right arrow key.
     ArrowRight,
+    /// Up arrow key.
+    ArrowUp,
+    /// Down arrow key.
+    ArrowDown,
+    /// Space bar.
+    Space,
+    /// Forward delete key.
+    Delete,
+    /// Home key.
+    Home,
+    /// End key.
+    End,
+    /// Page Up key.
+    PageUp,
+    /// Page Down key.
+    PageDown,
     /// Arbitrary Unicode character.
     Char(char),
 }

@@ -22,7 +22,24 @@ if TYPE_CHECKING:
     from io import TextIOWrapper
     from types import TracebackType
 
-_NAMED_KEYS = frozenset({"enter", "tab", "escape", "backspace", "arrow_left", "arrow_right"})
+_NAMED_KEYS = frozenset(
+    {
+        "enter",
+        "tab",
+        "escape",
+        "backspace",
+        "arrow_left",
+        "arrow_right",
+        "arrow_up",
+        "arrow_down",
+        "space",
+        "delete",
+        "home",
+        "end",
+        "page_up",
+        "page_down",
+    }
+)
 # The daemon paces typing at up to ~180 ms per key; allow headroom on top of the base timeout.
 _FILL_SECONDS_PER_CHAR = 0.25
 
