@@ -12,12 +12,13 @@ use crate::ffi::{
     AXUIElementGetTypeID, AXUIElementSetAttributeValue, AXValueGetTypeID, AXValueGetValue,
     CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFGetTypeID, CgPoint, CgSize,
     K_AX_ERROR_SUCCESS, K_AX_VALUE_TYPE_CG_POINT, K_AX_VALUE_TYPE_CG_SIZE, OwnedCf, cf_string,
-    cf_to_bool, cf_to_string, kCFBooleanTrue,
+    cf_to_bool, cf_to_string, cf_to_url_string, kCFBooleanTrue,
 };
 
 const MAX_DEPTH: usize = 40;
 const MAX_NODES: usize = 2_000;
 const MAX_VISITED: usize = 10_000;
+const MAX_WEB_AREA_SEARCH: usize = 500;
 
 /// Checks whether the current process has macOS Accessibility permission.
 #[must_use]
@@ -26,16 +27,7 @@ pub fn is_accessibility_trusted() -> bool {
     unsafe { AXIsProcessTrusted() != 0 }
 }
 
-/// Captures a bounded snapshot of the accessibility tree for `pid`.
-///
-/// Enables `AXEnhancedUserInterface` on the target application so Chromium/Chrome
-/// exposes its `AXWebArea` web-content accessibility tree.
-///
-/// # Errors
-///
-/// Returns [`WayboundError::BackendUnavailable`] if Accessibility permissions are missing
-/// or the application element cannot be created.
-pub fn snapshot_application_tree(pid: i32) -> Result<Vec<AccessibilityNode>> {
+fn open_window_root(pid: i32) -> Result<OwnedCf> {
     if pid <= 0 {
         return Err(WayboundError::BackendUnavailable {
             backend: "macos_native".to_owned(),
@@ -62,21 +54,94 @@ pub fn snapshot_application_tree(pid: i32) -> Result<Vec<AccessibilityNode>> {
 
     // Prefer the active browser window, then the first window in `AXWindows`,
     // falling back to the application root so we work even when Chrome is backgrounded.
-    let root = copy_attr(&app, "AXFocusedWindow")
+    Ok(copy_attr(&app, "AXFocusedWindow")
         .or_else(|| copy_attr(&app, "AXMainWindow"))
         .or_else(|| first_ax_window(&app))
-        .unwrap_or(app);
+        .unwrap_or(app))
+}
+
+/// Captures a bounded snapshot of the web-content (`AXWebArea`) accessibility tree for `pid`.
+///
+/// Scopes traversal to `AXWebArea` so browser chrome (tabs, toolbar, address bar)
+/// does not pollute semantic web locators.
+///
+/// # Errors
+///
+/// Returns [`WayboundError::BackendUnavailable`] if Accessibility permissions are missing
+/// or the application element cannot be created.
+pub fn snapshot_application_tree(pid: i32) -> Result<Vec<AccessibilityNode>> {
+    let window_root = open_window_root(pid)?;
+    let Some(web_area) = find_web_area(&window_root) else {
+        tracing::debug!(pid, "AXWebArea not yet present in browser window");
+        return Ok(Vec::new());
+    };
 
     let mut nodes = Vec::new();
     let mut visited = 0;
-    walk_node(&root, 0, &mut visited, &mut nodes);
+    walk_node(&web_area, 0, &mut visited, &mut nodes);
     tracing::debug!(
         pid,
         visited,
         captured = nodes.len(),
-        "macos AX snapshot complete"
+        "macos AXWebArea snapshot complete"
     );
     Ok(nodes)
+}
+
+/// Reads the active tab's URL from `AXWebArea`'s `AXURL` attribute.
+///
+/// # Errors
+///
+/// Returns [`WayboundError::BackendUnavailable`] if Accessibility permissions are missing.
+pub fn read_current_url(pid: i32) -> Result<Option<String>> {
+    let window_root = open_window_root(pid)?;
+    let Some(web_area) = find_web_area(&window_root) else {
+        return Ok(None);
+    };
+    Ok(copy_attr(&web_area, "AXURL").and_then(|v| cf_to_url_string(&v)))
+}
+
+fn find_web_area(root: &OwnedCf) -> Option<OwnedCf> {
+    let mut stack: Vec<(OwnedCf, usize)> = Vec::new();
+    // SAFETY: `root` is a valid retained `OwnedCf` pointing to an `AXUIElement`.
+    let root_clone = unsafe { OwnedCf::retain(root.as_ptr()) }?;
+    stack.push((root_clone, 0));
+
+    let mut visited = 0;
+    while let Some((elem, depth)) = stack.pop() {
+        if visited >= MAX_WEB_AREA_SEARCH || depth > 14 {
+            continue;
+        }
+        visited += 1;
+
+        if read_string_attr(&elem, "AXRole").as_deref() == Some("AXWebArea") {
+            return Some(elem);
+        }
+
+        let Some(children) = copy_attr(&elem, "AXChildren") else {
+            continue;
+        };
+
+        // SAFETY: `children` is a live CF object; verify `CFArray` and `AXUIElement` type IDs.
+        unsafe {
+            if CFGetTypeID(children.as_ptr()) != CFArrayGetTypeID() {
+                continue;
+            }
+            let ax_type_id = AXUIElementGetTypeID();
+            let count = CFArrayGetCount(children.as_ptr());
+            for idx in (0..count).rev() {
+                let child_raw = CFArrayGetValueAtIndex(children.as_ptr(), idx);
+                if !child_raw.is_null()
+                    && CFGetTypeID(child_raw) == ax_type_id
+                    && let Some(child) = OwnedCf::retain(child_raw)
+                {
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn first_ax_window(app: &OwnedCf) -> Option<OwnedCf> {

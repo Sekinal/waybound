@@ -21,6 +21,11 @@ def test_ergonomic_launch_full_workflow() -> None:
         assert len(nodes) == 2
         assert nodes[0].role is Role.TEXTBOX
         assert nodes[0].name == "Origin"
+        assert page.url() == "https://mock.waybound.local/"
+
+        buttons = page.get_by_role(Role.BUTTON).all()
+        assert len(buttons) == 1
+        assert page.get_by_role(Role.BUTTON).nth(0).text_content() == "Search Flights"
 
         found = page.get_by_role(Role.BUTTON, name="Search").wait_for(timeout_ms=1_000)
         assert found.id == "btn-search"

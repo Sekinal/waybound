@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from waybound.types import AccessibilityNode, KeyModifier, LocatorQuery, Role
@@ -18,9 +18,30 @@ class Locator:
     _transport: Transport
     query: LocatorQuery
 
+    def nth(self, index: int) -> Locator:
+        """Return a locator narrowed to the zero-based `index`-th matching element."""
+        if index < 0:
+            msg = f"nth index must be non-negative, got {index}"
+            raise ValueError(msg)
+        return Locator(_transport=self._transport, query=replace(self.query, nth=index))
+
+    def all(self) -> list[AccessibilityNode]:
+        """Return all accessibility nodes matching this locator."""
+        return self._transport.locate_all(self.query)
+
     def wait_for(self, *, timeout_ms: int = 10_000) -> AccessibilityNode:
         """Wait until this element appears in the accessibility tree."""
         return self._transport.wait_for(self.query, timeout_ms=timeout_ms)
+
+    def text_content(self, *, timeout_ms: int = 5_000) -> str | None:
+        """Return the accessible name or value text of the resolved element."""
+        node = self.wait_for(timeout_ms=timeout_ms)
+        return node.name if node.name is not None else node.value
+
+    def input_value(self, *, timeout_ms: int = 5_000) -> str:
+        """Return the current editable value of a textbox/input element."""
+        node = self.wait_for(timeout_ms=timeout_ms)
+        return node.value or ""
 
     def click(self) -> None:
         """Click the resolved element using native OS input."""
@@ -37,6 +58,10 @@ class Page:
     def __init__(self, transport: Transport) -> None:
         self._transport = transport
 
+    def url(self) -> str | None:
+        """Return the active tab URL from the browser's web area, if available."""
+        return self._transport.current_url()
+
     def goto(self, url: str) -> None:
         """Navigate the active browser tab to `url` via native OS shortcut."""
         self._transport.navigate(url)
@@ -50,7 +75,7 @@ class Page:
         self._transport.press(key, modifiers=modifiers)
 
     def snapshot_tree(self) -> list[AccessibilityNode]:
-        """Return a snapshot of the live OS accessibility tree."""
+        """Return a snapshot of the live web-content accessibility tree."""
         return self._transport.snapshot_tree()
 
     def get_by_role(self, role: Role, *, name: str | None = None, exact: bool = False) -> Locator:

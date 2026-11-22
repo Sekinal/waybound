@@ -72,6 +72,7 @@ class LocatorQuery:
     role: Role | None = None
     name: str | None = None
     exact: bool = False
+    nth: int = 0
 
 
 class Transport(Protocol):
@@ -79,6 +80,14 @@ class Transport(Protocol):
 
     def snapshot_tree(self) -> list[AccessibilityNode]:
         """Return the live OS accessibility tree."""
+        ...
+
+    def locate_all(self, query: LocatorQuery) -> list[AccessibilityNode]:
+        """Return all nodes matching `query`."""
+        ...
+
+    def current_url(self) -> str | None:
+        """Return the active tab URL, if available."""
         ...
 
     def wait_for(self, query: LocatorQuery, *, timeout_ms: int = 10_000) -> AccessibilityNode:

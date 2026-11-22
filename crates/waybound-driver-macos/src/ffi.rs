@@ -105,6 +105,8 @@ unsafe extern "C" {
     pub fn CFStringGetTypeID() -> usize;
     pub fn CFArrayGetTypeID() -> usize;
     pub fn CFBooleanGetTypeID() -> usize;
+    pub fn CFURLGetTypeID() -> usize;
+    pub fn CFURLGetString(an_url: CfTypeRef) -> CfStringRef;
     pub fn CFBooleanGetValue(boolean: CfBooleanRef) -> u8;
     pub fn CFStringCreateWithCString(
         alloc: CfTypeRef,
@@ -268,4 +270,22 @@ pub fn cf_to_bool(obj: &OwnedCf) -> Option<bool> {
         }
         Some(CFBooleanGetValue(raw) != 0)
     }
+}
+
+/// Extracts a URL string from an owned `CFURL` or `CFString` object.
+#[must_use]
+pub fn cf_to_url_string(obj: &OwnedCf) -> Option<String> {
+    if let Some(s) = cf_to_string(obj) {
+        return Some(s);
+    }
+    let raw = obj.as_ptr();
+    // SAFETY: `obj` guarantees `raw` is a live CoreFoundation object; type ID check verifies `CFURL`.
+    // `CFURLGetString` follows the Get Rule (+0 borrowed ref), so we retain it into `OwnedCf`.
+    let url_cf_str = unsafe {
+        if CFGetTypeID(raw) != CFURLGetTypeID() {
+            return None;
+        }
+        OwnedCf::retain(CFURLGetString(raw))?
+    };
+    cf_to_string(&url_cf_str)
 }

@@ -57,6 +57,17 @@ impl Driver for MacOsDriver {
         }
     }
 
+    fn current_url(&self) -> Result<Option<String>> {
+        #[cfg(target_os = "macos")]
+        {
+            ax::read_current_url(self.pid)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(None)
+        }
+    }
+
     fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
         #[cfg(target_os = "macos")]
         {

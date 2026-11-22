@@ -93,6 +93,24 @@ class UnixSocketTransport:
 
         return [_parse_node(item) for item in raw_nodes if isinstance(item, dict)]
 
+    def locate_all(self, query: LocatorQuery) -> list[AccessibilityNode]:
+        """Return all accessibility nodes matching `query`."""
+        response = self._request({"method": "locate_all", "query": _encode_query(query)})
+        raw_nodes = response.get("nodes")
+        if not isinstance(raw_nodes, list):
+            msg = f"unexpected locate_all response: {response!r}"
+            raise WayboundDaemonError("protocol_error", msg)
+        return [_parse_node(item) for item in raw_nodes if isinstance(item, dict)]
+
+    def current_url(self) -> str | None:
+        """Return the active tab URL from the daemon, if available."""
+        response = self._request({"method": "current_url"})
+        url = response.get("url")
+        if url is None or isinstance(url, str):
+            return url
+        msg = f"unexpected current_url response: {response!r}"
+        raise WayboundDaemonError("protocol_error", msg)
+
     def wait_for(self, query: LocatorQuery, *, timeout_ms: int = 10_000) -> AccessibilityNode:
         """Poll until an element matching `query` appears or `timeout_ms` elapses."""
         clamped_ms = max(0, timeout_ms)
@@ -243,4 +261,5 @@ def _encode_query(query: LocatorQuery) -> dict[str, object]:
         "role": query.role.value if query.role is not None else None,
         "name": query.name,
         "exact": query.exact,
+        "nth": max(0, query.nth),
     }

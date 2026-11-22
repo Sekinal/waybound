@@ -57,6 +57,10 @@ impl Driver for MockDriver {
         Ok(self.nodes.clone())
     }
 
+    fn current_url(&self) -> Result<Option<String>> {
+        Ok(Some("https://mock.waybound.local/".to_owned()))
+    }
+
     fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
         if let Ok(mut guard) = self.events.lock() {
             guard.push(event.clone());

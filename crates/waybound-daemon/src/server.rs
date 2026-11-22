@@ -77,6 +77,14 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             Ok(nodes) => Response::Tree { nodes },
             Err(err) => Response::from(&err),
         },
+        Request::LocateAll { query } => match driver.locate_all(&query) {
+            Ok(nodes) => Response::Tree { nodes },
+            Err(err) => Response::from(&err),
+        },
+        Request::CurrentUrl => match driver.current_url() {
+            Ok(url) => Response::Url { url },
+            Err(err) => Response::from(&err),
+        },
         Request::WaitFor { query, timeout_ms } => {
             match wait_for_element(driver, &query, timeout_ms) {
                 Ok(node) => Response::Node { node },

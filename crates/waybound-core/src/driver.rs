@@ -62,19 +62,42 @@ pub trait Driver: Send + Sync {
     /// Returns an error if the OS accessibility bus cannot be queried.
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>>;
 
-    /// Resolves the first accessibility node matching `query`.
+    /// Resolves all accessibility nodes matching `query` (ignoring `query.nth`).
     ///
     /// # Errors
     ///
-    /// Returns [`crate::WayboundError::ElementNotFound`] when no node matches.
+    /// Returns an error if the OS accessibility bus cannot be queried.
+    fn locate_all(&self, query: &LocatorQuery) -> Result<Vec<AccessibilityNode>> {
+        let nodes = self.snapshot_tree()?;
+        Ok(nodes
+            .into_iter()
+            .filter(|node| query.matches(node))
+            .collect())
+    }
+
+    /// Resolves the `query.nth`-th accessibility node matching `query`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::WayboundError::ElementNotFound`] when fewer than `query.nth + 1` nodes match.
     fn locate(&self, query: &LocatorQuery) -> Result<AccessibilityNode> {
         let nodes = self.snapshot_tree()?;
         nodes
             .into_iter()
-            .find(|node| query.matches(node))
+            .filter(|node| query.matches(node))
+            .nth(query.nth)
             .ok_or_else(|| crate::WayboundError::ElementNotFound {
                 query: format!("{query:?}"),
             })
+    }
+
+    /// Returns the URL currently loaded in the active browser tab, if available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OS accessibility bus cannot be queried.
+    fn current_url(&self) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// Dispatches a native OS input event to the active browser surface.

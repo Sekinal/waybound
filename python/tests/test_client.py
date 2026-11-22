@@ -14,6 +14,13 @@ class FakeTransport:
     def snapshot_tree(self) -> list[AccessibilityNode]:
         return []
 
+    def locate_all(self, query: LocatorQuery) -> list[AccessibilityNode]:
+        self.events.append(("locate_all", query))
+        return []
+
+    def current_url(self) -> str | None:
+        return "https://example.com"
+
     def wait_for(self, query: LocatorQuery, *, timeout_ms: int = 10_000) -> AccessibilityNode:
         self.events.append(("wait_for", (query, timeout_ms)))
         return AccessibilityNode(

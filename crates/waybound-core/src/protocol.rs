@@ -14,6 +14,13 @@ pub enum Request {
     Ping,
     /// Return a snapshot of the active accessibility tree.
     SnapshotTree,
+    /// Return all accessibility nodes matching `query`.
+    LocateAll {
+        /// Semantic locator query (`nth` is ignored).
+        query: LocatorQuery,
+    },
+    /// Return the current active tab URL, if available.
+    CurrentUrl,
     /// Poll the accessibility tree until an element matching `query` appears or `timeout_ms` elapses.
     WaitFor {
         /// Semantic locator query.
@@ -77,6 +84,11 @@ pub enum Response {
     Node {
         /// First matched accessibility node.
         node: AccessibilityNode,
+    },
+    /// Response to [`Request::CurrentUrl`].
+    Url {
+        /// Current URL string, if known.
+        url: Option<String>,
     },
     /// Structured error returned when a request fails.
     Error {

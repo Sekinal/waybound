@@ -73,6 +73,9 @@ pub struct LocatorQuery {
     pub name: Option<String>,
     /// Whether `name` must match exactly.
     pub exact: bool,
+    /// Zero-based match index when multiple nodes satisfy the query.
+    #[serde(default)]
+    pub nth: usize,
 }
 
 impl LocatorQuery {
@@ -83,6 +86,7 @@ impl LocatorQuery {
             role: Some(role),
             name,
             exact: false,
+            nth: 0,
         }
     }
 
