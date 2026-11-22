@@ -293,6 +293,23 @@ fn launch_desktop_chrome(
     Ok((pid, chrome, proxy_fwd))
 }
 
+/// Builds the `Xvfb` configuration for `--headless-xvfb`.
+///
+/// `--display :N` selects the virtual display number, so several daemons on one host
+/// (for example a Python `BrowserPool`) can each own a distinct `Xvfb` server instead of
+/// all colliding on the default `:99`.
+fn headless_display_config(display: Option<&str>) -> Result<HeadlessDisplayConfig, String> {
+    let mut config = HeadlessDisplayConfig::default();
+    if let Some(raw) = display {
+        let without_colon = raw.strip_prefix(':').unwrap_or(raw);
+        let number = without_colon.split('.').next().unwrap_or(without_colon);
+        config.display_num = number.parse::<u16>().map_err(|_| {
+            format!("--display {raw:?} must look like :N when combined with --headless-xvfb")
+        })?;
+    }
+    Ok(config)
+}
+
 #[allow(clippy::too_many_lines)]
 fn build_backend(
     cli: CliArgs,
@@ -397,8 +414,9 @@ fn build_backend(
                     );
                     (None, None, Some(comp), Some(guard))
                 } else if cli.headless_xvfb {
-                    let session = HeadlessDisplaySession::start(HeadlessDisplayConfig::default())
-                        .map_err(|e| e.to_string())?;
+                    let config = headless_display_config(cli.display.as_deref())?;
+                    let session =
+                        HeadlessDisplaySession::start(config).map_err(|e| e.to_string())?;
                     let disp = session.display();
                     (Some(session), Some(disp), None, None)
                 } else {
@@ -675,5 +693,24 @@ mod tests {
             "--headless-wayland".to_owned(),
         ]);
         assert!(matches!(conflict, Err(msg) if msg.contains("mutually exclusive")));
+    }
+
+    #[test]
+    fn headless_display_defaults_to_99_and_honours_display_flag() {
+        assert_eq!(headless_display_config(None).map(|c| c.display_num), Ok(99));
+        assert_eq!(
+            headless_display_config(Some(":105")).map(|c| c.display_num),
+            Ok(105)
+        );
+        assert_eq!(
+            headless_display_config(Some(":7.0")).map(|c| c.display_num),
+            Ok(7)
+        );
+        assert_eq!(
+            headless_display_config(Some("42")).map(|c| c.display_num),
+            Ok(42)
+        );
+        assert!(headless_display_config(Some("localhost:1")).is_err());
+        assert!(headless_display_config(Some(":")).is_err());
     }
 }
