@@ -2,7 +2,7 @@
 //!
 //! Consumes decrypted client->server and server->client byte streams from
 //! [`crate::tls13::PassiveTls13Decoder`], correlates request URLs with response
-//! statuses, headers, and full bodies (with streaming `gzip`/`deflate`/`br`
+//! statuses, headers, and full bodies (with streaming `gzip`/`deflate`/`br`/`zstd`
 //! decompression), and tracks exact inflight request counts for `networkidle`.
 
 use std::collections::HashMap;
@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flate2::read::{GzDecoder, ZlibDecoder};
 use fluke_hpack::Decoder as HpackDecoder;
+use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 use waybound_core::CapturedResponse;
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -30,6 +31,12 @@ const H2_FLAG_PRIORITY: u8 = 0x20;
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum decompressed UTF-8 body size (16 MiB).
 const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest `zstd` window a response may request (RFC 9659 caps HTTP `zstd` at 8 MiB).
+const ZSTD_MAX_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+/// Empty raw block flagged `Last_Block` (RFC 8878 §3.1.1.2), followed by four
+/// placeholder bytes for an optional content checksum. Appended after the last
+/// complete block of a truncated frame so the decoder releases its window.
+const ZSTD_SYNTHETIC_FRAME_END: [u8; 7] = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 /// Maximum buffered framing bytes per direction.
 const MAX_FRAME_BUFFER: usize = 4 * 1024 * 1024;
 
@@ -582,7 +589,7 @@ fn build_https_url(authority: &str, path: &str) -> String {
 }
 
 /// Decodes raw response bytes into UTF-8 text, transparently decompressing
-/// `gzip`, `deflate`, or `br` (Brotli) and retaining partial prefixes for streaming SSE.
+/// `gzip`, `deflate`, `br` (Brotli), or `zstd` and retaining partial prefixes for streaming SSE.
 #[must_use]
 pub fn decode_body_bytes(raw: &[u8], encoding: Option<&str>) -> Option<String> {
     if raw.is_empty() {
@@ -608,6 +615,10 @@ pub fn decode_body_bytes(raw: &[u8], encoding: Option<&str>) -> Option<String> {
             let _ = decoder.read_to_end(&mut out);
             if out.is_empty() { raw.to_vec() } else { out }
         }
+        Some("zstd") => {
+            let out = decode_zstd(raw);
+            if out.is_empty() { raw.to_vec() } else { out }
+        }
         _ => raw.to_vec(),
     };
 
@@ -621,6 +632,65 @@ pub fn decode_body_bytes(raw: &[u8], encoding: Option<&str>) -> Option<String> {
             } else {
                 None
             }
+        }
+    }
+}
+
+/// Decompresses one or more concatenated `zstd` frames, capped at
+/// [`MAX_DECOMPRESSED_BYTES`]. A truncated final frame still yields the output
+/// of every block that arrived in full.
+fn decode_zstd(raw: &[u8]) -> Vec<u8> {
+    let limit = usize::try_from(MAX_DECOMPRESSED_BYTES).unwrap_or(usize::MAX);
+    let mut out = Vec::new();
+    let mut decoder = FrameDecoder::new();
+    decoder.set_max_window_size(ZSTD_MAX_WINDOW_BYTES);
+    let mut rest = raw;
+    while !rest.is_empty() && out.len() < limit {
+        let frame = rest;
+        let frame_out_start = out.len();
+        match decode_zstd_frame(&mut decoder, &mut rest, &mut out, limit) {
+            Ok(()) => {}
+            Err(Some(complete_len)) => {
+                // The decoder holds back up to a window of output until the frame
+                // ends, so re-decode the complete blocks behind a synthetic end.
+                out.truncate(frame_out_start);
+                let mut patched = frame.get(..complete_len).unwrap_or_default().to_vec();
+                patched.extend_from_slice(&ZSTD_SYNTHETIC_FRAME_END);
+                let mut src = patched.as_slice();
+                let _ = decode_zstd_frame(&mut decoder, &mut src, &mut out, limit);
+                break;
+            }
+            Err(None) => break,
+        }
+    }
+    out.truncate(limit);
+    out
+}
+
+/// Decodes a single `zstd` frame from the front of `src` block by block,
+/// appending to `out` until the frame ends or `out` reaches `limit` bytes.
+///
+/// Returns `Err(Some(n))` when the frame breaks off after `n` bytes of complete
+/// blocks, and `Err(None)` when no frame header could be read.
+fn decode_zstd_frame(
+    decoder: &mut FrameDecoder,
+    src: &mut &[u8],
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), Option<usize>> {
+    let frame_len = src.len();
+    decoder.reset(&mut *src).map_err(|_| None)?;
+    loop {
+        let complete_len = frame_len - src.len();
+        let result = decoder.decode_blocks(&mut *src, BlockDecodingStrategy::UptoBlocks(1));
+        if result.is_err() && !decoder.is_finished() {
+            return Err(Some(complete_len));
+        }
+        if let Some(chunk) = decoder.collect() {
+            out.extend_from_slice(&chunk);
+        }
+        if decoder.is_finished() || out.len() >= limit {
+            return Ok(());
         }
     }
 }
@@ -744,5 +814,94 @@ mod tests {
             final_resp.body.as_deref(),
             Some("data: {\"type\":\"flightOption\"}\n\n")
         );
+    }
+
+    /// Text spanning several 128 KiB `zstd` blocks that does not collapse into one sequence.
+    fn multi_block_text() -> String {
+        use std::fmt::Write as _;
+
+        let mut text = String::new();
+        for i in 0..40_000u32 {
+            let _ = writeln!(text, "line {i}: {}", i.wrapping_mul(7919) % 10_007);
+        }
+        text
+    }
+
+    #[test]
+    fn decodes_zstd_round_trip() {
+        let payload = br#"{"flights":[{"price":419}]}"#;
+        let compressed = ruzstd::encoding::compress_to_vec(
+            &payload[..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        assert_ne!(compressed.as_slice(), &payload[..]);
+        assert_eq!(
+            decode_body_bytes(&compressed, Some("zstd")).as_deref(),
+            Some(r#"{"flights":[{"price":419}]}"#)
+        );
+        assert_eq!(
+            decode_body_bytes(&compressed, Some(" ZSTD ")).as_deref(),
+            Some(r#"{"flights":[{"price":419}]}"#)
+        );
+
+        let text = multi_block_text();
+        let compressed = ruzstd::encoding::compress_to_vec(
+            text.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        assert_eq!(
+            decode_body_bytes(&compressed, Some("zstd")).as_deref(),
+            Some(text.as_str())
+        );
+    }
+
+    #[test]
+    fn decodes_concatenated_zstd_frames() {
+        let mut compressed = ruzstd::encoding::compress_to_vec(
+            &b"data: one\n\n"[..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        compressed.extend(ruzstd::encoding::compress_to_vec(
+            &b"data: two\n\n"[..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        ));
+        assert_eq!(
+            decode_body_bytes(&compressed, Some("zstd")).as_deref(),
+            Some("data: one\n\ndata: two\n\n")
+        );
+    }
+
+    #[test]
+    fn keeps_partial_output_of_truncated_zstd_frame() {
+        let text = multi_block_text();
+        let compressed = ruzstd::encoding::compress_to_vec(
+            text.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        let truncated = &compressed[..compressed.len() * 3 / 4];
+        let partial = decode_body_bytes(truncated, Some("zstd")).unwrap_or_default();
+        assert!(!partial.is_empty());
+        assert!(partial.len() < text.len());
+        assert!(text.starts_with(&partial));
+    }
+
+    #[test]
+    fn caps_zstd_output_at_max_decompressed_bytes() {
+        // Hand-built frame: no checksum, 1 MiB window, then RLE blocks of 128 KiB
+        // of `a` adding up to more than MAX_DECOMPRESSED_BYTES.
+        let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x50];
+        let blocks = 130;
+        for n in 1..=blocks {
+            // Block_Header: Last_Block | Block_Type (1 = RLE) << 1 | Block_Size << 3.
+            let header: u32 = u32::from(n == blocks) | (1 << 1) | (128 * 1024) << 3;
+            frame.extend_from_slice(&header.to_le_bytes()[..3]);
+            frame.push(b'a');
+        }
+        let body = decode_body_bytes(&frame, Some("zstd")).unwrap_or_default();
+        assert_eq!(
+            u64::try_from(body.len()).unwrap_or_default(),
+            MAX_DECOMPRESSED_BYTES
+        );
+        assert!(body.bytes().all(|b| b == b'a'));
     }
 }

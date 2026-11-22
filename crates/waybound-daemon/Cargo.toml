@@ -6,8 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-brotli.workspace = true
-flate2.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
 tracing.workspace = true
@@ -18,6 +16,10 @@ waybound-driver-linux.workspace = true
 waybound-driver-macos.workspace = true
 waybound-driver-windows.workspace = true
 waybound-net.workspace = true
+
+[dev-dependencies]
+brotli.workspace = true
+flate2.workspace = true
 
 [lints]
 workspace = true
