@@ -1,4 +1,7 @@
 //! Live incremental parser for NSS `SSLKEYLOGFILE` files.
+//!
+//! Understands the TLS 1.3 `CLIENT_TRAFFIC_SECRET_0` / `SERVER_TRAFFIC_SECRET_0` labels and
+//! the TLS 1.2 `CLIENT_RANDOM` label (which carries the 48-byte master secret).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -6,13 +9,15 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// TLS 1.3 traffic secrets associated with a single `client_random`.
+/// TLS secrets associated with a single `client_random`.
 #[derive(Debug, Clone, Default)]
 pub struct TrafficSecrets {
     /// `CLIENT_TRAFFIC_SECRET_0` (client -> server application data).
     pub client_traffic_secret_0: Option<Vec<u8>>,
     /// `SERVER_TRAFFIC_SECRET_0` (server -> client application data).
     pub server_traffic_secret_0: Option<Vec<u8>>,
+    /// `CLIENT_RANDOM` (TLS 1.2 master secret).
+    pub master_secret: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -57,13 +62,20 @@ impl KeyLogStore {
         server_secret: Vec<u8>,
     ) {
         if let Ok(mut guard) = self.inner.lock() {
-            let _ = guard.secrets.insert(
-                client_random,
-                TrafficSecrets {
-                    client_traffic_secret_0: Some(client_secret),
-                    server_traffic_secret_0: Some(server_secret),
-                },
-            );
+            let entry = guard.secrets.entry(client_random).or_default();
+            entry.client_traffic_secret_0 = Some(client_secret);
+            entry.server_traffic_secret_0 = Some(server_secret);
+        }
+    }
+
+    /// Inserts a TLS 1.2 master secret directly (useful in unit tests).
+    pub fn insert_master_secret_for_test(&self, client_random: [u8; 32], master_secret: Vec<u8>) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard
+                .secrets
+                .entry(client_random)
+                .or_default()
+                .master_secret = Some(master_secret);
         }
     }
 }
@@ -132,6 +144,7 @@ pub fn parse_keylog_line<S: std::hash::BuildHasher>(
     match label {
         "CLIENT_TRAFFIC_SECRET_0" => entry.client_traffic_secret_0 = Some(secret_bytes),
         "SERVER_TRAFFIC_SECRET_0" => entry.server_traffic_secret_0 = Some(secret_bytes),
+        "CLIENT_RANDOM" => entry.master_secret = Some(secret_bytes),
         _ => {}
     }
 }
@@ -185,6 +198,26 @@ mod tests {
         if let Some(sec) = found {
             assert_eq!(sec.client_traffic_secret_0, Some(vec![0xAA; 32]));
             assert_eq!(sec.server_traffic_secret_0, Some(vec![0xBB; 48]));
+            assert_eq!(sec.master_secret, None);
+        }
+    }
+
+    #[test]
+    fn parses_tls12_client_random_lines() {
+        let mut map = HashMap::new();
+        let random_hex = "0f".repeat(32);
+        let ms_hex = "Cd".repeat(48);
+        parse_keylog_line(&format!("CLIENT_RANDOM {random_hex} {ms_hex}\n"), &mut map);
+        // Malformed lines (short random, odd hex) are ignored.
+        parse_keylog_line(&format!("CLIENT_RANDOM 0f0f {ms_hex}\n"), &mut map);
+        parse_keylog_line(&format!("CLIENT_RANDOM {random_hex} abc\n"), &mut map);
+
+        assert_eq!(map.len(), 1);
+        let found = map.get(&[0x0Fu8; 32]);
+        assert!(found.is_some());
+        if let Some(sec) = found {
+            assert_eq!(sec.master_secret, Some(vec![0xCD; 48]));
+            assert_eq!(sec.client_traffic_secret_0, None);
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Pure-Rust HTTP/1.1 and HTTP/2 + HPACK plaintext stream correlator.
 //!
 //! Consumes decrypted client->server and server->client byte streams from
-//! [`crate::tls13::PassiveTls13Decoder`], correlates request URLs with response
+//! [`crate::tls::PassiveTlsDecoder`], correlates request URLs with response
 //! statuses, headers, and full bodies (with streaming `gzip`/`deflate`/`br`/`zstd`
 //! decompression), and tracks exact inflight request counts for `networkidle`.
 
