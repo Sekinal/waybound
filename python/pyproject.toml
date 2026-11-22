@@ -5,9 +5,29 @@ build-backend = "hatchling.build"
 [project]
 name = "waybound"
 version = "0.2.1"
-description = "Ergonomic, out-of-band OS-level browser automation SDK"
+description = "Zero-CDP, out-of-band OS-level browser automation SDK (macOS, Linux, Windows, Android)"
+license = "MIT OR Apache-2.0"
 requires-python = ">=3.12"
 dependencies = []
+keywords = ["browser-automation", "accessibility", "playwright", "mcp", "rust", "wayland", "macos", "windows"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/Sekinal/waybound"
+Repository = "https://github.com/Sekinal/waybound"
+Issues = "https://github.com/Sekinal/waybound/issues"
+Changelog = "https://github.com/Sekinal/waybound/releases"
 
 [project.scripts]
 waybound = "waybound.cli:main"
