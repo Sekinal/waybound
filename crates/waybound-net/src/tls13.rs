@@ -448,14 +448,14 @@ mod tests {
         let mut ch = vec![CONTENT_TYPE_HANDSHAKE, 0x03, 0x01, 0x00, 38];
         ch.extend_from_slice(&[HANDSHAKE_CLIENT_HELLO, 0, 0, 34, 0x03, 0x03]);
         ch.extend_from_slice(&client_random);
-        assert!(dec.feed(Direction::ClientToServer, &ch).is_empty());
+        assert_eq!(dec.feed(Direction::ClientToServer, &ch), Vec::<u8>::new());
 
         let mut sh = vec![CONTENT_TYPE_HANDSHAKE, 0x03, 0x03, 0x00, 41];
         sh.extend_from_slice(&[HANDSHAKE_SERVER_HELLO, 0, 0, 37, 0x03, 0x03]);
         sh.extend_from_slice(&[0x99u8; 32]); // server random
         sh.push(0); // session_id_len = 0
         sh.extend_from_slice(&0x1301u16.to_be_bytes()); // TLS_AES_128_GCM_SHA256
-        assert!(dec.feed(Direction::ServerToClient, &sh).is_empty());
+        assert_eq!(dec.feed(Direction::ServerToClient, &sh), Vec::<u8>::new());
 
         // Bogus encrypted handshake record (skipped gracefully because seq stays 0).
         let fake_hs = [CONTENT_TYPE_APPLICATION_DATA, 0x03, 0x03, 0x00, 20];

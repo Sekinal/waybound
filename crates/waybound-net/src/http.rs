@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(inflight.get(), 0);
 
         let list = captured.lock().map(|g| g.clone()).unwrap_or_default();
-        assert!(!list.is_empty());
+        assert_ne!(list.len(), 0);
         let final_resp = &list[list.len() - 1];
         assert_eq!(
             final_resp.url,
