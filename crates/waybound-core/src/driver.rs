@@ -71,10 +71,7 @@ pub trait Driver: Send + Sync {
     /// Returns an error if the OS accessibility bus cannot be queried.
     fn locate_all(&self, query: &LocatorQuery) -> Result<Vec<AccessibilityNode>> {
         let nodes = self.snapshot_tree()?;
-        Ok(nodes
-            .into_iter()
-            .filter(|node| query.matches(node))
-            .collect())
+        Ok(query.resolve_all(&nodes).into_iter().cloned().collect())
     }
 
     /// Resolves the `query.nth`-th accessibility node matching `query`.
@@ -84,10 +81,9 @@ pub trait Driver: Send + Sync {
     /// Returns [`crate::WayboundError::ElementNotFound`] when fewer than `query.nth + 1` nodes match.
     fn locate(&self, query: &LocatorQuery) -> Result<AccessibilityNode> {
         let nodes = self.snapshot_tree()?;
-        nodes
-            .into_iter()
-            .filter(|node| query.matches(node))
-            .nth(query.nth)
+        query
+            .resolve_one(&nodes)
+            .cloned()
             .ok_or_else(|| crate::WayboundError::ElementNotFound {
                 query: format!("{query:?}"),
             })

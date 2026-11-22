@@ -61,7 +61,33 @@ impl Bounds {
     pub fn center(&self) -> (f64, f64) {
         (self.x + self.width / 2.0, self.y + self.height / 2.0)
     }
+
+    /// Returns `true` when `other`'s center lies within this bounding rectangle (with 1px tolerance).
+    #[must_use]
+    pub fn contains_center(&self, other: &Self) -> bool {
+        if !self.x.is_finite()
+            || !self.y.is_finite()
+            || !self.width.is_finite()
+            || !self.height.is_finite()
+            || self.width <= 0.0
+            || self.height <= 0.0
+        {
+            return false;
+        }
+        let (cx, cy) = other.center();
+        if !cx.is_finite() || !cy.is_finite() {
+            return false;
+        }
+        let tol = 1.0;
+        cx >= self.x - tol
+            && cx <= self.x + self.width + tol
+            && cy >= self.y - tol
+            && cy <= self.y + self.height + tol
+    }
 }
+
+/// Maximum nesting depth for chained `within` parent scopes.
+const MAX_SCOPE_DEPTH: usize = 8;
 
 /// A single node in the live OS accessibility tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,6 +118,9 @@ pub struct LocatorQuery {
     /// Zero-based match index when multiple nodes satisfy the query.
     #[serde(default)]
     pub nth: usize,
+    /// Optional parent container query; matches are spatially scoped inside the resolved parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within: Option<Box<Self>>,
 }
 
 impl LocatorQuery {
@@ -103,10 +132,12 @@ impl LocatorQuery {
             name,
             exact: false,
             nth: 0,
+            within: None,
         }
     }
 
-    /// Evaluates whether a candidate [`AccessibilityNode`] satisfies this query.
+    /// Evaluates whether a candidate [`AccessibilityNode`] satisfies this query's own filters
+    /// (ignoring `within` parent scoping and `nth`).
     #[must_use]
     pub fn matches(&self, node: &AccessibilityNode) -> bool {
         if let Some(expected_role) = self.role
@@ -132,6 +163,57 @@ impl LocatorQuery {
         }
 
         true
+    }
+
+    /// Resolves all nodes matching this query (honoring any chained `within` parent scopes,
+    /// ignoring `self.nth`).
+    #[must_use]
+    pub fn resolve_all<'a>(&self, nodes: &'a [AccessibilityNode]) -> Vec<&'a AccessibilityNode> {
+        self.resolve_all_with_depth(nodes, 0)
+    }
+
+    /// Resolves the `self.nth`-th node matching this query (honoring any chained `within` scopes).
+    #[must_use]
+    pub fn resolve_one<'a>(&self, nodes: &'a [AccessibilityNode]) -> Option<&'a AccessibilityNode> {
+        self.resolve_all_with_depth(nodes, 0)
+            .into_iter()
+            .nth(self.nth)
+    }
+
+    fn resolve_all_with_depth<'a>(
+        &self,
+        nodes: &'a [AccessibilityNode],
+        depth: usize,
+    ) -> Vec<&'a AccessibilityNode> {
+        if depth > MAX_SCOPE_DEPTH {
+            return Vec::new();
+        }
+
+        let parent = match &self.within {
+            None => None,
+            Some(parent_query) => {
+                let Some(resolved) = parent_query
+                    .resolve_all_with_depth(nodes, depth + 1)
+                    .into_iter()
+                    .nth(parent_query.nth)
+                else {
+                    return Vec::new();
+                };
+                Some(resolved)
+            }
+        };
+
+        nodes
+            .iter()
+            .filter(|node| {
+                if let Some(container) = parent
+                    && (node.id == container.id || !container.bounds.contains_center(&node.bounds))
+                {
+                    return false;
+                }
+                self.matches(node)
+            })
+            .collect()
     }
 }
 
@@ -171,5 +253,73 @@ mod tests {
 
         let wrong_role = LocatorQuery::by_role(Role::Link, Some("search".to_owned()));
         assert!(!wrong_role.matches(&node));
+    }
+
+    #[test]
+    fn scoped_locator_resolves_only_inside_parent_bounds() {
+        let nodes = vec![
+            AccessibilityNode {
+                id: "outer-save".to_owned(),
+                role: Role::Button,
+                name: Some("Save".to_owned()),
+                value: None,
+                bounds: Bounds {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 60.0,
+                    height: 30.0,
+                },
+                focused: false,
+            },
+            AccessibilityNode {
+                id: "settings-dialog".to_owned(),
+                role: Role::Dialog,
+                name: Some("Settings".to_owned()),
+                value: None,
+                bounds: Bounds {
+                    x: 200.0,
+                    y: 200.0,
+                    width: 400.0,
+                    height: 300.0,
+                },
+                focused: false,
+            },
+            AccessibilityNode {
+                id: "dialog-save".to_owned(),
+                role: Role::Button,
+                name: Some("Save".to_owned()),
+                value: None,
+                bounds: Bounds {
+                    x: 500.0,
+                    y: 440.0,
+                    width: 70.0,
+                    height: 30.0,
+                },
+                focused: false,
+            },
+        ];
+
+        let query = LocatorQuery {
+            role: Some(Role::Button),
+            name: Some("Save".to_owned()),
+            exact: true,
+            nth: 0,
+            within: Some(Box::new(LocatorQuery::by_role(
+                Role::Dialog,
+                Some("Settings".to_owned()),
+            ))),
+        };
+
+        let resolved = query.resolve_one(&nodes);
+        assert_eq!(resolved.map(|n| n.id.as_str()), Some("dialog-save"));
+
+        let missing_parent = LocatorQuery {
+            within: Some(Box::new(LocatorQuery::by_role(
+                Role::Dialog,
+                Some("Nonexistent".to_owned()),
+            ))),
+            ..query
+        };
+        assert_eq!(missing_parent.resolve_all(&nodes).len(), 0);
     }
 }

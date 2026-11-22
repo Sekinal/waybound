@@ -22,12 +22,31 @@ class Locator:
     _transport: Transport
     query: LocatorQuery
 
+    @property
+    def first(self) -> Locator:
+        """Return a locator narrowed to the first matching element (`nth(0)`)."""
+        return self.nth(0)
+
     def nth(self, index: int) -> Locator:
         """Return a locator narrowed to the zero-based `index`-th matching element."""
         if index < 0:
             msg = f"nth index must be non-negative, got {index}"
             raise ValueError(msg)
         return Locator(_transport=self._transport, query=replace(self.query, nth=index))
+
+    def get_by_role(self, role: Role, *, name: str | None = None, exact: bool = False) -> Locator:
+        """Return a child locator scoped spatially inside this container element."""
+        return Locator(
+            _transport=self._transport,
+            query=LocatorQuery(role=role, name=name, exact=exact, within=self.query),
+        )
+
+    def get_by_text(self, text: str, *, exact: bool = False) -> Locator:
+        """Return a child locator matching accessible text inside this container element."""
+        return Locator(
+            _transport=self._transport,
+            query=LocatorQuery(role=None, name=text, exact=exact, within=self.query),
+        )
 
     def all(self) -> list[AccessibilityNode]:
         """Return all accessibility nodes matching this locator."""

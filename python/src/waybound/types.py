@@ -99,6 +99,7 @@ class LocatorQuery:
     name: str | None = None
     exact: bool = False
     nth: int = 0
+    within: LocatorQuery | None = None
 
 
 class Transport(Protocol):

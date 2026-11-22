@@ -324,9 +324,12 @@ def _parse_http_response(item: dict[object, object]) -> CapturedResponse:
 
 
 def _encode_query(query: LocatorQuery) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "role": query.role.value if query.role is not None else None,
         "name": query.name,
         "exact": query.exact,
         "nth": max(0, query.nth),
     }
+    if query.within is not None:
+        payload["within"] = _encode_query(query.within)
+    return payload

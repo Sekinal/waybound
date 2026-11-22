@@ -22,9 +22,24 @@ class AsyncLocator:
 
     _inner: Locator
 
+    @property
+    def first(self) -> AsyncLocator:
+        """Return a locator narrowed to the first matching element (`nth(0)`)."""
+        return AsyncLocator(self._inner.first)
+
     def nth(self, index: int) -> AsyncLocator:
         """Return a locator narrowed to the zero-based `index`-th matching element."""
         return AsyncLocator(self._inner.nth(index))
+
+    def get_by_role(
+        self, role: Role, *, name: str | None = None, exact: bool = False
+    ) -> AsyncLocator:
+        """Return a child async locator scoped spatially inside this container element."""
+        return AsyncLocator(self._inner.get_by_role(role, name=name, exact=exact))
+
+    def get_by_text(self, text: str, *, exact: bool = False) -> AsyncLocator:
+        """Return a child async locator matching accessible text inside this container element."""
+        return AsyncLocator(self._inner.get_by_text(text, exact=exact))
 
     async def all(self) -> list[AccessibilityNode]:
         """Return all accessibility nodes matching this locator."""
