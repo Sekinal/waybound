@@ -378,13 +378,17 @@ while ($queue.Count -gt 0 -and $nodes.Count -lt $maxNodes) {
             }
         } catch {}
 
+        # Probe state patterns only on control types that can carry them: each
+        # TryGetCurrentPattern is a cross-process call.
         $toggleState = $null
-        try {
-            $tp = $null
-            if ($el.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$tp)) {
-                $toggleState = [int]$tp.Current.ToggleState
-            }
-        } catch {}
+        if ($ct -eq 'ControlType.CheckBox' -or $ct -eq 'ControlType.RadioButton' -or $ct -eq 'ControlType.Button' -or $ct -eq 'ControlType.MenuItem') {
+            try {
+                $tp = $null
+                if ($el.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$tp)) {
+                    $toggleState = [int]$tp.Current.ToggleState
+                }
+            } catch {}
+        }
         $selected = $null
         if ($ct -eq 'ControlType.RadioButton') {
             try {
@@ -395,12 +399,14 @@ while ($queue.Count -gt 0 -and $nodes.Count -lt $maxNodes) {
             } catch {}
         }
         $expandState = $null
-        try {
-            $ep = $null
-            if ($el.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$ep)) {
-                $expandState = [int]$ep.Current.ExpandCollapseState
-            }
-        } catch {}
+        if ($ct -eq 'ControlType.ComboBox' -or $ct -eq 'ControlType.Button' -or $ct -eq 'ControlType.MenuItem' -or $ct -eq 'ControlType.TreeItem' -or $ct -eq 'ControlType.Hyperlink' -or $ct -eq 'ControlType.SplitButton') {
+            try {
+                $ep = $null
+                if ($el.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$ep)) {
+                    $expandState = [int]$ep.Current.ExpandCollapseState
+                }
+            } catch {}
+        }
 
         $rid = $el.GetRuntimeId()
         $idStr = if ($null -ne $rid) { ($rid -join '-') } else { "uia-$($nodes.Count)" }

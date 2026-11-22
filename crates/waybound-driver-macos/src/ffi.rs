@@ -107,6 +107,7 @@ unsafe extern "C" {
     pub fn CFRelease(cf: CfTypeRef);
     pub fn CFRetain(cf: CfTypeRef) -> CfTypeRef;
     pub fn CFGetTypeID(cf: CfTypeRef) -> usize;
+    pub fn CFEqual(cf1: CfTypeRef, cf2: CfTypeRef) -> u8;
     pub fn CFStringGetTypeID() -> usize;
     pub fn CFArrayGetTypeID() -> usize;
     pub fn CFBooleanGetTypeID() -> usize;
@@ -143,6 +144,7 @@ unsafe extern "C" {
         attribute: CfStringRef,
         value: *mut CfTypeRef,
     ) -> i32;
+    pub fn AXUIElementCopyAttributeNames(element: AxUiElementRef, names: *mut CfArrayRef) -> i32;
     pub fn AXUIElementSetAttributeValue(
         element: AxUiElementRef,
         attribute: CfStringRef,

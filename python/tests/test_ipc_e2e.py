@@ -89,10 +89,8 @@ def test_check_uncheck_round_trip_against_mock() -> None:
         assert insurance.is_enabled() is False
         assert insurance.is_checked() is True
         insurance.check()  # already in the requested state: allowed even though disabled
-        with pytest.raises(WayboundDaemonError) as disabled:
-            insurance.uncheck()
-        assert disabled.value.code == "element_disabled"
-        assert insurance.is_checked() is True
+        # Refusing `uncheck()` waits out the 5 s enable auto-wait; the daemon unit tests cover
+        # it with a short injected wait instead.
 
         with pytest.raises(WayboundDaemonError) as not_checkable:
             page.get_by_role(Role.BUTTON, name="Search").check()

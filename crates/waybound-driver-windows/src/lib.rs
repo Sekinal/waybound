@@ -45,6 +45,11 @@ impl Driver for WindowsDriver {
         BackendKind::WindowsNative
     }
 
+    /// Node ids are UIA runtime ids, which stay stable for an element's lifetime.
+    fn stable_node_ids(&self) -> bool {
+        true
+    }
+
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
         #[cfg(target_os = "windows")]
         {

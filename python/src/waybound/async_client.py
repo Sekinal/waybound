@@ -90,7 +90,11 @@ class AsyncLocator:
         await asyncio.to_thread(self._inner.check)
 
     async def uncheck(self) -> None:
-        """Ensure the checkbox/switch is unchecked, clicking only if it is checked."""
+        """Ensure the checkbox/switch is unchecked, clicking only if it is checked.
+
+        A mixed (indeterminate) checkbox counts as unchecked and is left as is; radio buttons
+        cannot be unchecked.
+        """
         await asyncio.to_thread(self._inner.uncheck)
 
     async def is_checked(self, *, timeout_ms: int = 5_000) -> bool:

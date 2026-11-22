@@ -133,10 +133,12 @@ pub enum Request {
     Shutdown,
     /// Idempotently drive a checkbox / radio / switch to `checked`.
     ///
-    /// Auto-waits for the element like `click`, refuses disabled elements and elements
-    /// without a checked state, clicks only when the current state differs, then re-reads
-    /// the node and fails if the state did not change. Answered with [`Response::Node`]
-    /// carrying the node as re-read after the action.
+    /// Auto-waits for the element like `click` (and, when a click is needed, for it to be
+    /// enabled), refuses elements without a checked state and unchecking a radio button,
+    /// clicks only when the current state differs, then re-reads the node and fails if the
+    /// state did not change. A mixed checkbox counts as unchecked, so `checked: false` leaves
+    /// it mixed without clicking. Answered with [`Response::Node`] carrying the node as
+    /// re-read after the action.
     SetChecked {
         /// Semantic locator query.
         query: LocatorQuery,
@@ -287,6 +289,7 @@ mod tests {
     #[test]
     fn state_errors_map_to_stable_codes() {
         let disabled = Response::from(&WayboundError::ElementDisabled {
+            action: "check".to_owned(),
             query: "q".to_owned(),
         });
         assert!(matches!(disabled, Response::Error { ref code, .. } if code == "element_disabled"));

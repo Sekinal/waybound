@@ -107,6 +107,12 @@ pub trait Driver: Send + Sync {
         self.locate(query)
     }
 
+    /// Returns `true` when [`AccessibilityNode::id`] values identify the same UI element across
+    /// snapshots (for example UIA runtime ids), rather than being positional indices.
+    fn stable_node_ids(&self) -> bool {
+        false
+    }
+
     /// Returns the URL currently loaded in the active browser tab, if available.
     ///
     /// # Errors

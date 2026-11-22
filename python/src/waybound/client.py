@@ -101,14 +101,20 @@ class Locator:
     def check(self) -> None:
         """Ensure the checkbox/radio/switch is checked, clicking only if it is not.
 
-        Raises `WayboundDaemonError` with code `element_disabled` if a click is needed on a
-        disabled element, or `invalid_element_state` if the element has no checked state or
-        the click did not check it.
+        Waits for the element to appear and, if a click is needed, to become enabled. Raises
+        `WayboundDaemonError` with code `element_disabled` if it stays disabled, or
+        `invalid_element_state` if the element has no checked state or the click did not
+        check it.
         """
         self._transport.set_checked(self.query, checked=True)
 
     def uncheck(self) -> None:
-        """Ensure the checkbox/switch is unchecked, clicking only if it is checked."""
+        """Ensure the checkbox/switch is unchecked, clicking only if it is checked.
+
+        A mixed (indeterminate) checkbox counts as unchecked, so it is left mixed without a
+        click. Radio buttons cannot be unchecked (`invalid_element_state`); check another
+        option instead. Errors are otherwise the same as for `check()`.
+        """
         self._transport.set_checked(self.query, checked=False)
 
     def is_checked(self, *, timeout_ms: int = 5_000) -> bool:

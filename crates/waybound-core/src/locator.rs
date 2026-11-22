@@ -120,7 +120,8 @@ pub struct AccessibilityNode {
     ///
     /// `None` when the concept does not apply to the node (buttons, links, text, ...).
     /// A mixed / indeterminate tri-state checkbox is reported as `Some(false)`: it is not
-    /// fully checked, so `is_checked()` is `false` and `check()` clicks it.
+    /// fully checked, so `is_checked()` is `false`, `check()` clicks it, and `uncheck()` leaves
+    /// it mixed without clicking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked: Option<bool>,
     /// Whether the node is disabled (not enabled / not sensitive) and ignores input.

@@ -11,7 +11,10 @@ use waybound_core::{AccessibilityNode, Bounds, Result, Role, WayboundError};
 use zbus::blocking::{Connection, connection::Builder};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
-use crate::atspi::{AtspiSnapshot, AtspiStates, MAX_NODES, decode_atspi_states, map_atspi_role};
+use crate::atspi::{
+    AtspiSnapshot, AtspiStates, MAX_NODES, decode_atspi_node_states, is_checkable_atspi_role,
+    map_atspi_role,
+};
 use crate::process::BACKEND_NAME;
 
 const REGISTRY_BUS: &str = "org.a11y.atspi.Registry";
@@ -284,7 +287,7 @@ impl AtspiClient {
             } else {
                 self.get_state(&bus, path.as_str())
                     .map_or_else(AtspiStates::default, |words| {
-                        decode_atspi_states(&words, role)
+                        decode_atspi_node_states(&words, role, is_checkable_atspi_role(&role_raw))
                     })
             };
 

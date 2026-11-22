@@ -659,64 +659,143 @@ fn navigate_url(driver: &dyn Driver, url: &str) -> Result<()> {
     })
 }
 
-/// How long `set_checked` waits for the accessibility tree to reflect a toggle click.
-const CHECK_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Timing knobs for [`set_checked_element`]; tests shrink them to stay fast.
+#[derive(Debug, Clone, Copy)]
+struct CheckTiming {
+    /// How long to wait for the element to appear and, if a click is needed, to be enabled.
+    action_wait: Duration,
+    /// How long to wait for the accessibility tree to reflect the toggle click.
+    settle: Duration,
+    /// Delay between polls.
+    poll: Duration,
+}
 
-/// Returns the node's current checked state, refusing disabled and non-checkable nodes.
+impl CheckTiming {
+    const DEFAULT: Self = Self {
+        action_wait: DEFAULT_ACTION_WAIT,
+        settle: Duration::from_secs(2),
+        poll: ACTION_POLL_INTERVAL,
+    };
+}
+
+/// Returns the node's checked state, failing for nodes without one.
 fn checked_state(node: &waybound_core::AccessibilityNode, query: &LocatorQuery) -> Result<bool> {
-    let Some(current) = node.checked else {
-        return Err(WayboundError::InvalidElementState {
+    node.checked
+        .ok_or_else(|| WayboundError::InvalidElementState {
             detail: format!(
                 "element {:?} (role {:?}) matched {query:?} but has no checked state",
                 node.name, node.role
             ),
-        });
-    };
-    Ok(current)
+        })
 }
 
 /// Idempotently drives a checkbox / radio / switch to `desired` (Playwright `setChecked`).
-///
-/// Reads the state first and returns without input when it already matches, so a disabled
-/// element that is already in the desired state is not an error. Otherwise the element must
-/// be enabled; it is clicked once and re-read until the state flips or
-/// [`CHECK_SETTLE_TIMEOUT`] elapses.
 fn set_checked_element(
     driver: &dyn Driver,
     state: &SessionState,
     query: &LocatorQuery,
     desired: bool,
 ) -> Result<waybound_core::AccessibilityNode> {
-    let node = locate_with_auto_wait(driver, query)?;
-    if checked_state(&node, query)? == desired {
-        return Ok(node);
-    }
-    if node.disabled {
-        return Err(WayboundError::ElementDisabled {
-            query: format!("refusing to toggle disabled element matched by {query:?}"),
-        });
-    }
+    set_checked_with_timing(driver, state, query, desired, CheckTiming::DEFAULT)
+}
 
-    click_element(driver, state, query)?;
-
-    let deadline = Instant::now() + CHECK_SETTLE_TIMEOUT;
-    loop {
-        let after = driver.locate(query)?;
-        let now = checked_state(&after, query)?;
-        if now == desired {
-            return Ok(after);
+/// Reads the state first and returns without input when it already matches, so a disabled
+/// element that is already in the desired state is not an error. A mixed checkbox reads as
+/// unchecked, so unchecking it is a no-op that leaves it mixed.
+///
+/// Otherwise waits (up to `timing.action_wait`) for the element to become enabled, clicks it
+/// once, and polls until the clicked node reports `desired`. While settling, a node that is
+/// briefly missing or has no readable state counts as "not settled yet", and the node is
+/// re-identified by stable id, then by role and position, then by the query, so a name that
+/// changes on toggle (`Off` -> `On`) or a shifting `nth` does not lose track of it.
+fn set_checked_with_timing(
+    driver: &dyn Driver,
+    state: &SessionState,
+    query: &LocatorQuery,
+    desired: bool,
+    timing: CheckTiming,
+) -> Result<waybound_core::AccessibilityNode> {
+    let deadline = Instant::now() + timing.action_wait;
+    let target = loop {
+        let node = match driver.locate(query) {
+            Ok(node) => node,
+            Err(WayboundError::ElementNotFound { .. }) if Instant::now() < deadline => {
+                thread::sleep(timing.poll);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if checked_state(&node, query)? == desired {
+            return Ok(node);
         }
-        if Instant::now() >= deadline {
+        if node.role == Role::Radio && !desired {
             return Err(WayboundError::InvalidElementState {
                 detail: format!(
-                    "clicking element matched by {query:?} did not set checked={desired} \
-                     (still checked={now} after {}ms)",
-                    CHECK_SETTLE_TIMEOUT.as_millis()
+                    "radio buttons cannot be unchecked (check another option instead): {query:?}"
                 ),
             });
         }
-        thread::sleep(ACTION_POLL_INTERVAL);
+        if !node.disabled {
+            break node;
+        }
+        if Instant::now() >= deadline {
+            return Err(WayboundError::ElementDisabled {
+                action: if desired { "check" } else { "uncheck" }.to_owned(),
+                query: format!("{query:?}"),
+            });
+        }
+        thread::sleep(timing.poll);
+    };
+
+    click_element(driver, state, query)?;
+
+    let stable_ids = driver.stable_node_ids();
+    let settle_deadline = Instant::now() + timing.settle;
+    let mut last_seen: Option<bool> = None;
+    loop {
+        if let Ok(nodes) = driver.snapshot_tree()
+            && let Some(after) = reidentify(&nodes, &target, query, stable_ids)
+        {
+            if after.checked == Some(desired) {
+                return Ok(after.clone());
+            }
+            last_seen = after.checked.or(last_seen);
+        }
+        if Instant::now() >= settle_deadline {
+            return Err(WayboundError::InvalidElementState {
+                detail: format!(
+                    "clicking element matched by {query:?} did not set checked={desired} \
+                     within {}ms (last seen checked={last_seen:?})",
+                    timing.settle.as_millis()
+                ),
+            });
+        }
+        thread::sleep(timing.poll);
     }
+}
+
+/// Finds `target` again in a fresh snapshot after it was clicked.
+///
+/// Prefers the backend id when the driver's ids are stable across snapshots, then a node with
+/// the same role whose bounds overlap the original ones, and finally the original query.
+fn reidentify<'a>(
+    nodes: &'a [waybound_core::AccessibilityNode],
+    target: &waybound_core::AccessibilityNode,
+    query: &LocatorQuery,
+    stable_ids: bool,
+) -> Option<&'a waybound_core::AccessibilityNode> {
+    if stable_ids && let Some(found) = nodes.iter().find(|n| n.id == target.id) {
+        return Some(found);
+    }
+    nodes
+        .iter()
+        .find(|n| n.role == target.role && bounds_overlap(&n.bounds, &target.bounds))
+        .or_else(|| query.resolve_one(nodes))
+}
+
+/// Returns `true` when either rectangle contains the other's center.
+fn bounds_overlap(a: &waybound_core::Bounds, b: &waybound_core::Bounds) -> bool {
+    a.contains_center(b) || b.contains_center(a)
 }
 
 #[cfg(unix)]
@@ -1041,7 +1120,7 @@ fn handle_io_streams<R: Read, W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use waybound_core::Role;
+    use waybound_core::{AccessibilityNode, Bounds, Role};
 
     use super::*;
     use crate::mock_driver::MockDriver;
@@ -1322,27 +1401,132 @@ mod tests {
         assert_eq!(mouse_clicks(&driver), 2);
     }
 
+    /// Short waits so failure paths stay fast in tests.
+    const FAST: CheckTiming = CheckTiming {
+        action_wait: Duration::from_millis(250),
+        settle: Duration::from_millis(150),
+        poll: Duration::from_millis(5),
+    };
+
+    fn fast_set(
+        driver: &MockDriver,
+        query: &LocatorQuery,
+        desired: bool,
+    ) -> Result<AccessibilityNode> {
+        set_checked_with_timing(driver, &state(), query, desired, FAST)
+    }
+
+    fn node(id: &str, role: Role, name: &str, checked: bool, y: f64) -> AccessibilityNode {
+        AccessibilityNode {
+            checked: Some(checked),
+            ..AccessibilityNode::new(
+                id.to_owned(),
+                role,
+                Some(name.to_owned()),
+                None,
+                Bounds {
+                    x: 10.0,
+                    y,
+                    width: 20.0,
+                    height: 20.0,
+                },
+            )
+        }
+    }
+
     #[test]
     fn set_checked_refuses_disabled_element_that_needs_a_click() {
         let driver = MockDriver::sample_page();
-        let st = state();
         let query = checkbox("Travel insurance");
 
         // Already checked: nothing to do, so the disabled state is not an error.
-        assert!(set_checked_element(&driver, &st, &query, true).is_ok());
+        assert!(fast_set(&driver, &query, true).is_ok());
 
-        let response = handle_request(
-            &driver,
-            &st,
-            Request::SetChecked {
-                query,
-                checked: false,
-            },
-        );
+        let refused = fast_set(&driver, &query, false);
         assert!(matches!(
-            response,
-            Response::Error { ref code, .. } if code == "element_disabled"
+            refused,
+            Err(WayboundError::ElementDisabled { ref action, .. }) if action == "uncheck"
         ));
+        if let Err(err) = &refused {
+            assert_eq!(
+                Response::from(err),
+                Response::Error {
+                    code: "element_disabled".to_owned(),
+                    message: format!("cannot uncheck: element is disabled (query: {query:?})"),
+                }
+            );
+        }
+        assert_eq!(mouse_clicks(&driver), 0);
+    }
+
+    #[test]
+    fn set_checked_waits_for_element_to_become_enabled() {
+        let driver = MockDriver::sample_page();
+        driver.enable_after("chk-insurance", 3);
+        let result = fast_set(&driver, &checkbox("Travel insurance"), false);
+        assert!(matches!(result, Ok(ref n) if n.checked == Some(false) && !n.disabled));
+        assert_eq!(mouse_clicks(&driver), 1);
+    }
+
+    #[test]
+    fn set_checked_tolerates_node_missing_right_after_click() {
+        let driver = MockDriver::sample_page();
+        driver.hide_after_click(2);
+        let result = fast_set(&driver, &checkbox("Nonstop"), true);
+        assert!(matches!(result, Ok(ref n) if n.checked == Some(true)));
+        assert_eq!(mouse_clicks(&driver), 1);
+    }
+
+    #[test]
+    fn set_checked_follows_node_whose_name_changes_on_toggle() {
+        for positional in [false, true] {
+            let driver = MockDriver::with_nodes(vec![
+                node("other", Role::Switch, "Wifi", false, 100.0),
+                node("sw", Role::Switch, "Off", false, 10.0),
+            ]);
+            driver.rename_on_toggle("sw", "Off", "On");
+            if positional {
+                driver.set_positional_ids();
+            }
+            let query = LocatorQuery {
+                exact: true,
+                ..LocatorQuery::by_role(Role::Switch, Some("Off".to_owned()))
+            };
+            let result = fast_set(&driver, &query, true);
+            assert!(
+                matches!(result, Ok(ref n) if n.id == "sw" && n.name.as_deref() == Some("On")),
+                "positional ids: {positional}"
+            );
+            assert_eq!(mouse_clicks(&driver), 1);
+        }
+    }
+
+    #[test]
+    fn set_checked_reports_click_that_does_not_change_state() {
+        let driver = MockDriver::sample_page();
+        driver.set_inert_clicks();
+        let result = fast_set(&driver, &checkbox("Nonstop"), true);
+        assert!(matches!(
+            result,
+            Err(WayboundError::InvalidElementState { ref detail })
+                if detail.contains("did not set checked=true")
+        ));
+        assert_eq!(mouse_clicks(&driver), 1);
+    }
+
+    #[test]
+    fn set_checked_refuses_to_uncheck_a_radio_without_clicking() {
+        let driver = MockDriver::with_nodes(vec![node("r", Role::Radio, "Economy", true, 10.0)]);
+        let query = LocatorQuery::by_role(Role::Radio, Some("Economy".to_owned()));
+        let result = fast_set(&driver, &query, false);
+        assert!(matches!(
+            result,
+            Err(WayboundError::InvalidElementState { ref detail })
+                if detail.contains("radio buttons cannot be unchecked")
+        ));
+        assert_eq!(mouse_clicks(&driver), 0);
+        // Checking an already-selected radio is still a no-op.
+        assert!(fast_set(&driver, &query, true).is_ok());
         assert_eq!(mouse_clicks(&driver), 0);
     }
 

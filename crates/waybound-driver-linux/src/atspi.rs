@@ -40,7 +40,7 @@ pub fn map_atspi_role(role: &str) -> Role {
         "landmark" | "region" => Role::Region,
         "grouping" | "panel" => Role::Group,
         "image" | "icon" => Role::Img,
-        "menu item" => Role::MenuItem,
+        "menu item" | "check menu item" | "radio menu item" => Role::MenuItem,
         "document web" | "document frame" => Role::Document,
         "heading" => Role::Heading,
         "static" | "label" | "paragraph" => Role::StaticText,
@@ -107,16 +107,36 @@ const fn is_control(role: Role) -> bool {
     )
 }
 
+/// Returns `true` for checkable menu item roles (`check menu item` / `radio menu item`).
+///
+/// Both map to [`Role::MenuItem`], which plain menu items share, so the raw role decides
+/// whether a state set without `CHECKABLE` still yields a checked state.
+#[must_use]
+pub fn is_checkable_atspi_role(role: &str) -> bool {
+    let normalized = role.trim().to_ascii_lowercase().replace(['-', '_'], " ");
+    matches!(normalized.as_str(), "check menu item" | "radio menu item")
+}
+
 /// Decodes an AT-SPI2 state set (the `au` array of 32-bit words from
 /// `org.a11y.atspi.Accessible.GetState`) for a node with the given `role`.
 ///
-/// `checked` is reported for nodes that are `CHECKABLE` or have a checkbox / radio / switch
-/// role; a mixed checkbox (`INDETERMINATE`) is `Some(false)`. `disabled` is only reported
-/// for controls, and only when both `ENABLED` and `SENSITIVE` are missing, so a node that
-/// merely omits one of them is never refused.
+/// Equivalent to [`decode_atspi_node_states`] with `checkable_role = false`.
 #[must_use]
 pub fn decode_atspi_states(words: &[u32], role: Role) -> AtspiStates {
-    let checkable = has_state(words, STATE_CHECKABLE)
+    decode_atspi_node_states(words, role, false)
+}
+
+/// Decodes an AT-SPI2 state set for a node with the given `role`.
+///
+/// `checked` is reported for nodes that are `CHECKABLE`, have a checkbox / radio / switch
+/// role, or whose raw role is checkable (`checkable_role`, see [`is_checkable_atspi_role`]);
+/// a mixed checkbox (`INDETERMINATE`) is `Some(false)`. `disabled` is only reported for
+/// controls, and only when both `ENABLED` and `SENSITIVE` are missing, so a node that merely
+/// omits one of them is never refused.
+#[must_use]
+pub fn decode_atspi_node_states(words: &[u32], role: Role, checkable_role: bool) -> AtspiStates {
+    let checkable = checkable_role
+        || has_state(words, STATE_CHECKABLE)
         || matches!(role, Role::CheckBox | Role::Radio | Role::Switch);
     let checked = checkable.then(|| {
         let on = has_state(words, STATE_CHECKED)
@@ -212,7 +232,7 @@ pub fn parse_atspi_snapshot_json(raw: &str) -> Result<AtspiSnapshot> {
                 focused: raw_node.focused,
                 ..AtspiStates::default()
             },
-            |words| decode_atspi_states(words, role),
+            |words| decode_atspi_node_states(words, role, is_checkable_atspi_role(&raw_node.role)),
         );
         nodes.push(AccessibilityNode {
             id: raw_node.id,
@@ -540,6 +560,8 @@ mod tests {
             ("dialog", Role::Dialog),
             ("alert", Role::Dialog),
             ("menu item", Role::MenuItem),
+            ("check menu item", Role::MenuItem),
+            ("radio menu item", Role::MenuItem),
             ("document web", Role::Document),
             ("document frame", Role::Document),
             ("heading", Role::Heading),
@@ -680,6 +702,17 @@ mod tests {
             Role::MenuItem,
         );
         assert_eq!(menu_checkbox.checked, Some(true));
+
+        // A check menu item without CHECKABLE still reports its state via its raw role;
+        // a plain menu item does not.
+        assert!(is_checkable_atspi_role("check menu item"));
+        assert!(is_checkable_atspi_role("Radio-Menu-Item"));
+        assert!(!is_checkable_atspi_role("menu item"));
+        let unchecked_menu =
+            decode_atspi_node_states(&words(&[STATE_ENABLED]), Role::MenuItem, true);
+        assert_eq!(unchecked_menu.checked, Some(false));
+        let plain_menu = decode_atspi_states(&words(&[STATE_ENABLED]), Role::MenuItem);
+        assert_eq!(plain_menu.checked, None);
 
         let pressed_toggle =
             decode_atspi_states(&words(&[STATE_ENABLED, STATE_PRESSED]), Role::Switch);

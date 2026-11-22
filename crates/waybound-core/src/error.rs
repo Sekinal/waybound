@@ -59,9 +59,11 @@ pub enum WayboundError {
         reason: String,
     },
 
-    /// The matched element is disabled, so the requested action was refused.
-    #[error("element is disabled: {query}")]
+    /// The matched element stayed disabled, so the requested action was refused.
+    #[error("cannot {action}: element is disabled (query: {query})")]
     ElementDisabled {
+        /// The refused action (for example `check`).
+        action: String,
         /// Human-readable representation of the locator query.
         query: String,
     },
