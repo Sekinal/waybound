@@ -136,7 +136,15 @@ pub fn snapshot_application_tree(pid: i32) -> Result<Vec<AccessibilityNode>> {
 
     let mut nodes = Vec::new();
     let mut visited = 0;
-    walk_node(&web_area, 0, &mut visited, &mut nodes);
+    // Created once per walk and shared by every probed node.
+    let expanded_key = cf_string("AXExpanded");
+    walk_node(
+        &web_area,
+        0,
+        &mut visited,
+        &mut nodes,
+        expanded_key.as_ref(),
+    );
     tracing::debug!(
         pid,
         visited,
@@ -256,7 +264,11 @@ fn enable_enhanced_ui(app: &OwnedCf) {
 }
 
 fn copy_attr(element: &OwnedCf, attr_name: &str) -> Option<OwnedCf> {
-    let key = cf_string(attr_name)?;
+    copy_attr_key(element, &cf_string(attr_name)?)
+}
+
+/// Like [`copy_attr`] with a pre-built attribute name `CFString`.
+fn copy_attr_key(element: &OwnedCf, key: &OwnedCf) -> Option<OwnedCf> {
     let mut out = ptr::null();
     // SAFETY: `element` and `key` are valid retained CoreFoundation references, and `out` receives a `+1` ref on success.
     unsafe {
@@ -431,11 +443,9 @@ fn read_bool_attr(element: &OwnedCf, attr_name: &str) -> Option<bool> {
     copy_attr(element, attr_name).and_then(|v| cf_to_bool(&v))
 }
 
-/// Returns `true` if `element` lists `attr_name` in `AXUIElementCopyAttributeNames`.
-fn advertises_attr(element: &OwnedCf, attr_name: &str) -> bool {
-    let Some(key) = cf_string(attr_name) else {
-        return false;
-    };
+/// Returns `true` if `element` lists the attribute named by `key` in
+/// `AXUIElementCopyAttributeNames`.
+fn advertises_attr(element: &OwnedCf, key: &OwnedCf) -> bool {
     let mut raw_names = ptr::null();
     // SAFETY: `element` is a valid retained `AXUIElementRef`; on success `raw_names` receives a
     // `+1` retained `CFArrayRef` whose ownership is transferred to `OwnedCf`.
@@ -464,12 +474,12 @@ fn advertises_attr(element: &OwnedCf, attr_name: &str) -> bool {
     }
 }
 
-fn read_expanded(element: &OwnedCf, role: Role) -> Option<bool> {
+fn read_expanded(element: &OwnedCf, role: Role, expanded_key: Option<&OwnedCf>) -> Option<bool> {
+    let key = expanded_key?;
+    let read = || copy_attr_key(element, key).and_then(|v| cf_to_bool(&v));
     match expand_probe(role) {
-        ExpandProbe::Always => read_bool_attr(element, "AXExpanded"),
-        ExpandProbe::IfAdvertised if advertises_attr(element, "AXExpanded") => {
-            read_bool_attr(element, "AXExpanded")
-        }
+        ExpandProbe::Always => read(),
+        ExpandProbe::IfAdvertised if advertises_attr(element, key) => read(),
         ExpandProbe::IfAdvertised | ExpandProbe::Never => None,
     }
 }
@@ -479,6 +489,7 @@ fn walk_node(
     depth: usize,
     visited: &mut usize,
     out: &mut Vec<AccessibilityNode>,
+    expanded_key: Option<&OwnedCf>,
 ) {
     if depth > MAX_DEPTH || out.len() >= MAX_NODES || *visited >= MAX_VISITED {
         return;
@@ -518,7 +529,7 @@ fn walk_node(
 
     if role != Role::Unknown || name.is_some() {
         let disabled = is_control(role) && read_bool_attr(element, "AXEnabled") == Some(false);
-        let expanded = read_expanded(element, role);
+        let expanded = read_expanded(element, role, expanded_key);
         let id = format!("ax-{}", out.len());
         out.push(AccessibilityNode {
             id,
@@ -565,7 +576,7 @@ fn walk_node(
         if out.len() >= MAX_NODES || *visited >= MAX_VISITED {
             break;
         }
-        walk_node(child, depth + 1, visited, out);
+        walk_node(child, depth + 1, visited, out, expanded_key);
     }
 }
 

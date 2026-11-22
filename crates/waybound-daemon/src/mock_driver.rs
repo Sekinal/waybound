@@ -45,6 +45,8 @@ struct MockState {
     toggle_names: Option<(String, String, String)>,
     /// Report node ids as positional (not stable) like the macOS / AT-SPI / Android drivers.
     positional_ids: bool,
+    /// Visible viewport; when set, `Scroll` events shift every node by the scroll delta.
+    viewport: Option<Bounds>,
 }
 
 const fn bounds(x: f64, y: f64, width: f64, height: f64) -> Bounds {
@@ -135,6 +137,12 @@ impl MockDriver {
         self.configure(|st| st.positional_ids = true);
     }
 
+    /// Simulates a scrollable page: reports `viewport` and moves nodes on `Scroll` events.
+    #[cfg(test)]
+    pub fn set_viewport(&self, viewport: Bounds) {
+        self.configure(|st| st.viewport = Some(viewport));
+    }
+
     /// Makes clicks change nothing (a control that ignores input).
     #[cfg(test)]
     pub fn set_inert_clicks(&self) {
@@ -208,8 +216,12 @@ impl Driver for MockDriver {
         BackendKind::MacOsNative
     }
 
-    fn stable_node_ids(&self) -> bool {
+    fn is_stable_node_id(&self, _id: &str) -> bool {
         self.state.lock().is_ok_and(|st| !st.positional_ids)
+    }
+
+    fn viewport_bounds(&self) -> Result<Option<Bounds>> {
+        Ok(self.state.lock().map_or(None, |st| st.viewport))
     }
 
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
@@ -252,6 +264,16 @@ impl Driver for MockDriver {
                 button: MouseButton::Left,
                 ..
             } => self.click(),
+            InputEvent::Scroll { delta_x, delta_y } => {
+                if let Ok(mut guard) = self.state.lock()
+                    && guard.viewport.is_some()
+                {
+                    for node in &mut guard.nodes {
+                        node.bounds.x += delta_x;
+                        node.bounds.y += delta_y;
+                    }
+                }
+            }
             _ => {}
         }
         if let Ok(mut guard) = self.events.lock() {

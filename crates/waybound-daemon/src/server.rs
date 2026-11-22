@@ -386,6 +386,16 @@ fn validate_bounds(b: waybound_core::Bounds, query: &LocatorQuery) -> Result<()>
 }
 
 fn hover_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery) -> Result<()> {
+    hover_element_node(driver, state, query).map(|_node| ())
+}
+
+/// Like [`hover_element`], but returns the node the pointer was moved onto, as re-located
+/// after any scroll-into-view (so its bounds are the ones on screen now).
+fn hover_element_node(
+    driver: &dyn Driver,
+    state: &SessionState,
+    query: &LocatorQuery,
+) -> Result<waybound_core::AccessibilityNode> {
     let mut node = locate_with_auto_wait(driver, query)?;
     validate_bounds(node.bounds, query)?;
 
@@ -427,11 +437,18 @@ fn hover_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery
         Point { x, y }
     };
 
-    move_pointer(driver, state, target, &mut rng)
+    move_pointer(driver, state, target, &mut rng)?;
+    Ok(node)
 }
 
 fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery) -> Result<()> {
     hover_element(driver, state, query)?;
+    press_left_at_pointer(driver, state)
+}
+
+/// Presses and releases the left button where the pointer is (with a human pause and hold
+/// when motion is enabled).
+fn press_left_at_pointer(driver: &dyn Driver, state: &SessionState) -> Result<()> {
     let hold_ms = if state.options.use_motion {
         let mut rng = SplitMix64::from_entropy();
         thread::sleep(hover_pause_before_click(&mut rng));
@@ -716,7 +733,7 @@ fn set_checked_with_timing(
     timing: CheckTiming,
 ) -> Result<waybound_core::AccessibilityNode> {
     let deadline = Instant::now() + timing.action_wait;
-    let target = loop {
+    loop {
         let node = match driver.locate(query) {
             Ok(node) => node,
             Err(WayboundError::ElementNotFound { .. }) if Instant::now() < deadline => {
@@ -728,33 +745,34 @@ fn set_checked_with_timing(
         if checked_state(&node, query)? == desired {
             return Ok(node);
         }
-        if node.role == Role::Radio && !desired {
-            return Err(WayboundError::InvalidElementState {
-                detail: format!(
-                    "radio buttons cannot be unchecked (check another option instead): {query:?}"
-                ),
-            });
-        }
+        refuse_radio_uncheck(&node, query, desired)?;
         if !node.disabled {
-            break node;
+            break;
         }
         if Instant::now() >= deadline {
-            return Err(WayboundError::ElementDisabled {
-                action: if desired { "check" } else { "uncheck" }.to_owned(),
-                query: format!("{query:?}"),
-            });
+            return Err(disabled_error(query, desired));
         }
         thread::sleep(timing.poll);
-    };
+    }
 
-    click_element(driver, state, query)?;
+    // Scroll into view and move onto the element, then validate exactly the node that will
+    // be clicked: its post-scroll bounds are what the settle poll re-identifies it by.
+    let target = hover_element_node(driver, state, query)?;
+    if checked_state(&target, query)? == desired {
+        return Ok(target);
+    }
+    refuse_radio_uncheck(&target, query, desired)?;
+    if target.disabled {
+        return Err(disabled_error(query, desired));
+    }
+    press_left_at_pointer(driver, state)?;
 
-    let stable_ids = driver.stable_node_ids();
+    let stable_id = driver.is_stable_node_id(&target.id);
     let settle_deadline = Instant::now() + timing.settle;
     let mut last_seen: Option<bool> = None;
     loop {
         if let Ok(nodes) = driver.snapshot_tree()
-            && let Some(after) = reidentify(&nodes, &target, query, stable_ids)
+            && let Some(after) = reidentify(&nodes, &target, query, stable_id)
         {
             if after.checked == Some(desired) {
                 return Ok(after.clone());
@@ -774,23 +792,64 @@ fn set_checked_with_timing(
     }
 }
 
-/// Finds `target` again in a fresh snapshot after it was clicked.
+fn refuse_radio_uncheck(
+    node: &waybound_core::AccessibilityNode,
+    query: &LocatorQuery,
+    desired: bool,
+) -> Result<()> {
+    if node.role == Role::Radio && !desired {
+        return Err(WayboundError::InvalidElementState {
+            detail: format!(
+                "radio buttons cannot be unchecked (check another option instead): {query:?}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn disabled_error(query: &LocatorQuery, desired: bool) -> WayboundError {
+    WayboundError::ElementDisabled {
+        action: if desired { "check" } else { "uncheck" }.to_owned(),
+        query: format!("{query:?}"),
+    }
+}
+
+/// Finds `target` (the node as it was clicked) again in a fresh snapshot.
 ///
-/// Prefers the backend id when the driver's ids are stable across snapshots, then a node with
-/// the same role whose bounds overlap the original ones, and finally the original query.
+/// Uses the backend id when `stable_id` says it identifies the element across snapshots.
+/// Otherwise picks, among nodes with the same role whose bounds overlap the target's, those
+/// the query still matches first and then the one with the closest bounds (so a wrapper and
+/// the native input it contains are told apart). Falls back to the query alone.
 fn reidentify<'a>(
     nodes: &'a [waybound_core::AccessibilityNode],
     target: &waybound_core::AccessibilityNode,
     query: &LocatorQuery,
-    stable_ids: bool,
+    stable_id: bool,
 ) -> Option<&'a waybound_core::AccessibilityNode> {
-    if stable_ids && let Some(found) = nodes.iter().find(|n| n.id == target.id) {
+    if stable_id && let Some(found) = nodes.iter().find(|n| n.id == target.id) {
         return Some(found);
     }
+    let query_matches = query.resolve_all(nodes);
+    let rank = |n: &waybound_core::AccessibilityNode| {
+        let off_query = !query_matches.iter().any(|m| std::ptr::eq(*m, n));
+        (off_query, bounds_distance(&n.bounds, &target.bounds))
+    };
     nodes
         .iter()
-        .find(|n| n.role == target.role && bounds_overlap(&n.bounds, &target.bounds))
+        .filter(|n| n.role == target.role && bounds_overlap(&n.bounds, &target.bounds))
+        .min_by(|a, b| {
+            rank(a)
+                .partial_cmp(&rank(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .or_else(|| query.resolve_one(nodes))
+}
+
+/// Manhattan distance between two rectangles' centers plus their size differences.
+fn bounds_distance(a: &waybound_core::Bounds, b: &waybound_core::Bounds) -> f64 {
+    let (ax, ay) = a.center();
+    let (bx, by) = b.center();
+    (ax - bx).abs() + (ay - by).abs() + (a.width - b.width).abs() + (a.height - b.height).abs()
 }
 
 /// Returns `true` when either rectangle contains the other's center.
@@ -1206,7 +1265,7 @@ mod tests {
             BackendKind::AndroidWaydroid
         }
 
-        fn snapshot_tree(&self) -> Result<Vec<waybound_core::AccessibilityNode>> {
+        fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call < self.failures {
                 return Err(WayboundError::Transient {
@@ -1253,7 +1312,7 @@ mod tests {
         fn backend_kind(&self) -> BackendKind {
             BackendKind::AndroidWaydroid
         }
-        fn snapshot_tree(&self) -> Result<Vec<waybound_core::AccessibilityNode>> {
+        fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
             let _ = self.0.fetch_add(1, Ordering::SeqCst);
             Err(WayboundError::BackendUnavailable {
                 backend: "android_waydroid".to_owned(),
@@ -1303,7 +1362,7 @@ mod tests {
             BackendKind::AndroidWaydroid
         }
 
-        fn snapshot_tree(&self) -> Result<Vec<waybound_core::AccessibilityNode>> {
+        fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
             self.0.snapshot_tree()
         }
 
@@ -1512,6 +1571,89 @@ mod tests {
                 if detail.contains("did not set checked=true")
         ));
         assert_eq!(mouse_clicks(&driver), 1);
+    }
+
+    /// A dense scrollable list of checkboxes 30px apart; only y in [0, 300) is visible.
+    /// Item 19 is already checked and lands on Item 13's old rectangle after the one scroll
+    /// needed to bring Item 13 into view, so verifying the stale rectangle would look like a
+    /// successful check.
+    fn dense_list_driver() -> MockDriver {
+        let driver = MockDriver::with_nodes(
+            (0u32..20)
+                .map(|i| {
+                    node(
+                        &format!("cb{i}"),
+                        Role::CheckBox,
+                        &format!("Item {i}"),
+                        i == 19,
+                        30.0f64.mul_add(f64::from(i), 10.0),
+                    )
+                })
+                .collect(),
+        );
+        driver.set_positional_ids();
+        driver.set_viewport(Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 400.0,
+            height: 300.0,
+        });
+        driver
+    }
+
+    #[test]
+    fn set_checked_verifies_the_node_it_scrolled_to_not_the_old_rectangle() {
+        let query = checkbox("Item 13");
+
+        let driver = dense_list_driver();
+        let result = fast_set(&driver, &query, true);
+        assert!(
+            matches!(result, Ok(ref n) if n.id == "cb13" && n.checked == Some(true)),
+            "{result:?}"
+        );
+        let after = driver.snapshot_tree().unwrap_or_default();
+        let item13 = after.iter().find(|n| n.id == "cb13");
+        assert!(item13.is_some_and(|n| n.checked == Some(true) && n.bounds.y < 300.0));
+        assert_eq!(mouse_clicks(&driver), 1);
+
+        // If the click does nothing, the checked Item 19 now under the old rectangle must
+        // not be mistaken for success.
+        let driver = dense_list_driver();
+        driver.set_inert_clicks();
+        let result = fast_set(&driver, &query, true);
+        assert!(
+            matches!(result, Err(WayboundError::InvalidElementState { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn reidentify_prefers_query_matches_then_closest_bounds() {
+        let rect = |x: f64, y: f64, w: f64, h: f64| Bounds {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        let mut native = node("n0", Role::CheckBox, "", false, 0.0);
+        native.name = None;
+        native.bounds = rect(95.0, 15.0, 10.0, 10.0);
+        let mut wrapper = node("n1", Role::CheckBox, "Accept terms", true, 0.0);
+        wrapper.bounds = rect(0.0, 0.0, 200.0, 40.0);
+        let nodes = vec![native.clone(), wrapper.clone()];
+
+        // The wrapper was clicked: both overlap, the query only matches the wrapper.
+        let query = LocatorQuery::by_role(Role::CheckBox, Some("Accept".to_owned()));
+        let found = reidentify(&nodes, &wrapper, &query, false);
+        assert_eq!(found.map(|n| n.id.as_str()), Some("n1"));
+
+        // A query matching neither (name changed on toggle): closest bounds win, so the
+        // native input is re-found even though the wrapper comes later in tree order.
+        let renamed = LocatorQuery::by_role(Role::CheckBox, Some("Gone".to_owned()));
+        let found = reidentify(&nodes, &native, &renamed, false);
+        assert_eq!(found.map(|n| n.id.as_str()), Some("n0"));
+        let found = reidentify(&nodes, &wrapper, &renamed, false);
+        assert_eq!(found.map(|n| n.id.as_str()), Some("n1"));
     }
 
     #[test]

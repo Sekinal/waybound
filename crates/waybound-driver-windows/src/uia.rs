@@ -3,6 +3,9 @@
 use serde::Deserialize;
 use waybound_core::{AccessibilityNode, Bounds, Result, Role, WayboundError};
 
+/// Prefix of the positional ids used when an element has no UIA runtime id.
+pub const POSITIONAL_ID_PREFIX: &str = "uia-pos-";
+
 /// Maximum number of accessibility nodes accepted from a single UIA tree snapshot.
 pub const MAX_NODES: usize = 4_000;
 
@@ -224,7 +227,8 @@ pub fn parse_uia_snapshot_json(raw: &str) -> Result<UiaSnapshot> {
             inferred_viewport = Some(bounds);
         }
 
-        let id = normalize_non_empty(raw_node.id).unwrap_or_else(|| format!("uia-{idx}"));
+        let id = normalize_non_empty(raw_node.id)
+            .unwrap_or_else(|| format!("{POSITIONAL_ID_PREFIX}{idx}"));
 
         nodes.push(AccessibilityNode {
             id,
@@ -409,7 +413,7 @@ while ($queue.Count -gt 0 -and $nodes.Count -lt $maxNodes) {
         }
 
         $rid = $el.GetRuntimeId()
-        $idStr = if ($null -ne $rid) { ($rid -join '-') } else { "uia-$($nodes.Count)" }
+        $idStr = if ($null -ne $rid) { ($rid -join '-') } else { "uia-pos-$($nodes.Count)" }
 
         if ($null -eq $currentUrl -and $ct -eq 'ControlType.Edit' -and $val) {
             if (($name -and $name -match 'Address|URL') -or $val -match '^https?://') {
@@ -643,7 +647,7 @@ mod tests {
         assert_eq!(first.map(|n| n.focused), Some(true));
 
         let second = snapshot.nodes.get(1);
-        assert_eq!(second.map(|n| n.id.as_str()), Some("uia-1"));
+        assert_eq!(second.map(|n| n.id.as_str()), Some("uia-pos-1"));
         assert_eq!(second.map(|n| n.role), Some(Role::TextBox));
         assert_eq!(second.and_then(|n| n.value.as_deref()), Some("rust"));
         Ok(())

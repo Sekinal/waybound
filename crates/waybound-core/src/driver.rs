@@ -107,9 +107,10 @@ pub trait Driver: Send + Sync {
         self.locate(query)
     }
 
-    /// Returns `true` when [`AccessibilityNode::id`] values identify the same UI element across
-    /// snapshots (for example UIA runtime ids), rather than being positional indices.
-    fn stable_node_ids(&self) -> bool {
+    /// Returns `true` when the node id `id` identifies the same UI element across snapshots
+    /// (for example a UIA runtime id), rather than being a positional index.
+    fn is_stable_node_id(&self, id: &str) -> bool {
+        let _ = id;
         false
     }
 
