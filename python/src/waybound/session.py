@@ -35,6 +35,7 @@ class LaunchOptions:
     proxy: str | None = None
     timezone: str | None = None
     locale: str | None = None
+    focus: bool = False
     no_motion: bool = False
     daemon_binary: Path | str | None = None
     startup_timeout_s: float = 5.0
@@ -128,6 +129,8 @@ class Session:
             cmd.extend(["--timezone", opts.timezone])
         if opts.locale is not None:
             cmd.extend(["--locale", opts.locale])
+        if opts.focus:
+            cmd.append("--focus")
         if opts.no_motion:
             cmd.append("--no-motion")
 

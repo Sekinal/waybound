@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -63,6 +64,19 @@ class Page:
     def url(self) -> str | None:
         """Return the active tab URL from the browser's web area, if available."""
         return self._transport.current_url()
+
+    def wait_for_url(self, url_contains: str, *, timeout_ms: int = 10_000) -> str:
+        """Poll until the active tab URL contains `url_contains` or `timeout_ms` elapses."""
+        needle = url_contains.lower()
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+        while True:
+            current = self._transport.current_url()
+            if current is not None and needle in current.lower():
+                return current
+            if time.monotonic() >= deadline:
+                msg = f"timed out after {timeout_ms}ms waiting for URL containing {url_contains!r}"
+                raise TimeoutError(msg)
+            time.sleep(0.075)
 
     def goto(self, url: str) -> None:
         """Navigate the active browser tab to `url` via native OS shortcut."""

@@ -37,6 +37,7 @@ struct CliArgs {
     proxy: Option<String>,
     timezone: Option<String>,
     locale: Option<String>,
+    focus: bool,
     no_motion: bool,
 }
 
@@ -51,6 +52,7 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut proxy = env::var("WAYBOUND_PROXY").ok();
     let mut timezone = None;
     let mut locale = None;
+    let mut focus = false;
     let mut no_motion = false;
 
     let mut args = env::args().skip(1);
@@ -117,6 +119,7 @@ fn parse_args() -> Result<CliArgs, String> {
                     .ok_or_else(|| "--locale requires a locale (e.g., en_US.UTF-8)".to_owned())?;
                 locale = Some(val);
             }
+            "--focus" => focus = true,
             "--no-motion" => no_motion = true,
             unknown => return Err(format!("unknown argument: {unknown}")),
         }
@@ -133,6 +136,7 @@ fn parse_args() -> Result<CliArgs, String> {
         proxy,
         timezone,
         locale,
+        focus,
         no_motion,
     })
 }
@@ -220,6 +224,7 @@ fn main() -> ExitCode {
                     proxy_server: chrome_proxy_server,
                     timezone: cli.timezone,
                     locale: cli.locale,
+                    focus: cli.focus,
                 };
                 match launch_chrome(&opts) {
                     Ok(chrome) => {

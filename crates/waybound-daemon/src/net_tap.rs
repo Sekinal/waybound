@@ -1,22 +1,25 @@
 //! Passive wire-level TLS/HTTP response tap powered by `SSLKEYLOGFILE` + `tshark`.
 //!
 //! Decrypts HTTP/1.1, HTTP/2, and HTTP/3 responses off the wire without MITM
-//! certificates, proxies, or CDP.
+//! certificates, proxies, or CDP, automatically decompressing `gzip`, `deflate`,
+//! and `br` (Brotli) payloads.
 
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use flate2::read::{GzDecoder, ZlibDecoder};
 use waybound_core::{CapturedResponse, Result, WayboundError};
 
 const MAX_CAPTURED_RESPONSES: usize = 500;
 const MAX_PENDING_STREAMS: usize = 1_000;
 const MAX_BODY_BYTES: usize = 512 * 1024;
+const MAX_DECOMPRESSED_BYTES: u64 = 4 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_WAIT_MS: u64 = 120_000;
 
@@ -118,6 +121,7 @@ struct PendingStream {
     url: Option<String>,
     status: Option<u16>,
     content_type: Option<String>,
+    content_encoding: Option<String>,
     body: Vec<u8>,
     emitted: bool,
 }
@@ -162,14 +166,13 @@ impl StreamCorrelator {
         } else {
             None
         };
-
-        let key = if !h2_stream.is_empty() && !tcp_stream.is_empty() {
-            format!("h2:{tcp_stream}:{h2_stream}")
-        } else if !h3_stream.is_empty() && !udp_stream.is_empty() {
-            format!("h3:{udp_stream}:{h3_stream}")
-        } else if !tcp_stream.is_empty() {
-            format!("h1:{tcp_stream}")
+        let content_encoding = if cols.len() >= 21 {
+            first_non_empty(&[cols[18], cols[19], cols[20]])
         } else {
+            None
+        };
+
+        let Some(key) = build_stream_key(tcp_stream, udp_stream, h2_stream, h3_stream) else {
             return;
         };
 
@@ -196,6 +199,7 @@ impl StreamCorrelator {
                 entry.url = Some(h1_uri.to_owned());
                 entry.status = None;
                 entry.content_type = None;
+                entry.content_encoding = None;
                 entry.body.clear();
                 entry.emitted = false;
             }
@@ -220,6 +224,9 @@ impl StreamCorrelator {
         if let Some(ct) = content_type {
             entry.content_type = Some(ct.to_owned());
         }
+        if let Some(ce) = content_encoding {
+            entry.content_encoding = Some(ce.to_owned());
+        }
 
         // Only collect payload bytes after response status headers are observed so POST/PUT
         // request bodies are never mixed into response bodies.
@@ -237,11 +244,7 @@ impl StreamCorrelator {
         if let (Some(url), Some(status)) = (&entry.url, entry.status)
             && (!entry.emitted || body_updated)
         {
-            let body = if entry.body.is_empty() {
-                None
-            } else {
-                String::from_utf8(entry.body.clone()).ok()
-            };
+            let body = decode_body_bytes(&entry.body, entry.content_encoding.as_deref());
             store.upsert(
                 entry.seq,
                 CapturedResponse {
@@ -253,6 +256,66 @@ impl StreamCorrelator {
             );
             entry.emitted = true;
         }
+    }
+}
+
+/// Decodes raw HTTP response bytes into UTF-8 text, transparently decompressing
+/// `gzip`, `deflate`, or `br` (Brotli) up to [`MAX_DECOMPRESSED_BYTES`].
+fn decode_body_bytes(raw: &[u8], encoding: Option<&str>) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+
+    let enc = encoding.map(str::to_ascii_lowercase);
+    let decompressed: Vec<u8> = match enc.as_deref().map(str::trim) {
+        Some("gzip" | "x-gzip") => {
+            let mut out = Vec::new();
+            let mut decoder = GzDecoder::new(raw).take(MAX_DECOMPRESSED_BYTES);
+            if decoder.read_to_end(&mut out).is_ok() && !out.is_empty() {
+                out
+            } else {
+                // Wireshark may have already decompressed `http.file_data`.
+                raw.to_vec()
+            }
+        }
+        Some("deflate") => {
+            let mut out = Vec::new();
+            let mut decoder = ZlibDecoder::new(raw).take(MAX_DECOMPRESSED_BYTES);
+            if decoder.read_to_end(&mut out).is_ok() && !out.is_empty() {
+                out
+            } else {
+                raw.to_vec()
+            }
+        }
+        Some("br") => {
+            let mut out = Vec::new();
+            let mut decoder = brotli::Decompressor::new(raw, 4096).take(MAX_DECOMPRESSED_BYTES);
+            if decoder.read_to_end(&mut out).is_ok() && !out.is_empty() {
+                out
+            } else {
+                raw.to_vec()
+            }
+        }
+        _ => raw.to_vec(),
+    };
+
+    String::from_utf8(decompressed).ok()
+}
+
+fn build_stream_key(
+    tcp_stream: &str,
+    udp_stream: &str,
+    h2_stream: &str,
+    h3_stream: &str,
+) -> Option<String> {
+    if !h2_stream.is_empty() && !tcp_stream.is_empty() {
+        Some(format!("h2:{tcp_stream}:{h2_stream}"))
+    } else if !h3_stream.is_empty() && !udp_stream.is_empty() {
+        Some(format!("h3:{udp_stream}:{h3_stream}"))
+    } else if !tcp_stream.is_empty() {
+        Some(format!("h1:{tcp_stream}"))
+    } else {
+        None
     }
 }
 
@@ -393,6 +456,12 @@ pub fn start_passive_tap(ssl_keylog: &Path, store: Arc<ResponseStore>) -> Result
             "http2.data.data",
             "-e",
             "http3.data",
+            "-e",
+            "http.content_encoding",
+            "-e",
+            "http2.headers.content_encoding",
+            "-e",
+            "http3.headers.content_encoding",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -428,6 +497,11 @@ pub fn start_passive_tap(ssl_keylog: &Path, store: Arc<ResponseStore>) -> Result
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
     use super::*;
 
     #[test]
@@ -435,20 +509,17 @@ mod tests {
         let store = ResponseStore::default();
         let mut correlator = StreamCorrelator::default();
 
-        // Stream 1: POST request with body 'REQ' (524551) before response headers
         correlator.ingest_line(
             "3\t\t1\t\t\t\t\t\tapi.example.com\t/v1/fares\t\t\t\t\t\t\t524551\t",
             &store,
         );
         assert!(store.list(None).is_empty());
 
-        // Stream 1 response: 200 + '{"ok":true}'
         correlator.ingest_line(
             "3\t\t1\t\t\t200\t\t\t\t\t\t\t\tapplication/json\t\t\t7b226f6b223a747275657d\t",
             &store,
         );
 
-        // Stream 2 (different streamid=3) to the exact same URL + status 200
         correlator.ingest_line(
             "3\t\t3\t\t\t\t\t\tapi.example.com\t/v1/fares\t\t\t\t\t\t\t\t",
             &store,
@@ -469,7 +540,6 @@ mod tests {
         let store = ResponseStore::default();
         let mut correlator = StreamCorrelator::default();
 
-        // Request 1 + Response 1 on tcp.stream=7
         correlator.ingest_line(
             "7\t\t\t\t\t\t\thttps://a.test/1\t\t\t\t\t\t\t\t\t\t",
             &store,
@@ -479,7 +549,6 @@ mod tests {
             &store,
         );
 
-        // Request 2 on same keep-alive tcp.stream=7 with request body 'bad'
         correlator.ingest_line(
             "7\t\t\t\t\t\t\thttps://a.test/2\t\t\t\t\t\t\t\t626164\t\t",
             &store,
@@ -496,5 +565,28 @@ mod tests {
         assert_eq!(captured[1].url, "https://a.test/2");
         assert_eq!(captured[1].status, 201);
         assert_eq!(captured[1].body.as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn decodes_gzip_and_brotli_bodies() {
+        let payload = br#"{"flights":[{"price":419}]}"#;
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        assert!(gz.write_all(payload).is_ok());
+        let gz_bytes = gz.finish().unwrap_or_default();
+        assert_eq!(
+            decode_body_bytes(&gz_bytes, Some("gzip")).as_deref(),
+            Some(r#"{"flights":[{"price":419}]}"#)
+        );
+
+        let mut br_bytes = Vec::new();
+        {
+            let mut writer = brotli::CompressorWriter::new(&mut br_bytes, 4096, 4, 22);
+            assert!(writer.write_all(payload).is_ok());
+        }
+        assert_eq!(
+            decode_body_bytes(&br_bytes, Some("br")).as_deref(),
+            Some(r#"{"flights":[{"price":419}]}"#)
+        );
     }
 }

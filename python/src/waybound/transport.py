@@ -151,16 +151,21 @@ class UnixSocketTransport:
         return [_parse_http_response(item) for item in raw_items if isinstance(item, dict)]
 
     def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
-        """Wait until a passively captured HTTP response matches `url_contains`."""
+        """Wait until a passively captured HTTP response matches `url_contains`.
+
+        Uses a dedicated short-lived Unix socket connection so concurrent `asyncio.gather`
+        calls (e.g., `wait_for_response` + `click`) run in true parallel without blocking.
+        """
         clamped_ms = max(0, timeout_ms)
-        response = self._request(
-            {
-                "method": "wait_for_response",
-                "url_contains": url_contains,
-                "timeout_ms": clamped_ms,
-            },
-            timeout_override_s=max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0),
-        )
+        dedicated_timeout = max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0)
+        with UnixSocketTransport(self._socket_path, timeout_s=dedicated_timeout) as dedicated:
+            response = dedicated._request(
+                {
+                    "method": "wait_for_response",
+                    "url_contains": url_contains,
+                    "timeout_ms": clamped_ms,
+                }
+            )
         raw_resp = response.get("response")
         if not isinstance(raw_resp, dict):
             msg = f"unexpected wait_for_response payload: {response!r}"

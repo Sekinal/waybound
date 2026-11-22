@@ -1,9 +1,11 @@
-//! Embedded localhost HTTP/CONNECT proxy forwarder for authenticated upstream proxies.
+//! Embedded localhost HTTP/CONNECT proxy forwarder supporting both authenticated
+//! HTTP (`http://user:pass@host:port`) and SOCKS5 (`socks5://user:pass@host:port`)
+//! upstream proxies.
 //!
 //! Chrome's `--proxy-server` flag does not support inline `user:pass` credentials.
 //! This module binds a loopback-only unauthenticated listener (`127.0.0.1:0`) and
-//! injects `Proxy-Authorization: Basic ...` when forwarding to an authenticated
-//! upstream HTTP proxy — without extensions, auth prompts, or TLS MITM.
+//! handles upstream authentication transparently — without extensions, auth prompts,
+//! or TLS MITM.
 
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -33,33 +35,51 @@ impl Drop for TunnelGuard {
     }
 }
 
-/// Parsed upstream HTTP proxy endpoint.
+/// Supported upstream proxy protocols.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyProtocol {
+    /// Upstream HTTP/CONNECT proxy.
+    Http,
+    /// Upstream RFC 1928/1929 SOCKS5 proxy with remote DNS resolution.
+    Socks5,
+}
+
+/// Parsed upstream proxy endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamProxy {
+    /// Upstream protocol (`http` or `socks5`).
+    pub protocol: ProxyProtocol,
     /// Upstream proxy `host:port`.
     pub host_port: String,
-    /// Optional `Basic <base64>` `Proxy-Authorization` header value.
+    /// Optional decoded `(username, password)` credentials.
+    pub credentials: Option<(Vec<u8>, Vec<u8>)>,
+    /// Optional `Basic <base64>` `Proxy-Authorization` header value (for HTTP upstream).
     pub auth_header: Option<String>,
 }
 
 impl UpstreamProxy {
-    /// Parses `http://[user:pass@]host:port` (or `host:port`) into an [`UpstreamProxy`].
+    /// Parses `http://[user:pass@]host:port` or `socks5[h]://[user:pass@]host:port`.
     ///
-    /// Credentials are percent-decoded before Base64 encoding and redacted from any error messages.
+    /// Credentials are percent-decoded and redacted from any error messages.
     ///
     /// # Errors
     ///
     /// Returns an error if the URL scheme is unsupported or `host:port` is missing/invalid.
     pub fn parse(raw: &str) -> std::result::Result<Self, String> {
         let trimmed = raw.trim();
-        let rest = if let Some(stripped) = trimmed.strip_prefix("http://") {
-            stripped
+        let (protocol, rest) = if let Some(stripped) = trimmed.strip_prefix("http://") {
+            (ProxyProtocol::Http, stripped)
+        } else if let Some(stripped) = trimmed
+            .strip_prefix("socks5://")
+            .or_else(|| trimmed.strip_prefix("socks5h://"))
+        {
+            (ProxyProtocol::Socks5, stripped)
         } else if let Some((scheme, _)) = trimmed.split_once("://") {
             return Err(format!(
-                "unsupported proxy scheme {scheme:?} (local forwarder supports http://)"
+                "unsupported proxy scheme {scheme:?} (expected http:// or socks5://)"
             ));
         } else {
-            trimmed
+            (ProxyProtocol::Http, trimmed)
         };
 
         let authority = rest.split('/').next().unwrap_or(rest);
@@ -75,13 +95,20 @@ impl UpstreamProxy {
             return Err(format!("invalid proxy host:port {host_port:?}"));
         }
 
-        let auth_header = creds.map(|c| {
-            let decoded = percent_decode(c);
-            format!("Basic {}", base64_encode(&decoded))
+        let (credentials, auth_header) = creds.map_or((None, None), |c| {
+            let decoded_full = percent_decode(c);
+            let header = format!("Basic {}", base64_encode(&decoded_full));
+            let pair = c.split_once(':').map_or_else(
+                || (decoded_full, Vec::new()),
+                |(u, p)| (percent_decode(u), percent_decode(p)),
+            );
+            (Some(pair), Some(header))
         });
 
         Ok(Self {
+            protocol,
             host_port: host_port.to_owned(),
+            credentials,
             auth_header,
         })
     }
@@ -153,8 +180,9 @@ impl ProxyForwarder {
 
         tracing::info!(
             listen = %local_addr,
+            protocol = ?upstream_arc.protocol,
             upstream = %upstream_arc.host_port,
-            authenticated = upstream_arc.auth_header.is_some(),
+            authenticated = upstream_arc.credentials.is_some(),
             "started local proxy auth forwarder"
         );
 
@@ -193,7 +221,7 @@ fn connect_upstream(host_port: &str) -> io::Result<TcpStream> {
     }))
 }
 
-fn handle_client(client: TcpStream, upstream: &UpstreamProxy) -> io::Result<()> {
+fn handle_client(mut client: TcpStream, upstream: &UpstreamProxy) -> io::Result<()> {
     client.set_nonblocking(false)?;
     client.set_read_timeout(Some(HEADER_IO_TIMEOUT))?;
     client.set_write_timeout(Some(HEADER_IO_TIMEOUT))?;
@@ -228,13 +256,66 @@ fn handle_client(client: TcpStream, upstream: &UpstreamProxy) -> io::Result<()> 
         return Ok(());
     }
 
-    let is_connect = header_lines[0].to_ascii_uppercase().starts_with("CONNECT ");
-
     let mut upstream_stream = connect_upstream(&upstream.host_port)?;
     upstream_stream.set_read_timeout(Some(HEADER_IO_TIMEOUT))?;
     upstream_stream.set_write_timeout(Some(HEADER_IO_TIMEOUT))?;
 
-    // Buffer the entire outbound header block into a single write to avoid TCP fragmentation.
+    match upstream.protocol {
+        ProxyProtocol::Http => {
+            forward_http_upstream(&mut upstream_stream, &header_lines, total_bytes, upstream)?;
+            let buffered = client_reader.buffer();
+            if !buffered.is_empty() {
+                upstream_stream.write_all(buffered)?;
+                upstream_stream.flush()?;
+            }
+        }
+        ProxyProtocol::Socks5 => {
+            let (target_host, target_port, is_connect) = parse_request_target(&header_lines[0])?;
+            socks5_handshake(&mut upstream_stream, upstream, &target_host, target_port)?;
+            if is_connect {
+                client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+                client.flush()?;
+            } else {
+                forward_plain_http_over_socks(&mut upstream_stream, &header_lines, total_bytes)?;
+            }
+            let buffered = client_reader.buffer();
+            if !buffered.is_empty() {
+                upstream_stream.write_all(buffered)?;
+                upstream_stream.flush()?;
+            }
+        }
+    }
+
+    client.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    client.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    upstream_stream.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+    upstream_stream.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+
+    let mut client_to_up_src = client_reader.into_inner();
+    let mut client_to_up_dst = upstream_stream.try_clone()?;
+    let mut up_to_client_src = upstream_stream;
+    let mut up_to_client_dst = client;
+
+    let forward_thread = thread::Builder::new()
+        .name("waybound-proxy-pipe".to_owned())
+        .spawn(move || {
+            let _ = copy_stream(&mut client_to_up_src, &mut client_to_up_dst);
+            let _ = client_to_up_dst.shutdown(std::net::Shutdown::Write);
+        })?;
+
+    let _ = copy_stream(&mut up_to_client_src, &mut up_to_client_dst);
+    let _ = up_to_client_dst.shutdown(std::net::Shutdown::Write);
+    let _ = forward_thread.join();
+    Ok(())
+}
+
+fn forward_http_upstream(
+    upstream_stream: &mut TcpStream,
+    header_lines: &[String],
+    total_bytes: usize,
+    upstream: &UpstreamProxy,
+) -> io::Result<()> {
+    let is_connect = header_lines[0].to_ascii_uppercase().starts_with("CONNECT ");
     let mut outbound = Vec::with_capacity(total_bytes + 160);
     for (idx, line) in header_lines.iter().enumerate() {
         if idx > 0 {
@@ -257,35 +338,176 @@ fn handle_client(client: TcpStream, upstream: &UpstreamProxy) -> io::Result<()> 
         outbound.extend_from_slice(b"Connection: close\r\nProxy-Connection: close\r\n");
     }
     outbound.extend_from_slice(b"\r\n");
-
-    let buffered = client_reader.buffer();
-    if !buffered.is_empty() {
-        outbound.extend_from_slice(buffered);
-    }
     upstream_stream.write_all(&outbound)?;
-    upstream_stream.flush()?;
+    upstream_stream.flush()
+}
 
-    // Switch to longer idle timeout for established tunnels.
-    client.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
-    client.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
-    upstream_stream.set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
-    upstream_stream.set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))?;
+fn forward_plain_http_over_socks(
+    upstream_stream: &mut TcpStream,
+    header_lines: &[String],
+    total_bytes: usize,
+) -> io::Result<()> {
+    let mut outbound = Vec::with_capacity(total_bytes + 64);
+    for (idx, line) in header_lines.iter().enumerate() {
+        if idx > 0 {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("proxy-") || lower.starts_with("connection:") {
+                continue;
+            }
+        }
+        outbound.extend_from_slice(line.as_bytes());
+    }
+    outbound.extend_from_slice(b"Connection: close\r\n\r\n");
+    upstream_stream.write_all(&outbound)?;
+    upstream_stream.flush()
+}
 
-    let mut client_to_up_src = client_reader.into_inner();
-    let mut client_to_up_dst = upstream_stream.try_clone()?;
-    let mut up_to_client_src = upstream_stream;
-    let mut up_to_client_dst = client;
+fn parse_request_target(request_line: &str) -> io::Result<(String, u16, bool)> {
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    let is_connect = method.eq_ignore_ascii_case("CONNECT");
 
-    let forward_thread = thread::Builder::new()
-        .name("waybound-proxy-pipe".to_owned())
-        .spawn(move || {
-            let _ = copy_stream(&mut client_to_up_src, &mut client_to_up_dst);
-            let _ = client_to_up_dst.shutdown(std::net::Shutdown::Write);
-        })?;
+    if is_connect {
+        let Some((host, port_str)) = target.rsplit_once(':') else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "CONNECT target missing host:port",
+            ));
+        };
+        let port = port_str
+            .parse::<u16>()
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid CONNECT port"))?;
+        return Ok((host.to_owned(), port, true));
+    }
 
-    let _ = copy_stream(&mut up_to_client_src, &mut up_to_client_dst);
-    let _ = up_to_client_dst.shutdown(std::net::Shutdown::Write);
-    let _ = forward_thread.join();
+    let stripped = target
+        .strip_prefix("http://")
+        .or_else(|| target.strip_prefix("https://"))
+        .unwrap_or(target);
+    let authority = stripped.split('/').next().unwrap_or("");
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (
+            h.to_owned(),
+            p.parse::<u16>()
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid HTTP port"))?,
+        ),
+        None => (authority.to_owned(), 80),
+    };
+    if host.is_empty() {
+        return Err(io::Error::new(ErrorKind::InvalidInput, "empty target host"));
+    }
+    Ok((host, port, false))
+}
+
+/// Performs RFC 1928 + RFC 1929 SOCKS5 handshake with remote domain resolution (`ATYP=0x03`).
+fn socks5_handshake(
+    stream: &mut TcpStream,
+    upstream: &UpstreamProxy,
+    target_host: &str,
+    target_port: u16,
+) -> io::Result<()> {
+    let want_auth = upstream.credentials.is_some();
+    if want_auth {
+        stream.write_all(&[0x05, 0x02, 0x00, 0x02])?;
+    } else {
+        stream.write_all(&[0x05, 0x01, 0x00])?;
+    }
+    stream.flush()?;
+
+    let mut method_resp = [0u8; 2];
+    stream.read_exact(&mut method_resp)?;
+    if method_resp[0] != 0x05 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid SOCKS5 server version",
+        ));
+    }
+
+    match method_resp[1] {
+        0x00 => {}
+        0x02 => {
+            let Some((user, pass)) = &upstream.credentials else {
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "SOCKS5 server requires auth but no credentials provided",
+                ));
+            };
+            let ulen = u8::try_from(user.len()).map_err(|_| {
+                io::Error::new(ErrorKind::InvalidInput, "SOCKS5 username exceeds 255 bytes")
+            })?;
+            let plen = u8::try_from(pass.len()).map_err(|_| {
+                io::Error::new(ErrorKind::InvalidInput, "SOCKS5 password exceeds 255 bytes")
+            })?;
+            let mut auth_req = Vec::with_capacity(3 + user.len() + pass.len());
+            auth_req.push(0x01);
+            auth_req.push(ulen);
+            auth_req.extend_from_slice(user);
+            auth_req.push(plen);
+            auth_req.extend_from_slice(pass);
+            stream.write_all(&auth_req)?;
+            stream.flush()?;
+
+            let mut auth_resp = [0u8; 2];
+            stream.read_exact(&mut auth_resp)?;
+            if auth_resp[1] != 0x00 {
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "SOCKS5 username/password authentication rejected",
+                ));
+            }
+        }
+        _ => {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "SOCKS5 server rejected all offered auth methods",
+            ));
+        }
+    }
+
+    let host_bytes = target_host.as_bytes();
+    let hlen = u8::try_from(host_bytes.len())
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "target domain exceeds 255 bytes"))?;
+    let mut connect_req = Vec::with_capacity(7 + host_bytes.len());
+    connect_req.extend_from_slice(&[0x05, 0x01, 0x00, 0x03, hlen]);
+    connect_req.extend_from_slice(host_bytes);
+    connect_req.extend_from_slice(&target_port.to_be_bytes());
+    stream.write_all(&connect_req)?;
+    stream.flush()?;
+
+    let mut hdr = [0u8; 4];
+    stream.read_exact(&mut hdr)?;
+    if hdr[0] != 0x05 || hdr[1] != 0x00 {
+        return Err(io::Error::new(
+            ErrorKind::ConnectionRefused,
+            format!("SOCKS5 CONNECT failed with reply code {}", hdr[1]),
+        ));
+    }
+
+    // Drain BND.ADDR + BND.PORT according to ATYP.
+    match hdr[3] {
+        0x01 => {
+            let mut skip = [0u8; 6];
+            stream.read_exact(&mut skip)?;
+        }
+        0x03 => {
+            let mut len_buf = [0u8; 1];
+            stream.read_exact(&mut len_buf)?;
+            let mut skip = vec![0u8; usize::from(len_buf[0]) + 2];
+            stream.read_exact(&mut skip)?;
+        }
+        0x04 => {
+            let mut skip = [0u8; 18];
+            stream.read_exact(&mut skip)?;
+        }
+        _ => {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid SOCKS5 reply address type",
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -358,16 +580,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_authenticated_percent_encoded_and_rejects_bad_urls() {
+    fn parses_http_and_socks5_and_redacts_bad_schemes() {
         let auth = UpstreamProxy::parse("http://alice:p%40ss@proxy.example.com:8080");
         assert!(auth.is_ok());
         if let Ok(p) = auth {
+            assert_eq!(p.protocol, ProxyProtocol::Http);
             assert_eq!(p.host_port, "proxy.example.com:8080");
-            // "alice:p@ss" -> YWxpY2U6cEBzcw==
             assert_eq!(p.auth_header.as_deref(), Some("Basic YWxpY2U6cEBzcw=="));
         }
 
-        let err = UpstreamProxy::parse("socks5://secretuser:secretpass@127.0.0.1:1080");
+        let socks = UpstreamProxy::parse("socks5://bob:s3cr3t@127.0.0.1:1080");
+        assert!(socks.is_ok());
+        if let Ok(p) = socks {
+            assert_eq!(p.protocol, ProxyProtocol::Socks5);
+            assert_eq!(p.credentials, Some((b"bob".to_vec(), b"s3cr3t".to_vec())));
+        }
+
+        let err = UpstreamProxy::parse("ftp://secretuser:secretpass@127.0.0.1:21");
         assert!(err.is_err());
         if let Err(msg) = err {
             assert!(!msg.contains("secretpass"));
@@ -418,5 +647,63 @@ mod tests {
 
         let received = server_thread.join().unwrap_or_default();
         assert!(received.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+    }
+
+    #[test]
+    fn forwarder_bridges_http_connect_to_authenticated_socks5() {
+        let Ok(socks_listener) = TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let Ok(socks_addr) = socks_listener.local_addr() else {
+            return;
+        };
+
+        let socks_thread = thread::spawn(move || {
+            let Ok((mut s, _)) = socks_listener.accept() else {
+                return false;
+            };
+            let mut greet = [0u8; 4];
+            if s.read_exact(&mut greet).is_err() || greet != [0x05, 0x02, 0x00, 0x02] {
+                return false;
+            }
+            let _ = s.write_all(&[0x05, 0x02]);
+
+            // Auth: 0x01, 3, "bob", 4, "pass"
+            let mut auth = [0u8; 10];
+            if s.read_exact(&mut auth).is_err() || &auth[2..5] != b"bob" || &auth[6..10] != b"pass"
+            {
+                return false;
+            }
+            let _ = s.write_all(&[0x01, 0x00]);
+
+            // CONNECT domain "api.test":443
+            let mut hdr = [0u8; 5];
+            if s.read_exact(&mut hdr).is_err() || hdr[3] != 0x03 {
+                return false;
+            }
+            let mut domain_and_port = vec![0u8; usize::from(hdr[4]) + 2];
+            if s.read_exact(&mut domain_and_port).is_err() {
+                return false;
+            }
+            let _ = s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]);
+            &domain_and_port[..usize::from(hdr[4])] == b"api.test"
+        });
+
+        let Ok(upstream) = UpstreamProxy::parse(&format!("socks5://bob:pass@{socks_addr}")) else {
+            return;
+        };
+        let Ok(forwarder) = ProxyForwarder::start(upstream) else {
+            return;
+        };
+        let Ok(mut client) = TcpStream::connect(forwarder.local_addr) else {
+            return;
+        };
+        let _ = client.write_all(b"CONNECT api.test:443 HTTP/1.1\r\nHost: api.test:443\r\n\r\n");
+        let mut resp = [0u8; 128];
+        let n = client.read(&mut resp).unwrap_or(0);
+        assert!(String::from_utf8_lossy(&resp[..n]).contains("200 Connection Established"));
+        drop(client);
+
+        assert!(socks_thread.join().unwrap_or(false));
     }
 }

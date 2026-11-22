@@ -61,6 +61,12 @@ class AsyncPage:
         """Return the active tab URL from the browser's web area, if available."""
         return await asyncio.to_thread(self._inner.url)
 
+    async def wait_for_url(self, url_contains: str, *, timeout_ms: int = 10_000) -> str:
+        """Poll until the active tab URL contains `url_contains` or `timeout_ms` elapses."""
+        return await asyncio.to_thread(
+            self._inner.wait_for_url, url_contains, timeout_ms=timeout_ms
+        )
+
     async def goto(self, url: str) -> None:
         """Navigate the active browser tab to `url` via native OS shortcut."""
         await asyncio.to_thread(self._inner.goto, url)

@@ -28,6 +28,8 @@ pub struct ChromeLaunchOptions {
     pub timezone: Option<String>,
     /// Optional OS-level locale (`LANG` / `LC_ALL` env vars, e.g., `en_US.UTF-8`).
     pub locale: Option<String>,
+    /// Whether to bring the launched browser window to the foreground on macOS.
+    pub focus: bool,
 }
 
 /// RAII handle owning a spawned Google Chrome process.
@@ -133,5 +135,20 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
     })?;
 
     tracing::info!(pid, binary = %binary.display(), "launched unmodified Google Chrome");
+    if options.focus && cfg!(target_os = "macos") {
+        focus_macos_pid(pid);
+    }
     Ok(LaunchedChrome { child, pid })
+}
+
+fn focus_macos_pid(pid: i32) {
+    let script = format!(
+        "tell application \"System Events\" to set frontmost of first process whose unix id is {pid} to true"
+    );
+    let _ = Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
