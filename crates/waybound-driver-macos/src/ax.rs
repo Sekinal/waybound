@@ -9,15 +9,15 @@ use waybound_core::{AccessibilityNode, Bounds, Result, Role, WayboundError};
 
 use crate::ffi::{
     AXIsProcessTrusted, AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
-    AXUIElementGetTypeID, AXValueGetTypeID, AXValueGetValue, CFArrayGetCount, CFArrayGetTypeID,
-    CFArrayGetValueAtIndex, CFGetTypeID, CgPoint, CgSize, K_AX_ERROR_SUCCESS,
-    K_AX_VALUE_TYPE_CG_POINT, K_AX_VALUE_TYPE_CG_SIZE, OwnedCf, cf_string, cf_to_bool,
-    cf_to_string,
+    AXUIElementGetTypeID, AXUIElementSetAttributeValue, AXValueGetTypeID, AXValueGetValue,
+    CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFGetTypeID, CgPoint, CgSize,
+    K_AX_ERROR_SUCCESS, K_AX_VALUE_TYPE_CG_POINT, K_AX_VALUE_TYPE_CG_SIZE, OwnedCf, cf_string,
+    cf_to_bool, cf_to_string, kCFBooleanTrue,
 };
 
-const MAX_DEPTH: usize = 32;
+const MAX_DEPTH: usize = 40;
 const MAX_NODES: usize = 2_000;
-const MAX_VISITED: usize = 8_000;
+const MAX_VISITED: usize = 10_000;
 
 /// Checks whether the current process has macOS Accessibility permission.
 #[must_use]
@@ -27,6 +27,9 @@ pub fn is_accessibility_trusted() -> bool {
 }
 
 /// Captures a bounded snapshot of the accessibility tree for `pid`.
+///
+/// Enables `AXEnhancedUserInterface` on the target application so Chromium/Chrome
+/// exposes its `AXWebArea` web-content accessibility tree.
 ///
 /// # Errors
 ///
@@ -55,10 +58,26 @@ pub fn snapshot_application_tree(pid: i32) -> Result<Vec<AccessibilityNode>> {
             }
         })?;
 
+    enable_enhanced_ui(&app);
+
+    // Prefer the active browser window so we spend the node budget on web content
+    // rather than menu bar items.
+    let root = copy_attr(&app, "AXFocusedWindow")
+        .or_else(|| copy_attr(&app, "AXMainWindow"))
+        .unwrap_or(app);
+
     let mut nodes = Vec::new();
     let mut visited = 0;
-    walk_node(&app, 0, &mut visited, &mut nodes);
+    walk_node(&root, 0, &mut visited, &mut nodes);
     Ok(nodes)
+}
+
+fn enable_enhanced_ui(app: &OwnedCf) {
+    let Some(key) = cf_string("AXEnhancedUserInterface") else {
+        return;
+    };
+    // SAFETY: `app` and `key` are valid retained CF objects, and `kCFBooleanTrue` is a global CF constant.
+    let _ = unsafe { AXUIElementSetAttributeValue(app.as_ptr(), key.as_ptr(), kCFBooleanTrue) };
 }
 
 fn copy_attr(element: &OwnedCf, attr_name: &str) -> Option<OwnedCf> {
@@ -155,7 +174,8 @@ fn walk_node(
     let role = map_ax_role(&role_str);
     let name = read_string_attr(element, "AXTitle")
         .filter(|s| !s.is_empty())
-        .or_else(|| read_string_attr(element, "AXDescription").filter(|s| !s.is_empty()));
+        .or_else(|| read_string_attr(element, "AXDescription").filter(|s| !s.is_empty()))
+        .or_else(|| read_string_attr(element, "AXPlaceholderValue").filter(|s| !s.is_empty()));
     let value = read_string_attr(element, "AXValue").filter(|s| !s.is_empty());
     let focused = copy_attr(element, "AXFocused")
         .and_then(|v| cf_to_bool(&v))

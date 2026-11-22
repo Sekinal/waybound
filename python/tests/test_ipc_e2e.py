@@ -2,65 +2,40 @@
 
 from __future__ import annotations
 
-import subprocess
-import tempfile
-import time
 from pathlib import Path
 
 import pytest
 
-from waybound import Page, Role, UnixSocketTransport, WayboundDaemonError, launch
+from waybound import KeyModifier, LaunchOptions, Role, WayboundDaemonError, launch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DAEMON_BIN = REPO_ROOT / "target" / "debug" / "waybound-daemon"
 
 
-def _wait_for_socket(socket_path: Path, timeout_s: float = 3.0) -> None:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if socket_path.exists():
-            return
-        time.sleep(0.02)
-    msg = f"daemon socket did not appear at {socket_path}"
-    raise TimeoutError(msg)
-
-
-def test_python_sdk_round_trip_with_rust_daemon() -> None:
+def test_ergonomic_launch_full_workflow() -> None:
     if not DAEMON_BIN.exists():
         pytest.skip("waybound-daemon binary not built yet (run cargo build)")
 
-    # Keep socket path short to stay within macOS's 104-byte AF_UNIX sun_path limit.
-    with tempfile.TemporaryDirectory(prefix="wb-", dir="/tmp") as tmp_dir:
-        socket_path = Path(tmp_dir) / "w.sock"
-        proc = subprocess.Popen(  # noqa: S603
-            [str(DAEMON_BIN), "--socket", str(socket_path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            _wait_for_socket(socket_path)
-            with UnixSocketTransport(socket_path) as transport:
-                assert transport.ping() == "0.1.0"
+    with launch(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
+        nodes = page.snapshot_tree()
+        assert len(nodes) == 2
+        assert nodes[0].role is Role.TEXTBOX
+        assert nodes[0].name == "Origin"
 
-                tree = transport.snapshot_tree()
-                assert len(tree) == 2
+        found = page.get_by_role(Role.BUTTON, name="Search").wait_for(timeout_ms=1_000)
+        assert found.id == "btn-search"
 
-                page = Page(transport)
-                page.get_by_role(Role.TEXTBOX, name="Origin").fill("SFO")
-                page.get_by_role(Role.BUTTON, name="Search").click()
-
-                with pytest.raises(WayboundDaemonError) as exc_info:
-                    page.get_by_role(Role.BUTTON, name="Nonexistent").click()
-                assert exc_info.value.code == "element_not_found"
-        finally:
-            proc.terminate()
-            proc.wait(timeout=3.0)
-
-
-def test_ergonomic_launch_context_manager() -> None:
-    if not DAEMON_BIN.exists():
-        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
-
-    with launch(backend="mock", daemon_binary=DAEMON_BIN) as page:
+        page.goto("https://example.com")
         page.get_by_role(Role.TEXTBOX, name="Origin").fill("NRT")
         page.get_by_role(Role.BUTTON, name="Search").click()
+        page.scroll(delta_y=-200.0)
+        page.press("enter")
+        page.press("l", modifiers=(KeyModifier.META,))
+
+        with pytest.raises(WayboundDaemonError) as exc_info:
+            page.get_by_role(Role.BUTTON, name="Nonexistent").wait_for(timeout_ms=120)
+        assert exc_info.value.code == "timeout"
+
+        with pytest.raises(WayboundDaemonError) as bad_url:
+            page.goto("javascript:alert(1)")
+        assert bad_url.value.code == "io_error"

@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use crate::input::Point;
 
+const MAX_STEPS: u64 = 10_000;
+
 /// A single timed waypoint along a pointer trajectory.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MotionStep {
@@ -23,7 +25,7 @@ pub struct MotionConfig {
     pub min_duration_ms: u64,
     /// Maximum total movement duration in milliseconds.
     pub max_duration_ms: u64,
-    /// Peak lateral arc offset as a fraction of total path distance (e.g., `0.04`).
+    /// Peak lateral arc offset as a fraction of total path distance (e.g., `0.035`).
     pub arc_ratio: f64,
 }
 
@@ -50,8 +52,8 @@ pub fn minimum_jerk(tau: f64) -> f64 {
 
 /// Generates a smooth minimum-jerk pointer trajectory from `start` to `end`.
 ///
-/// The `arc_sign` parameter (`+1.0` or `-1.0`) chooses which side of the chord
-/// the gentle natural wrist arc bows toward.
+/// The `arc_sign` parameter (`+1.0`, `-1.0`, or `0.0`) chooses which side of the chord
+/// the gentle natural wrist arc bows toward (`0.0` produces a straight minimum-jerk path).
 #[must_use]
 #[allow(
     clippy::cast_possible_truncation,
@@ -64,31 +66,45 @@ pub fn plan_pointer_path(
     arc_sign: f64,
     config: MotionConfig,
 ) -> Vec<MotionStep> {
+    if !start.x.is_finite() || !start.y.is_finite() || !end.x.is_finite() || !end.y.is_finite() {
+        return Vec::new();
+    }
+
     let dx = end.x - start.x;
     let dy = end.y - start.y;
     let distance = dx.hypot(dy);
 
-    if distance < 1.0 {
+    if !distance.is_finite() || distance < 1.0 {
         return vec![MotionStep {
             point: end,
             delay: Duration::ZERO,
         }];
     }
 
+    let min_ms = config.min_duration_ms.min(config.max_duration_ms) as f64;
+    let max_ms = config.min_duration_ms.max(config.max_duration_ms) as f64;
+
     // Fitts's law inspired duration: ~110ms + 75ms * log2(1 + distance / 20).
     let raw_ms = 75.0_f64.mul_add((1.0 + distance / 20.0).log2(), 110.0);
-    let total_ms = raw_ms
-        .round()
-        .clamp(config.min_duration_ms as f64, config.max_duration_ms as f64)
-        as u64;
+    let total_ms = raw_ms.round().clamp(min_ms, max_ms) as u64;
 
     let interval = config.step_interval_ms.max(1);
-    let steps = (total_ms / interval).max(2);
+    let steps = (total_ms / interval).clamp(2, MAX_STEPS);
 
     // Unit normal perpendicular to the chord for subtle natural arc curvature.
     let nx = -dy / distance;
     let ny = dx / distance;
-    let peak_offset = distance * config.arc_ratio * arc_sign.signum();
+    let safe_ratio = if config.arc_ratio.is_finite() {
+        config.arc_ratio
+    } else {
+        0.0
+    };
+    let safe_sign = if !arc_sign.is_finite() || arc_sign == 0.0 {
+        0.0
+    } else {
+        arc_sign.signum()
+    };
+    let peak_offset = distance * safe_ratio * safe_sign;
 
     let mut path = Vec::with_capacity(usize::try_from(steps).unwrap_or(64));
     for i in 1..=steps {
@@ -134,5 +150,33 @@ mod tests {
 
         assert!(path.len() >= 10);
         assert_eq!(path.last().map(|s| s.point), Some(end));
+    }
+
+    #[test]
+    fn plan_pointer_path_handles_inverted_durations_and_non_finite_inputs() {
+        let inverted = MotionConfig {
+            min_duration_ms: 500,
+            max_duration_ms: 100,
+            ..MotionConfig::default()
+        };
+        let path = plan_pointer_path(
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 200.0, y: 0.0 },
+            0.0,
+            inverted,
+        );
+        assert!(!path.is_empty());
+        assert!(path.iter().all(|s| s.point.y.abs() < 1e-12));
+
+        let bad = plan_pointer_path(
+            Point {
+                x: f64::NAN,
+                y: 0.0,
+            },
+            Point { x: 100.0, y: 0.0 },
+            1.0,
+            MotionConfig::default(),
+        );
+        assert!(bad.is_empty());
     }
 }

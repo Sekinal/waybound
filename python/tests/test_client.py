@@ -2,20 +2,43 @@
 
 from __future__ import annotations
 
-from waybound import Bounds, LocatorQuery, Page, Role
+from waybound import AccessibilityNode, Bounds, KeyModifier, LocatorQuery, Page, Role
 
 
 class FakeTransport:
     """In-memory transport recording semantic commands."""
 
     def __init__(self) -> None:
-        self.events: list[tuple[str, LocatorQuery, str | None]] = []
+        self.events: list[tuple[str, object]] = []
+
+    def snapshot_tree(self) -> list[AccessibilityNode]:
+        return []
+
+    def wait_for(self, query: LocatorQuery, *, timeout_ms: int = 10_000) -> AccessibilityNode:
+        self.events.append(("wait_for", (query, timeout_ms)))
+        return AccessibilityNode(
+            id="n1",
+            role=query.role or Role.UNKNOWN,
+            name=query.name,
+            value=None,
+            bounds=Bounds(10.0, 20.0, 100.0, 30.0),
+            focused=False,
+        )
 
     def click(self, query: LocatorQuery) -> None:
-        self.events.append(("click", query, None))
+        self.events.append(("click", query))
 
     def fill(self, query: LocatorQuery, text: str) -> None:
-        self.events.append(("fill", query, text))
+        self.events.append(("fill", (query, text)))
+
+    def navigate(self, url: str) -> None:
+        self.events.append(("navigate", url))
+
+    def scroll(self, delta_x: float, delta_y: float) -> None:
+        self.events.append(("scroll", (delta_x, delta_y)))
+
+    def press(self, key: str, *, modifiers: tuple[KeyModifier, ...] = ()) -> None:
+        self.events.append(("press", (key, modifiers)))
 
 
 def test_bounds_center() -> None:
@@ -27,10 +50,16 @@ def test_page_semantic_locators() -> None:
     transport = FakeTransport()
     page = Page(transport)
 
+    page.goto("https://example.com")
     page.get_by_role(Role.TEXTBOX, name="Origin").fill("SFO")
     page.get_by_role(Role.BUTTON, name="Search", exact=True).click()
+    page.scroll(delta_y=-250.0)
+    page.press("enter")
 
     assert transport.events == [
-        ("fill", LocatorQuery(role=Role.TEXTBOX, name="Origin", exact=False), "SFO"),
-        ("click", LocatorQuery(role=Role.BUTTON, name="Search", exact=True), None),
+        ("navigate", "https://example.com"),
+        ("fill", (LocatorQuery(role=Role.TEXTBOX, name="Origin", exact=False), "SFO")),
+        ("click", LocatorQuery(role=Role.BUTTON, name="Search", exact=True)),
+        ("scroll", (0.0, -250.0)),
+        ("press", ("enter", ())),
     ]

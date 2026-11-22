@@ -4,12 +4,14 @@
 
 use std::ptr;
 
-use waybound_core::{InputEvent, KeyCode, MouseButton, Point, Result, WayboundError};
+use waybound_core::{InputEvent, KeyCode, KeyModifier, MouseButton, Point, Result, WayboundError};
 
 use crate::ffi::{
     CGEventCreateKeyboardEvent, CGEventCreateMouseEvent, CGEventCreateScrollWheelEvent2,
-    CGEventKeyboardSetUnicodeString, CGEventPost, CgEventType, CgMouseButton, CgPoint,
-    K_CG_HID_EVENT_TAP, K_CG_SCROLL_EVENT_UNIT_PIXEL, OwnedCf,
+    CGEventKeyboardSetUnicodeString, CGEventPost, CGEventSetFlags, CgEventType, CgMouseButton,
+    CgPoint, K_CG_EVENT_FLAG_MASK_ALTERNATE, K_CG_EVENT_FLAG_MASK_COMMAND,
+    K_CG_EVENT_FLAG_MASK_CONTROL, K_CG_EVENT_FLAG_MASK_SHIFT, K_CG_HID_EVENT_TAP,
+    K_CG_SCROLL_EVENT_UNIT_PIXEL, OwnedCf,
 };
 
 /// Dispatches a native macOS `CGEvent` for `event`.
@@ -45,7 +47,7 @@ pub fn dispatch_cg_event(event: &InputEvent, last_cursor: &mut Point) -> Result<
             post_mouse(up, *last_cursor, cg_button)
         }
         InputEvent::Scroll { delta_x, delta_y } => post_scroll(*delta_x, *delta_y),
-        InputEvent::KeyPress { key } => post_key(key),
+        InputEvent::KeyPress { key, modifiers } => post_key(key, modifiers),
     }
 }
 
@@ -104,17 +106,49 @@ fn post_scroll(delta_x: f64, delta_y: f64) -> Result<()> {
     Ok(())
 }
 
-fn post_key(key: &KeyCode) -> Result<()> {
-    match key {
-        KeyCode::Enter => post_virtual_key(0x24),
-        KeyCode::Tab => post_virtual_key(0x30),
-        KeyCode::Escape => post_virtual_key(0x35),
-        KeyCode::Backspace => post_virtual_key(0x33),
-        KeyCode::Char(ch) => post_unicode_char(*ch),
+fn modifier_flags(modifiers: &[KeyModifier]) -> u64 {
+    modifiers.iter().fold(0u64, |acc, m| {
+        acc | match m {
+            KeyModifier::Meta => K_CG_EVENT_FLAG_MASK_COMMAND,
+            KeyModifier::Control => K_CG_EVENT_FLAG_MASK_CONTROL,
+            KeyModifier::Alt => K_CG_EVENT_FLAG_MASK_ALTERNATE,
+            KeyModifier::Shift => K_CG_EVENT_FLAG_MASK_SHIFT,
+        }
+    })
+}
+
+const fn ascii_virtual_keycode(ch: char) -> Option<u16> {
+    match ch.to_ascii_lowercase() {
+        'a' => Some(0x00),
+        'c' => Some(0x08),
+        'l' => Some(0x25),
+        'r' => Some(0x0F),
+        't' => Some(0x11),
+        'v' => Some(0x09),
+        'w' => Some(0x0D),
+        _ => None,
     }
 }
 
-fn post_virtual_key(keycode: u16) -> Result<()> {
+fn post_key(key: &KeyCode, modifiers: &[KeyModifier]) -> Result<()> {
+    let flags = modifier_flags(modifiers);
+    match key {
+        KeyCode::Enter => post_virtual_key(0x24, flags),
+        KeyCode::Tab => post_virtual_key(0x30, flags),
+        KeyCode::Escape => post_virtual_key(0x35, flags),
+        KeyCode::Backspace => post_virtual_key(0x33, flags),
+        KeyCode::Char(ch) => {
+            if flags != 0
+                && let Some(vk) = ascii_virtual_keycode(*ch)
+            {
+                return post_virtual_key(vk, flags);
+            }
+            post_unicode_char(*ch, flags)
+        }
+    }
+}
+
+fn post_virtual_key(keycode: u16, flags: u64) -> Result<()> {
     for down in [1u8, 0u8] {
         // SAFETY: `CGEventCreateKeyboardEvent` returns a `+1` retained `CGEventRef` or null.
         let ev =
@@ -124,12 +158,17 @@ fn post_virtual_key(keycode: u16) -> Result<()> {
                     reason: "CGEventCreateKeyboardEvent returned null".to_owned(),
                 })?;
         // SAFETY: `ev` is a valid non-null `CGEventRef`.
-        unsafe { CGEventPost(K_CG_HID_EVENT_TAP, ev.as_ptr()) };
+        unsafe {
+            if flags != 0 {
+                CGEventSetFlags(ev.as_ptr(), flags);
+            }
+            CGEventPost(K_CG_HID_EVENT_TAP, ev.as_ptr());
+        }
     }
     Ok(())
 }
 
-fn post_unicode_char(ch: char) -> Result<()> {
+fn post_unicode_char(ch: char, flags: u64) -> Result<()> {
     let mut utf16 = [0u16; 2];
     let encoded = ch.encode_utf16(&mut utf16);
 
@@ -142,6 +181,9 @@ fn post_unicode_char(ch: char) -> Result<()> {
         })?;
         // SAFETY: `ev` is valid and `encoded` is a valid UTF-16 slice of length `encoded.len()`.
         unsafe {
+            if flags != 0 {
+                CGEventSetFlags(ev.as_ptr(), flags);
+            }
             CGEventKeyboardSetUnicodeString(ev.as_ptr(), encoded.len(), encoded.as_ptr());
             CGEventPost(K_CG_HID_EVENT_TAP, ev.as_ptr());
         }

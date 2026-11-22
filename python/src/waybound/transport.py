@@ -8,11 +8,13 @@ import socket
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
-from waybound.types import AccessibilityNode, Bounds, LocatorQuery, Role
+from waybound.types import AccessibilityNode, Bounds, KeyModifier, LocatorQuery, Role
 
 if TYPE_CHECKING:
     from io import TextIOWrapper
     from types import TracebackType
+
+_NAMED_KEYS = frozenset({"enter", "tab", "escape", "backspace"})
 
 
 class WayboundDaemonError(RuntimeError):
@@ -27,7 +29,7 @@ class WayboundDaemonError(RuntimeError):
 class UnixSocketTransport:
     """Line-delimited JSON transport connected to waybound-daemon over AF_UNIX."""
 
-    def __init__(self, socket_path: Path | str, *, timeout_s: float = 5.0) -> None:
+    def __init__(self, socket_path: Path | str, *, timeout_s: float = 30.0) -> None:
         self._socket_path = Path(socket_path)
         self._sock: socket.socket | None = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._reader: TextIOWrapper | None = None
@@ -90,18 +92,56 @@ class UnixSocketTransport:
 
         return [_parse_node(item) for item in raw_nodes if isinstance(item, dict)]
 
+    def wait_for(self, query: LocatorQuery, *, timeout_ms: int = 10_000) -> AccessibilityNode:
+        """Poll until an element matching `query` appears or `timeout_ms` elapses."""
+        response = self._request(
+            {
+                "method": "wait_for",
+                "query": _encode_query(query),
+                "timeout_ms": max(0, timeout_ms),
+            }
+        )
+        raw_node = response.get("node")
+        if not isinstance(raw_node, dict):
+            msg = f"unexpected wait_for response: {response!r}"
+            raise WayboundDaemonError("protocol_error", msg)
+        return _parse_node(raw_node)
+
     def click(self, query: LocatorQuery) -> None:
         """Locate the target element and dispatch a native click."""
-        response = self._request({"method": "click", "query": _encode_query(query)})
-        if response.get("status") != "ok":
-            msg = f"unexpected click response: {response!r}"
-            raise WayboundDaemonError("protocol_error", msg)
+        self._expect_ok({"method": "click", "query": _encode_query(query)}, "click")
 
     def fill(self, query: LocatorQuery, text: str) -> None:
         """Focus the target element and type text via native keyboard events."""
-        response = self._request({"method": "fill", "query": _encode_query(query), "text": text})
+        self._expect_ok({"method": "fill", "query": _encode_query(query), "text": text}, "fill")
+
+    def navigate(self, url: str) -> None:
+        """Navigate the active browser tab to `url`."""
+        self._expect_ok({"method": "navigate", "url": url}, "navigate")
+
+    def scroll(self, delta_x: float, delta_y: float) -> None:
+        """Emit a native scroll event."""
+        self._expect_ok({"method": "scroll", "delta_x": delta_x, "delta_y": delta_y}, "scroll")
+
+    def press(self, key: str, *, modifiers: tuple[KeyModifier, ...] = ()) -> None:
+        """Emit a key press (`enter`, `tab`, `escape`, `backspace`, or single char)."""
+        encoded_key: object = key.lower() if key.lower() in _NAMED_KEYS else {"char": key}
+        if isinstance(encoded_key, dict) and len(key) != 1:
+            msg = f"key must be one of {sorted(_NAMED_KEYS)} or a single character, got {key!r}"
+            raise ValueError(msg)
+        self._expect_ok(
+            {
+                "method": "press",
+                "key": encoded_key,
+                "modifiers": [m.value for m in modifiers],
+            },
+            "press",
+        )
+
+    def _expect_ok(self, payload: dict[str, object], op: str) -> None:
+        response = self._request(payload)
         if response.get("status") != "ok":
-            msg = f"unexpected fill response: {response!r}"
+            msg = f"unexpected {op} response: {response!r}"
             raise WayboundDaemonError("protocol_error", msg)
 
     def _request(self, payload: dict[str, object]) -> dict[str, object]:

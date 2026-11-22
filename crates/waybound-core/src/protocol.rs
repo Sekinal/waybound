@@ -3,16 +3,24 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::WayboundError;
+use crate::input::{KeyCode, KeyModifier};
 use crate::locator::{AccessibilityNode, LocatorQuery};
 
 /// Wire-level request sent from a client SDK to `waybound-daemon`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Request {
     /// Health check returning the daemon version.
     Ping,
     /// Return a snapshot of the active accessibility tree.
     SnapshotTree,
+    /// Poll the accessibility tree until an element matching `query` appears or `timeout_ms` elapses.
+    WaitFor {
+        /// Semantic locator query.
+        query: LocatorQuery,
+        /// Maximum wait time in milliseconds.
+        timeout_ms: u64,
+    },
     /// Locate an element matching `query` and click its center.
     Click {
         /// Semantic locator query.
@@ -24,6 +32,26 @@ pub enum Request {
         query: LocatorQuery,
         /// Text to enter.
         text: String,
+    },
+    /// Navigate the active browser tab to `url` via OS keyboard shortcut (Cmd/Ctrl+L).
+    Navigate {
+        /// Destination URL (`http://` or `https://`).
+        url: String,
+    },
+    /// Emit a native scroll event.
+    Scroll {
+        /// Horizontal scroll delta in pixels.
+        delta_x: f64,
+        /// Vertical scroll delta in pixels.
+        delta_y: f64,
+    },
+    /// Emit a single key press with optional modifiers.
+    Press {
+        /// Key to press.
+        key: KeyCode,
+        /// Optional modifier keys.
+        #[serde(default)]
+        modifiers: Vec<KeyModifier>,
     },
 }
 
@@ -42,6 +70,11 @@ pub enum Response {
     Tree {
         /// Captured accessibility nodes.
         nodes: Vec<AccessibilityNode>,
+    },
+    /// Response to [`Request::WaitFor`].
+    Node {
+        /// First matched accessibility node.
+        node: AccessibilityNode,
     },
     /// Structured error returned when a request fails.
     Error {

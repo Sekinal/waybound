@@ -23,6 +23,20 @@ pub enum MouseButton {
     Middle,
 }
 
+/// Modifier keys that can be held during a key press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyModifier {
+    /// Command (macOS) / Super (Linux) / Win (Windows).
+    Meta,
+    /// Control key.
+    Control,
+    /// Alt / Option key.
+    Alt,
+    /// Shift key.
+    Shift,
+}
+
 /// Logical keyboard key identifiers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,9 +74,12 @@ pub enum InputEvent {
         /// Vertical scroll delta.
         delta_y: f64,
     },
-    /// Press and release a key.
+    /// Press and release a key, optionally with modifier keys held.
     KeyPress {
         /// Key to emit.
         key: KeyCode,
+        /// Active modifiers for this keystroke.
+        #[serde(default)]
+        modifiers: Vec<KeyModifier>,
     },
 }

@@ -35,6 +35,15 @@ pub const K_CG_HID_EVENT_TAP: u32 = 0;
 /// `kCGScrollEventUnitPixel`.
 pub const K_CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
 
+/// CoreGraphics modifier flags (`CGEventFlags`).
+pub const K_CG_EVENT_FLAG_MASK_SHIFT: u64 = 0x0002_0000;
+/// `kCGEventFlagMaskControl`.
+pub const K_CG_EVENT_FLAG_MASK_CONTROL: u64 = 0x0004_0000;
+/// `kCGEventFlagMaskAlternate`.
+pub const K_CG_EVENT_FLAG_MASK_ALTERNATE: u64 = 0x0008_0000;
+/// `kCGEventFlagMaskCommand`.
+pub const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
+
 /// CoreGraphics `CGPoint`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -88,6 +97,8 @@ pub enum CgMouseButton {
 }
 
 unsafe extern "C" {
+    pub static kCFBooleanTrue: CfBooleanRef;
+
     pub fn CFRelease(cf: CfTypeRef);
     pub fn CFRetain(cf: CfTypeRef) -> CfTypeRef;
     pub fn CFGetTypeID(cf: CfTypeRef) -> usize;
@@ -120,6 +131,11 @@ unsafe extern "C" {
         attribute: CfStringRef,
         value: *mut CfTypeRef,
     ) -> i32;
+    pub fn AXUIElementSetAttributeValue(
+        element: AxUiElementRef,
+        attribute: CfStringRef,
+        value: CfTypeRef,
+    ) -> i32;
     pub fn AXValueGetValue(value: AxValueRef, value_type: i32, value_ptr: *mut c_void) -> u8;
 
     pub fn CGEventCreateMouseEvent(
@@ -147,6 +163,7 @@ unsafe extern "C" {
         string_length: usize,
         unicode_string: *const u16,
     );
+    pub fn CGEventSetFlags(event: CgEventRef, flags: u64);
     pub fn CGEventPost(tap: u32, event: CgEventRef);
 }
 

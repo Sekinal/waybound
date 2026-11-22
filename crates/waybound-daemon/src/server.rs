@@ -5,20 +5,22 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use waybound_core::{
-    Driver, InputEvent, KeyCode, LocatorQuery, MouseButton, Point, Request, Response, Result,
-    WayboundError,
+    BackendKind, Driver, InputEvent, KeyCode, KeyModifier, LocatorQuery, MotionConfig, MouseButton,
+    Point, Request, Response, Result, WayboundError, plan_pointer_path,
 };
 
 const MAX_UNIX_PATH_BYTES: usize = 100;
 const MAX_FRAME_BYTES: u64 = 1024 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(75);
+const MAX_WAIT_TIMEOUT_MS: u64 = 120_000;
 
 /// RAII guard that removes a bound Unix socket file on drop.
 struct SocketGuard {
@@ -31,9 +33,39 @@ impl Drop for SocketGuard {
     }
 }
 
-/// Dispatches a single protocol [`Request`] against `driver`.
-#[must_use]
-pub fn handle_request(driver: &dyn Driver, request: Request) -> Response {
+/// RAII guard decrementing the active connection counter even on unwind.
+struct ConnectionGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let _ = self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Runtime options for daemon request execution.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerOptions {
+    /// Whether to execute smooth minimum-jerk pointer trajectories before clicks.
+    pub use_motion: bool,
+}
+
+struct SessionState {
+    last_cursor: Mutex<Point>,
+    options: ServerOptions,
+}
+
+impl SessionState {
+    const fn new(options: ServerOptions) -> Self {
+        Self {
+            last_cursor: Mutex::new(Point { x: 0.0, y: 0.0 }),
+            options,
+        }
+    }
+}
+
+fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -> Response {
     match request {
         Request::Ping => Response::Pong {
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -42,18 +74,95 @@ pub fn handle_request(driver: &dyn Driver, request: Request) -> Response {
             Ok(nodes) => Response::Tree { nodes },
             Err(err) => Response::from(&err),
         },
-        Request::Click { query } => match click_element(driver, &query) {
+        Request::WaitFor { query, timeout_ms } => {
+            match wait_for_element(driver, &query, timeout_ms) {
+                Ok(node) => Response::Node { node },
+                Err(err) => Response::from(&err),
+            }
+        }
+        Request::Click { query } => match click_element(driver, state, &query) {
             Ok(()) => Response::Ok,
             Err(err) => Response::from(&err),
         },
-        Request::Fill { query, text } => match fill_element(driver, &query, &text) {
+        Request::Fill { query, text } => match fill_element(driver, state, &query, &text) {
             Ok(()) => Response::Ok,
             Err(err) => Response::from(&err),
         },
+        Request::Navigate { url } => match navigate_url(driver, &url) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
+        Request::Scroll { delta_x, delta_y } => {
+            if !delta_x.is_finite() || !delta_y.is_finite() {
+                return Response::Error {
+                    code: "invalid_request".to_owned(),
+                    message: "scroll deltas must be finite numbers".to_owned(),
+                };
+            }
+            match driver.dispatch_input(&InputEvent::Scroll { delta_x, delta_y }) {
+                Ok(()) => Response::Ok,
+                Err(err) => Response::from(&err),
+            }
+        }
+        Request::Press { key, modifiers } => {
+            match driver.dispatch_input(&InputEvent::KeyPress { key, modifiers }) {
+                Ok(()) => Response::Ok,
+                Err(err) => Response::from(&err),
+            }
+        }
     }
 }
 
-fn click_element(driver: &dyn Driver, query: &LocatorQuery) -> Result<()> {
+fn wait_for_element(
+    driver: &dyn Driver,
+    query: &LocatorQuery,
+    timeout_ms: u64,
+) -> Result<waybound_core::AccessibilityNode> {
+    let clamped_ms = timeout_ms.min(MAX_WAIT_TIMEOUT_MS);
+    let deadline = Instant::now() + Duration::from_millis(clamped_ms);
+
+    loop {
+        match driver.locate(query) {
+            Ok(node) => return Ok(node),
+            Err(WayboundError::ElementNotFound { .. }) => {
+                if Instant::now() >= deadline {
+                    return Err(WayboundError::Timeout {
+                        timeout_ms: clamped_ms,
+                        context: format!("element not found for query: {query:?}"),
+                    });
+                }
+                thread::sleep(WAIT_POLL_INTERVAL);
+            }
+            Err(other) => return Err(other),
+        }
+    }
+}
+
+fn move_pointer(driver: &dyn Driver, state: &SessionState, target: Point) -> Result<()> {
+    let start = state
+        .last_cursor
+        .lock()
+        .map_or(Point { x: 0.0, y: 0.0 }, |g| *g);
+
+    if state.options.use_motion {
+        let path = plan_pointer_path(start, target, 1.0, MotionConfig::default());
+        for step in path {
+            if !step.delay.is_zero() {
+                thread::sleep(step.delay);
+            }
+            driver.dispatch_input(&InputEvent::PointerMove { to: step.point })?;
+        }
+    } else {
+        driver.dispatch_input(&InputEvent::PointerMove { to: target })?;
+    }
+
+    if let Ok(mut guard) = state.last_cursor.lock() {
+        *guard = target;
+    }
+    Ok(())
+}
+
+fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery) -> Result<()> {
     let node = driver.locate(query)?;
     let b = node.bounds;
     if !b.x.is_finite()
@@ -69,23 +178,63 @@ fn click_element(driver: &dyn Driver, query: &LocatorQuery) -> Result<()> {
     }
 
     let (x, y) = b.center();
-    driver.dispatch_input(&InputEvent::PointerMove { to: Point { x, y } })?;
+    move_pointer(driver, state, Point { x, y })?;
     driver.dispatch_input(&InputEvent::MouseClick {
         button: MouseButton::Left,
     })
 }
 
-fn fill_element(driver: &dyn Driver, query: &LocatorQuery, text: &str) -> Result<()> {
-    click_element(driver, query)?;
+fn fill_element(
+    driver: &dyn Driver,
+    state: &SessionState,
+    query: &LocatorQuery,
+    text: &str,
+) -> Result<()> {
+    click_element(driver, state, query)?;
+    type_text(driver, text, state.options.use_motion)
+}
+
+fn type_text(driver: &dyn Driver, text: &str, pace: bool) -> Result<()> {
     for ch in text.chars() {
         let key = match ch {
             '\n' | '\r' => KeyCode::Enter,
             '\t' => KeyCode::Tab,
             other => KeyCode::Char(other),
         };
-        driver.dispatch_input(&InputEvent::KeyPress { key })?;
+        driver.dispatch_input(&InputEvent::KeyPress {
+            key,
+            modifiers: Vec::new(),
+        })?;
+        if pace {
+            thread::sleep(Duration::from_millis(28));
+        }
     }
     Ok(())
+}
+
+fn navigate_url(driver: &dyn Driver, url: &str) -> Result<()> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(WayboundError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "url must start with http:// or https://",
+        )));
+    }
+
+    let focus_mod = match driver.backend_kind() {
+        BackendKind::MacOsNative => KeyModifier::Meta,
+        _ => KeyModifier::Control,
+    };
+
+    driver.dispatch_input(&InputEvent::KeyPress {
+        key: KeyCode::Char('l'),
+        modifiers: vec![focus_mod],
+    })?;
+    thread::sleep(Duration::from_millis(60));
+    type_text(driver, url, false)?;
+    driver.dispatch_input(&InputEvent::KeyPress {
+        key: KeyCode::Enter,
+        modifiers: Vec::new(),
+    })
 }
 
 fn prepare_socket_path(socket_path: &Path) -> Result<()> {
@@ -133,7 +282,11 @@ fn prepare_socket_path(socket_path: &Path) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the socket path is invalid, already in use, or cannot be bound.
-pub fn serve_unix(socket_path: &Path, driver: &Arc<dyn Driver>) -> Result<()> {
+pub fn serve_unix(
+    socket_path: &Path,
+    driver: &Arc<dyn Driver>,
+    options: ServerOptions,
+) -> Result<()> {
     prepare_socket_path(socket_path)?;
 
     let listener = UnixListener::bind(socket_path)?;
@@ -144,6 +297,7 @@ pub fn serve_unix(socket_path: &Path, driver: &Arc<dyn Driver>) -> Result<()> {
     tracing::info!(socket = %socket_path.display(), "listening on unix socket");
 
     let active_connections = Arc::new(AtomicUsize::new(0));
+    let state = Arc::new(SessionState::new(options));
 
     for incoming in listener.incoming() {
         match incoming {
@@ -156,12 +310,17 @@ pub fn serve_unix(socket_path: &Path, driver: &Arc<dyn Driver>) -> Result<()> {
                 }
 
                 let driver_ref = Arc::clone(driver);
-                let counter_ref = Arc::clone(&active_connections);
+                let state_ref = Arc::clone(&state);
+                let conn_guard = ConnectionGuard {
+                    counter: Arc::clone(&active_connections),
+                };
                 let _ = thread::spawn(move || {
-                    if let Err(err) = handle_connection(stream, driver_ref.as_ref()) {
+                    let _guard = conn_guard;
+                    if let Err(err) =
+                        handle_connection(stream, driver_ref.as_ref(), state_ref.as_ref())
+                    {
                         tracing::warn!(error = %err, "client connection closed with error");
                     }
-                    let _ = counter_ref.fetch_sub(1, Ordering::AcqRel);
                 });
             }
             Err(err)
@@ -192,7 +351,11 @@ fn write_response(stream: &mut UnixStream, response: &Response) -> Result<()> {
     Ok(())
 }
 
-fn handle_connection(mut stream: UnixStream, driver: &dyn Driver) -> Result<()> {
+fn handle_connection(
+    mut stream: UnixStream,
+    driver: &dyn Driver,
+    state: &SessionState,
+) -> Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
@@ -223,7 +386,7 @@ fn handle_connection(mut stream: UnixStream, driver: &dyn Driver) -> Result<()> 
         }
 
         let response = match serde_json::from_str::<Request>(trimmed) {
-            Ok(request) => handle_request(driver, request),
+            Ok(request) => handle_request(driver, state, request),
             Err(err) => Response::Error {
                 code: "invalid_request".to_owned(),
                 message: err.to_string(),

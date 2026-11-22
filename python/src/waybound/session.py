@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -16,6 +18,22 @@ if TYPE_CHECKING:
     from types import TracebackType
 
 BackendName = Literal["mock", "macos"]
+_MIN_WORKSPACE_PARENTS = 4
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchOptions:
+    """Configuration options for launching a `waybound` automation session."""
+
+    backend: BackendName = "mock"
+    pid: int | None = None
+    launch_chrome: bool = False
+    url: str | None = None
+    profile_dir: Path | str | None = None
+    ssl_keylog: Path | str | None = None
+    no_motion: bool = False
+    daemon_binary: Path | str | None = None
+    startup_timeout_s: float = 5.0
 
 
 def _resolve_daemon_binary(explicit: Path | str | None) -> Path:
@@ -26,25 +44,35 @@ def _resolve_daemon_binary(explicit: Path | str | None) -> Path:
     if on_path is not None:
         return Path(on_path)
 
-    # Local workspace fallback for development checkouts.
-    repo_root = Path(__file__).resolve().parents[3]
-    for profile in ("release", "debug"):
-        candidate = repo_root / "target" / profile / "waybound-daemon"
-        if candidate.exists():
-            return candidate
+    parents = Path(__file__).resolve().parents
+    if len(parents) >= _MIN_WORKSPACE_PARENTS:
+        repo_root = parents[3]
+        for profile in ("release", "debug"):
+            candidate = repo_root / "target" / profile / "waybound-daemon"
+            if candidate.exists():
+                return candidate
 
     msg = "waybound-daemon binary not found on PATH or in target/{release,debug}"
     raise FileNotFoundError(msg)
 
 
-def _wait_for_socket(socket_path: Path, proc: subprocess.Popen[bytes], timeout_s: float) -> None:
+def _connect_with_retry(
+    socket_path: Path,
+    proc: subprocess.Popen[bytes],
+    timeout_s: float,
+) -> UnixSocketTransport:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if socket_path.exists():
-            return
         if proc.poll() is not None:
-            msg = f"waybound-daemon exited early with code {proc.returncode}"
+            stderr_bytes = proc.stderr.read() if proc.stderr is not None else b""
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+            msg = f"waybound-daemon exited early (code {proc.returncode}): {stderr_text}"
             raise RuntimeError(msg)
+        if socket_path.exists():
+            try:
+                return UnixSocketTransport(socket_path)
+            except (FileNotFoundError, ConnectionRefusedError, PermissionError):
+                pass
         time.sleep(0.02)
     msg = f"timed out waiting for waybound-daemon socket at {socket_path}"
     raise TimeoutError(msg)
@@ -53,50 +81,56 @@ def _wait_for_socket(socket_path: Path, proc: subprocess.Popen[bytes], timeout_s
 class Session:
     """Context manager that starts `waybound-daemon`, connects, and cleans up on exit."""
 
-    def __init__(
-        self,
-        *,
-        backend: BackendName = "mock",
-        pid: int | None = None,
-        daemon_binary: Path | str | None = None,
-        startup_timeout_s: float = 5.0,
-    ) -> None:
-        self._backend = backend
-        self._pid = pid
-        self._daemon_binary = _resolve_daemon_binary(daemon_binary)
-        self._startup_timeout_s = startup_timeout_s
+    def __init__(self, options: LaunchOptions | None = None) -> None:
+        opts = options if options is not None else LaunchOptions()
+        self._options = opts
+        self._daemon_binary = _resolve_daemon_binary(opts.daemon_binary)
         self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._proc: subprocess.Popen[bytes] | None = None
         self._transport: UnixSocketTransport | None = None
 
     def __enter__(self) -> Page:
+        if self._proc is not None or self._transport is not None:
+            msg = "Session is already active and cannot be re-entered"
+            raise RuntimeError(msg)
+
         # Keep socket path short to stay within macOS's 104-byte AF_UNIX sun_path limit.
         tmp_dir = tempfile.TemporaryDirectory(prefix="wb-", dir="/tmp")
         self._tmp_dir = tmp_dir
         socket_path = Path(tmp_dir.name) / "w.sock"
 
+        opts = self._options
         cmd = [
             str(self._daemon_binary),
             "--socket",
             str(socket_path),
             "--backend",
-            self._backend,
+            opts.backend,
         ]
-        if self._pid is not None:
-            cmd.extend(["--pid", str(self._pid)])
+        if opts.pid is not None:
+            cmd.extend(["--pid", str(opts.pid)])
+        if opts.launch_chrome:
+            cmd.append("--launch-chrome")
+        if opts.url is not None:
+            cmd.extend(["--url", opts.url])
+        if opts.profile_dir is not None:
+            cmd.extend(["--profile-dir", str(Path(opts.profile_dir))])
+        if opts.ssl_keylog is not None:
+            cmd.extend(["--ssl-keylog", str(Path(opts.ssl_keylog))])
+        if opts.no_motion:
+            cmd.append("--no-motion")
 
         try:
             proc = subprocess.Popen(  # noqa: S603
                 cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
             self._proc = proc
-            _wait_for_socket(socket_path, proc, self._startup_timeout_s)
-            transport = UnixSocketTransport(socket_path)
+            transport = _connect_with_retry(socket_path, proc, opts.startup_timeout_s)
             self._transport = transport
             return Page(transport)
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -109,34 +143,48 @@ class Session:
         self.close()
 
     def close(self) -> None:
-        """Close the IPC transport, terminate the daemon, and clean up the socket dir."""
-        if self._transport is not None:
-            self._transport.close()
-            self._transport = None
-        if self._proc is not None:
-            self._proc.terminate()
+        """Close the IPC transport, terminate the daemon, and clean up the socket dir safely."""
+        try:
+            if self._transport is not None:
+                with contextlib.suppress(OSError):
+                    self._transport.close()
+                self._transport = None
+        finally:
             try:
-                self._proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-                self._proc.wait(timeout=1.0)
-            self._proc = None
-        if self._tmp_dir is not None:
-            self._tmp_dir.cleanup()
-            self._tmp_dir = None
+                if self._proc is not None:
+                    proc = self._proc
+                    self._proc = None
+                    try:
+                        if proc.poll() is None:
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=3.0)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                                with contextlib.suppress(subprocess.TimeoutExpired):
+                                    proc.wait(timeout=1.0)
+                    finally:
+                        if proc.stderr is not None:
+                            with contextlib.suppress(OSError):
+                                proc.stderr.close()
+            finally:
+                if self._tmp_dir is not None:
+                    with contextlib.suppress(OSError):
+                        self._tmp_dir.cleanup()
+                    self._tmp_dir = None
 
 
 def launch(
+    options: LaunchOptions | None = None,
     *,
     backend: BackendName = "mock",
-    pid: int | None = None,
-    daemon_binary: Path | str | None = None,
-    startup_timeout_s: float = 5.0,
+    launch_chrome: bool = False,
+    url: str | None = None,
 ) -> Session:
-    """Create a [`Session`] context manager for ergonomic out-of-band browser automation."""
-    return Session(
-        backend=backend,
-        pid=pid,
-        daemon_binary=daemon_binary,
-        startup_timeout_s=startup_timeout_s,
+    """Create a `Session` context manager for ergonomic out-of-band browser automation."""
+    resolved = (
+        options
+        if options is not None
+        else LaunchOptions(backend=backend, launch_chrome=launch_chrome, url=url)
     )
+    return Session(resolved)

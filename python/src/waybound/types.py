@@ -29,6 +29,15 @@ class Role(StrEnum):
     UNKNOWN = "unknown"
 
 
+class KeyModifier(StrEnum):
+    """Modifier keys held during a key press."""
+
+    META = "meta"
+    CONTROL = "control"
+    ALT = "alt"
+    SHIFT = "shift"
+
+
 @dataclass(frozen=True, slots=True)
 class Bounds:
     """Logical screen-space bounding rectangle."""
@@ -68,10 +77,30 @@ class LocatorQuery:
 class Transport(Protocol):
     """IPC transport abstraction between the Python SDK and waybound-daemon."""
 
+    def snapshot_tree(self) -> list[AccessibilityNode]:
+        """Return the live OS accessibility tree."""
+        ...
+
+    def wait_for(self, query: LocatorQuery, *, timeout_ms: int = 10_000) -> AccessibilityNode:
+        """Poll until an element matching `query` appears or `timeout_ms` elapses."""
+        ...
+
     def click(self, query: LocatorQuery) -> None:
         """Locate the target element and dispatch a native click."""
         ...
 
     def fill(self, query: LocatorQuery, text: str) -> None:
         """Focus the target element and type text via native keyboard events."""
+        ...
+
+    def navigate(self, url: str) -> None:
+        """Navigate the active browser tab to `url`."""
+        ...
+
+    def scroll(self, delta_x: float, delta_y: float) -> None:
+        """Emit a native scroll event."""
+        ...
+
+    def press(self, key: str, *, modifiers: tuple[KeyModifier, ...] = ()) -> None:
+        """Emit a key press (`enter`, `tab`, `escape`, `backspace`, or single char)."""
         ...
