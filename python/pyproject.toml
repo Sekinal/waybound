@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "waybound"
 version = "0.2.2"
 description = "Zero-CDP, out-of-band OS-level browser automation SDK (macOS, Linux, Windows, Android)"
+readme = "README.md"
 license = "MIT OR Apache-2.0"
 requires-python = ">=3.12"
 dependencies = []
