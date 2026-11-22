@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod atspi;
+pub mod atspi_native;
 pub mod input;
 mod process;
 pub mod screenshot;
@@ -22,14 +23,17 @@ use std::sync::{Arc, Mutex};
 use tracing::debug;
 use waybound_core::{AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Result};
 
-/// Native Linux browser driver targeting unmodified Chrome/Chromium over AT-SPI2
-/// and pure-Rust X11 `XTEST`/`GetImage` (with `xdotool`/`ydotool`/`scrot`/`grim` fallback).
+/// Native Linux browser driver targeting unmodified Chrome/Chromium.
+///
+/// Uses pure-Rust AT-SPI2 D-Bus (`zbus`) and X11 `XTEST`/`GetImage` (`x11rb`),
+/// with automatic fallback to `pyatspi`/`xdotool`/`ydotool`/`scrot`/`grim`.
 #[derive(Debug, Clone)]
 pub struct LinuxDriver {
     pid: Option<i32>,
     display: Option<String>,
     display_server: Option<DisplayServer>,
     x11: Arc<Mutex<Option<x11_native::X11Client>>>,
+    atspi: Arc<Mutex<Option<atspi_native::AtspiClient>>>,
 }
 
 impl LinuxDriver {
@@ -41,6 +45,7 @@ impl LinuxDriver {
             display: None,
             display_server: None,
             x11: Arc::new(Mutex::new(None)),
+            atspi: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -53,6 +58,7 @@ impl LinuxDriver {
             display,
             display_server: None,
             x11: Arc::new(Mutex::new(None)),
+            atspi: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -110,6 +116,28 @@ impl LinuxDriver {
         }
         guard.as_ref().map(op)
     }
+
+    fn query_snapshot(&self) -> Result<AtspiSnapshot> {
+        if let Ok(mut guard) = self.atspi.lock() {
+            if guard.is_none() {
+                match atspi_native::AtspiClient::connect() {
+                    Ok(client) => *guard = Some(client),
+                    Err(err) => {
+                        debug!(%err, "native AtspiClient unavailable; falling back to pyatspi");
+                    }
+                }
+            }
+            if let Some(client) = guard.as_ref() {
+                match client.snapshot(self.pid) {
+                    Ok(snap) => return Ok(snap),
+                    Err(err) => {
+                        debug!(%err, "native AtspiClient snapshot failed; falling back to pyatspi");
+                    }
+                }
+            }
+        }
+        atspi::query_atspi_tree(self.pid, self.display.as_deref())
+    }
 }
 
 impl Driver for LinuxDriver {
@@ -118,17 +146,17 @@ impl Driver for LinuxDriver {
     }
 
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
-        let snapshot = atspi::query_atspi_tree(self.pid, self.display.as_deref())?;
+        let snapshot = self.query_snapshot()?;
         Ok(snapshot.nodes)
     }
 
     fn current_url(&self) -> Result<Option<String>> {
-        let snapshot = atspi::query_atspi_tree(self.pid, self.display.as_deref())?;
+        let snapshot = self.query_snapshot()?;
         Ok(snapshot.current_url)
     }
 
     fn viewport_bounds(&self) -> Result<Option<Bounds>> {
-        let snapshot = atspi::query_atspi_tree(self.pid, self.display.as_deref())?;
+        let snapshot = self.query_snapshot()?;
         Ok(snapshot.viewport_bounds)
     }
 
