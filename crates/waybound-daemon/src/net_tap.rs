@@ -20,21 +20,18 @@ const MAX_BODY_BYTES: usize = 512 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_WAIT_MS: u64 = 120_000;
 
-/// Thread-safe store of passively decrypted HTTP responses.
+/// Thread-safe store of passively decrypted HTTP responses keyed by stream sequence ID.
 #[derive(Default)]
 pub struct ResponseStore {
-    responses: Mutex<VecDeque<CapturedResponse>>,
+    responses: Mutex<VecDeque<(u64, CapturedResponse)>>,
 }
 
 impl ResponseStore {
-    /// Inserts a new captured response or updates an existing response with the same URL
+    /// Inserts a new captured response or updates the exact same stream (`stream_seq`)
     /// when streaming `DATA` frames arrive after initial `HEADERS`.
-    pub fn upsert(&self, resp: CapturedResponse) {
+    pub fn upsert(&self, stream_seq: u64, resp: CapturedResponse) {
         if let Ok(mut guard) = self.responses.lock() {
-            if let Some(existing) = guard
-                .iter_mut()
-                .rev()
-                .find(|r| r.url == resp.url && r.status == resp.status)
+            if let Some((_, existing)) = guard.iter_mut().rev().find(|(seq, _)| *seq == stream_seq)
             {
                 if resp.body.is_some() {
                     existing.body = resp.body;
@@ -47,7 +44,7 @@ impl ResponseStore {
             if guard.len() >= MAX_CAPTURED_RESPONSES {
                 let _ = guard.pop_front();
             }
-            guard.push_back(resp);
+            guard.push_back((stream_seq, resp));
         }
     }
 
@@ -60,6 +57,7 @@ impl ResponseStore {
             |guard| {
                 guard
                     .iter()
+                    .map(|(_, r)| r)
                     .filter(|r| {
                         needle
                             .as_ref()
@@ -83,10 +81,10 @@ impl ResponseStore {
 
         loop {
             if let Ok(guard) = self.responses.lock()
-                && let Some(found) = guard
+                && let Some((_, found)) = guard
                     .iter()
                     .rev()
-                    .find(|r| r.url.to_lowercase().contains(&needle))
+                    .find(|(_, r)| r.url.to_lowercase().contains(&needle))
             {
                 return Ok(found.clone());
             }
@@ -116,6 +114,7 @@ impl Drop for PassiveTap {
 
 #[derive(Debug, Default)]
 struct PendingStream {
+    seq: u64,
     url: Option<String>,
     status: Option<u16>,
     content_type: Option<String>,
@@ -126,10 +125,16 @@ struct PendingStream {
 /// Stateful correlator turning `tshark -T fields` lines into [`CapturedResponse`] items.
 #[derive(Default)]
 struct StreamCorrelator {
+    next_seq: u64,
     streams: HashMap<String, PendingStream>,
 }
 
 impl StreamCorrelator {
+    const fn alloc_seq(&mut self) -> u64 {
+        self.next_seq += 1;
+        self.next_seq
+    }
+
     fn ingest_line(&mut self, line: &str, store: &ResponseStore) {
         let cols: Vec<&str> = line.split('\t').collect();
         if cols.len() < 15 {
@@ -172,11 +177,35 @@ impl StreamCorrelator {
             self.streams.clear();
         }
 
-        let entry = self.streams.entry(key).or_default();
+        if !self.streams.contains_key(&key) {
+            let seq = self.alloc_seq();
+            let _ = self.streams.insert(
+                key.clone(),
+                PendingStream {
+                    seq,
+                    ..PendingStream::default()
+                },
+            );
+        }
 
+        // On HTTP/1.1 keep-alive connections, a new request resets stream state with a fresh seq ID.
         if !h1_uri.is_empty() {
-            entry.url = Some(h1_uri.to_owned());
-        } else if !h2_auth.is_empty() || !h2_path.is_empty() {
+            let fresh_seq = self.alloc_seq();
+            if let Some(entry) = self.streams.get_mut(&key) {
+                entry.seq = fresh_seq;
+                entry.url = Some(h1_uri.to_owned());
+                entry.status = None;
+                entry.content_type = None;
+                entry.body.clear();
+                entry.emitted = false;
+            }
+        }
+
+        let Some(entry) = self.streams.get_mut(&key) else {
+            return;
+        };
+
+        if !h2_auth.is_empty() || !h2_path.is_empty() {
             entry.url = Some(build_https_url(h2_auth, h2_path));
         } else if !h3_auth.is_empty() || !h3_path.is_empty() {
             entry.url = Some(build_https_url(h3_auth, h3_path));
@@ -192,26 +221,36 @@ impl StreamCorrelator {
             entry.content_type = Some(ct.to_owned());
         }
 
-        if let Some(hex) = body_hex
+        // Only collect payload bytes after response status headers are observed so POST/PUT
+        // request bodies are never mixed into response bodies.
+        let body_updated = if entry.status.is_some()
+            && let Some(hex) = body_hex
             && entry.body.len() < MAX_BODY_BYTES
         {
+            let before = entry.body.len();
             append_hex_bytes(hex, &mut entry.body, MAX_BODY_BYTES);
-        }
+            entry.body.len() > before
+        } else {
+            false
+        };
 
         if let (Some(url), Some(status)) = (&entry.url, entry.status)
-            && (!entry.emitted || body_hex.is_some())
+            && (!entry.emitted || body_updated)
         {
             let body = if entry.body.is_empty() {
                 None
             } else {
                 String::from_utf8(entry.body.clone()).ok()
             };
-            store.upsert(CapturedResponse {
-                url: url.clone(),
-                status,
-                content_type: entry.content_type.clone(),
-                body,
-            });
+            store.upsert(
+                entry.seq,
+                CapturedResponse {
+                    url: url.clone(),
+                    status,
+                    content_type: entry.content_type.clone(),
+                    body,
+                },
+            );
             entry.emitted = true;
         }
     }
@@ -231,14 +270,21 @@ fn build_https_url(authority: &str, path: &str) -> String {
     }
 }
 
+/// Streams hex nibbles directly into `out` with zero intermediate allocation,
+/// stopping immediately once `out.len() >= max_bytes`.
 fn append_hex_bytes(hex: &str, out: &mut Vec<u8>, max_bytes: usize) {
-    let clean: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
-    for pair in clean.chunks_exact(2) {
+    let mut pending_hi: Option<u8> = None;
+    for byte in hex.bytes() {
         if out.len() >= max_bytes {
             break;
         }
-        if let (Some(hi), Some(lo)) = (hex_nibble(pair[0]), hex_nibble(pair[1])) {
-            out.push((hi << 4) | lo);
+        let Some(nibble) = hex_nibble(byte) else {
+            continue;
+        };
+        if let Some(hi) = pending_hi.take() {
+            out.push((hi << 4) | nibble);
+        } else {
+            pending_hi = Some(nibble);
         }
     }
 }
@@ -278,7 +324,8 @@ fn default_interface() -> String {
 ///
 /// # Errors
 ///
-/// Returns [`WayboundError::BackendUnavailable`] if `tshark` is not installed or fails to spawn.
+/// Returns [`WayboundError::BackendUnavailable`] if `tshark` is not installed, fails to spawn,
+/// or exits immediately (for example due to missing BPF permissions).
 pub fn start_passive_tap(ssl_keylog: &Path, store: Arc<ResponseStore>) -> Result<PassiveTap> {
     let tshark = resolve_tshark_binary().ok_or_else(|| WayboundError::BackendUnavailable {
         backend: "net_tap".to_owned(),
@@ -364,6 +411,12 @@ pub fn start_passive_tap(ssl_keylog: &Path, store: Arc<ResponseStore>) -> Result
 
     // Give tshark a brief moment to open BPF before Chrome fires its initial TLS handshake.
     thread::sleep(Duration::from_millis(450));
+    if let Some(status) = child.try_wait().map_err(WayboundError::Io)? {
+        return Err(WayboundError::BackendUnavailable {
+            backend: "net_tap".to_owned(),
+            reason: format!("tshark exited immediately on interface {iface} with {status}"),
+        });
+    }
 
     tracing::info!(
         iface = %iface,
@@ -378,28 +431,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn correlator_joins_http2_request_and_response() {
+    fn correlator_ignores_post_request_body_and_keeps_distinct_streams() {
         let store = ResponseStore::default();
         let mut correlator = StreamCorrelator::default();
 
-        // Request packet: tcp.stream=3, http2.streamid=1, authority=api.example.com, path=/v1/fares
-        let req_line = "3\t\t1\t\t\t\t\t\tapi.example.com\t/v1/fares\t\t\t\t\t\t\t\t";
-        correlator.ingest_line(req_line, &store);
+        // Stream 1: POST request with body 'REQ' (524551) before response headers
+        correlator.ingest_line(
+            "3\t\t1\t\t\t\t\t\tapi.example.com\t/v1/fares\t\t\t\t\t\t\t524551\t",
+            &store,
+        );
         assert!(store.list(None).is_empty());
 
-        // Response packet: tcp.stream=3, http2.streamid=1, status=200, content-type=application/json, body='{"ok":true}'
-        let resp_line =
-            "3\t\t1\t\t\t200\t\t\t\t\t\t\t\tapplication/json\t\t\t7b226f6b223a747275657d\t";
-        correlator.ingest_line(resp_line, &store);
+        // Stream 1 response: 200 + '{"ok":true}'
+        correlator.ingest_line(
+            "3\t\t1\t\t\t200\t\t\t\t\t\t\t\tapplication/json\t\t\t7b226f6b223a747275657d\t",
+            &store,
+        );
+
+        // Stream 2 (different streamid=3) to the exact same URL + status 200
+        correlator.ingest_line(
+            "3\t\t3\t\t\t\t\t\tapi.example.com\t/v1/fares\t\t\t\t\t\t\t\t",
+            &store,
+        );
+        correlator.ingest_line(
+            "3\t\t3\t\t\t200\t\t\t\t\t\t\t\tapplication/json\t\t\t7b226e223a327d\t",
+            &store,
+        );
 
         let captured = store.list(Some("/v1/fares"));
-        assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].url, "https://api.example.com/v1/fares");
-        assert_eq!(captured[0].status, 200);
-        assert_eq!(
-            captured[0].content_type.as_deref(),
-            Some("application/json")
-        );
+        assert_eq!(captured.len(), 2);
         assert_eq!(captured[0].body.as_deref(), Some(r#"{"ok":true}"#));
+        assert_eq!(captured[1].body.as_deref(), Some(r#"{"n":2}"#));
+    }
+
+    #[test]
+    fn correlator_resets_http1_keepalive_requests() {
+        let store = ResponseStore::default();
+        let mut correlator = StreamCorrelator::default();
+
+        // Request 1 + Response 1 on tcp.stream=7
+        correlator.ingest_line(
+            "7\t\t\t\t\t\t\thttps://a.test/1\t\t\t\t\t\t\t\t\t\t",
+            &store,
+        );
+        correlator.ingest_line(
+            "7\t\t\t\t200\t\t\t\t\t\t\t\ttext/plain\t\t\t6f6e65\t\t",
+            &store,
+        );
+
+        // Request 2 on same keep-alive tcp.stream=7 with request body 'bad'
+        correlator.ingest_line(
+            "7\t\t\t\t\t\t\thttps://a.test/2\t\t\t\t\t\t\t\t626164\t\t",
+            &store,
+        );
+        correlator.ingest_line(
+            "7\t\t\t\t201\t\t\t\t\t\t\t\ttext/plain\t\t\t74776f\t\t",
+            &store,
+        );
+
+        let captured = store.list(None);
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].url, "https://a.test/1");
+        assert_eq!(captured[0].body.as_deref(), Some("one"));
+        assert_eq!(captured[1].url, "https://a.test/2");
+        assert_eq!(captured[1].status, 201);
+        assert_eq!(captured[1].body.as_deref(), Some("two"));
     }
 }

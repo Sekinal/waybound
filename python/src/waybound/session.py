@@ -148,10 +148,12 @@ class Session:
 
     def close(self) -> None:
         """Gracefully shut down the daemon (unwinding browser & socket guards) and clean up."""
+        shutdown_sent = False
         try:
             if self._transport is not None:
                 with contextlib.suppress(OSError, WayboundDaemonError):
                     self._transport.shutdown()
+                    shutdown_sent = True
                 with contextlib.suppress(OSError):
                     self._transport.close()
                 self._transport = None
@@ -161,9 +163,10 @@ class Session:
                     proc = self._proc
                     self._proc = None
                     if proc.poll() is None:
-                        try:
-                            proc.wait(timeout=2.0)
-                        except subprocess.TimeoutExpired:
+                        if shutdown_sent:
+                            with contextlib.suppress(subprocess.TimeoutExpired):
+                                proc.wait(timeout=2.0)
+                        if proc.poll() is None:
                             proc.terminate()
                             try:
                                 proc.wait(timeout=2.0)

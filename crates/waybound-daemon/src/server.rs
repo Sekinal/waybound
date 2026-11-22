@@ -377,7 +377,11 @@ pub fn serve_unix(
         }
     }
 
-    tracing::info!("shutdown requested; exiting accept loop cleanly");
+    tracing::info!("shutdown requested; draining active connections");
+    let drain_deadline = Instant::now() + Duration::from_millis(250);
+    while active_connections.load(Ordering::Acquire) > 0 && Instant::now() < drain_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
     Ok(())
 }
 

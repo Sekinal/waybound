@@ -1,7 +1,8 @@
 //! Unmodified official Google Chrome launcher with RAII process cleanup.
 //!
-//! Launches the stock browser binary with zero automation flags and no
-//! remote-debugging ports, optionally configuring a profile directory and
+//! Launches the stock browser binary with zero CDP/WebDriver automation flags
+//! (only `--force-renderer-accessibility` so the OS accessibility tree is
+//! eagerly populated), optionally configuring a profile directory and
 //! `SSLKEYLOGFILE` for passive wire-level TLS inspection.
 
 use std::env;

@@ -109,13 +109,17 @@ fn find_web_area(root: &OwnedCf) -> Option<OwnedCf> {
 
     let mut visited = 0;
     while let Some((elem, depth)) = stack.pop() {
-        if visited >= MAX_WEB_AREA_SEARCH || depth > 14 {
-            continue;
+        if visited >= MAX_WEB_AREA_SEARCH {
+            break;
         }
         visited += 1;
 
         if read_string_attr(&elem, "AXRole").as_deref() == Some("AXWebArea") {
             return Some(elem);
+        }
+
+        if depth >= 14 {
+            continue;
         }
 
         let Some(children) = copy_attr(&elem, "AXChildren") else {
@@ -129,13 +133,19 @@ fn find_web_area(root: &OwnedCf) -> Option<OwnedCf> {
             }
             let ax_type_id = AXUIElementGetTypeID();
             let count = CFArrayGetCount(children.as_ptr());
+            let mut pushed = 0usize;
+            let budget = MAX_WEB_AREA_SEARCH.saturating_sub(visited);
             for idx in (0..count).rev() {
+                if pushed >= budget {
+                    break;
+                }
                 let child_raw = CFArrayGetValueAtIndex(children.as_ptr(), idx);
                 if !child_raw.is_null()
                     && CFGetTypeID(child_raw) == ax_type_id
                     && let Some(child) = OwnedCf::retain(child_raw)
                 {
                     stack.push((child, depth + 1));
+                    pushed += 1;
                 }
             }
         }
