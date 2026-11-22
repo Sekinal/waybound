@@ -116,6 +116,51 @@ pub struct AccessibilityNode {
     pub bounds: Bounds,
     /// Whether the node is currently focused.
     pub focused: bool,
+    /// Checked state of a checkbox, radio button, switch, or checkable menu item.
+    ///
+    /// `None` when the concept does not apply to the node (buttons, links, text, ...).
+    /// A mixed / indeterminate tri-state checkbox is reported as `Some(false)`: it is not
+    /// fully checked, so `is_checked()` is `false` and `check()` clicks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
+    /// Whether the node is disabled (not enabled / not sensitive) and ignores input.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
+    /// Expanded state of an expandable node (combobox, disclosure, tree item, menu button).
+    ///
+    /// `None` when the node cannot be expanded or collapsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded: Option<bool>,
+}
+
+// `skip_serializing_if` passes the field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl AccessibilityNode {
+    /// Creates a node with no checked/expanded state, enabled, and not focused.
+    #[must_use]
+    pub const fn new(
+        id: String,
+        role: Role,
+        name: Option<String>,
+        value: Option<String>,
+        bounds: Bounds,
+    ) -> Self {
+        Self {
+            id,
+            role,
+            name,
+            value,
+            bounds,
+            focused: false,
+            checked: None,
+            disabled: false,
+            expanded: None,
+        }
+    }
 }
 
 /// Query used to resolve a semantic element in the accessibility tree.
@@ -258,6 +303,9 @@ mod tests {
                 height: 30.0,
             },
             focused: false,
+            checked: None,
+            disabled: false,
+            expanded: None,
         };
 
         let query = LocatorQuery::by_role(Role::Button, Some("search".to_owned()));
@@ -282,6 +330,9 @@ mod tests {
                     height: 30.0,
                 },
                 focused: false,
+                checked: None,
+                disabled: false,
+                expanded: None,
             },
             AccessibilityNode {
                 id: "settings-dialog".to_owned(),
@@ -295,6 +346,9 @@ mod tests {
                     height: 300.0,
                 },
                 focused: false,
+                checked: None,
+                disabled: false,
+                expanded: None,
             },
             AccessibilityNode {
                 id: "dialog-save".to_owned(),
@@ -308,6 +362,9 @@ mod tests {
                     height: 30.0,
                 },
                 focused: false,
+                checked: None,
+                disabled: false,
+                expanded: None,
             },
         ];
 
@@ -333,5 +390,66 @@ mod tests {
             ..query
         };
         assert_eq!(missing_parent.resolve_all(&nodes).len(), 0);
+    }
+
+    #[test]
+    fn node_without_state_fields_deserialises_with_defaults() {
+        let legacy = r#"{"id":"n","role":"button","name":"Go","value":null,
+            "bounds":{"x":0.0,"y":0.0,"width":1.0,"height":1.0},"focused":true}"#;
+        let parsed: Result<AccessibilityNode, _> = serde_json::from_str(legacy);
+        assert!(parsed.is_ok());
+        if let Ok(node) = parsed {
+            assert_eq!(node.checked, None);
+            assert!(!node.disabled);
+            assert_eq!(node.expanded, None);
+            assert!(node.focused);
+        }
+    }
+
+    #[test]
+    fn default_state_fields_are_not_serialised() {
+        let node = AccessibilityNode::new(
+            "n".to_owned(),
+            Role::Button,
+            None,
+            None,
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        let json = serde_json::to_string(&node).unwrap_or_default();
+        assert!(!json.contains("checked"));
+        assert!(!json.contains("disabled"));
+        assert!(!json.contains("expanded"));
+    }
+
+    #[test]
+    fn state_fields_round_trip() {
+        let node = AccessibilityNode {
+            checked: Some(true),
+            disabled: true,
+            expanded: Some(false),
+            ..AccessibilityNode::new(
+                "cb".to_owned(),
+                Role::CheckBox,
+                Some("Agree".to_owned()),
+                None,
+                Bounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+            )
+        };
+        let json = serde_json::to_string(&node).unwrap_or_default();
+        assert!(json.contains(r#""checked":true"#));
+        assert!(json.contains(r#""disabled":true"#));
+        assert!(json.contains(r#""expanded":false"#));
+        let back: Result<AccessibilityNode, _> = serde_json::from_str(&json);
+        assert!(matches!(back, Ok(ref parsed) if *parsed == node));
     }
 }

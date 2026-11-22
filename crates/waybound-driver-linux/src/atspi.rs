@@ -48,6 +48,95 @@ pub fn map_atspi_role(role: &str) -> Role {
     }
 }
 
+/// `ATSPI_STATE_CHECKED`.
+const STATE_CHECKED: u32 = 4;
+/// `ATSPI_STATE_ENABLED`.
+const STATE_ENABLED: u32 = 8;
+/// `ATSPI_STATE_EXPANDABLE`.
+const STATE_EXPANDABLE: u32 = 9;
+/// `ATSPI_STATE_EXPANDED`.
+const STATE_EXPANDED: u32 = 10;
+/// `ATSPI_STATE_FOCUSED` (`ATSPI_STATE_FOCUSABLE` is 11).
+const STATE_FOCUSED: u32 = 12;
+/// `ATSPI_STATE_PRESSED` (toggle buttons report `aria-pressed` here).
+const STATE_PRESSED: u32 = 20;
+/// `ATSPI_STATE_SENSITIVE`.
+const STATE_SENSITIVE: u32 = 24;
+/// `ATSPI_STATE_INDETERMINATE` (mixed tri-state checkbox).
+const STATE_INDETERMINATE: u32 = 32;
+/// `ATSPI_STATE_CHECKABLE`.
+const STATE_CHECKABLE: u32 = 41;
+
+/// Node states decoded from one AT-SPI2 `GetState` reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AtspiStates {
+    /// `FOCUSED`.
+    pub focused: bool,
+    /// See [`AccessibilityNode::checked`]; mixed (`INDETERMINATE`) maps to `Some(false)`.
+    pub checked: Option<bool>,
+    /// Neither `ENABLED` nor `SENSITIVE` is set on a control.
+    pub disabled: bool,
+    /// `Some(EXPANDED)` when `EXPANDABLE` (or `EXPANDED`) is set, else `None`.
+    pub expanded: Option<bool>,
+}
+
+fn has_state(words: &[u32], state: u32) -> bool {
+    let word = usize::try_from(state / 32).unwrap_or(usize::MAX);
+    words
+        .get(word)
+        .is_some_and(|w| (w >> (state % 32)) & 1 == 1)
+}
+
+/// Roles for which checked / disabled / expanded states are reported.
+const fn is_control(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Button
+            | Role::Link
+            | Role::TextBox
+            | Role::SearchBox
+            | Role::CheckBox
+            | Role::Radio
+            | Role::Switch
+            | Role::ComboBox
+            | Role::ListBox
+            | Role::Option
+            | Role::Tab
+            | Role::MenuItem
+            | Role::ListItem
+    )
+}
+
+/// Decodes an AT-SPI2 state set (the `au` array of 32-bit words from
+/// `org.a11y.atspi.Accessible.GetState`) for a node with the given `role`.
+///
+/// `checked` is reported for nodes that are `CHECKABLE` or have a checkbox / radio / switch
+/// role; a mixed checkbox (`INDETERMINATE`) is `Some(false)`. `disabled` is only reported
+/// for controls, and only when both `ENABLED` and `SENSITIVE` are missing, so a node that
+/// merely omits one of them is never refused.
+#[must_use]
+pub fn decode_atspi_states(words: &[u32], role: Role) -> AtspiStates {
+    let checkable = has_state(words, STATE_CHECKABLE)
+        || matches!(role, Role::CheckBox | Role::Radio | Role::Switch);
+    let checked = checkable.then(|| {
+        let on = has_state(words, STATE_CHECKED)
+            || (role == Role::Switch && has_state(words, STATE_PRESSED));
+        on && !has_state(words, STATE_INDETERMINATE)
+    });
+    let control = is_control(role);
+    let disabled =
+        control && !has_state(words, STATE_ENABLED) && !has_state(words, STATE_SENSITIVE);
+    let expanded = (control
+        && (has_state(words, STATE_EXPANDABLE) || has_state(words, STATE_EXPANDED)))
+    .then(|| has_state(words, STATE_EXPANDED));
+    AtspiStates {
+        focused: has_state(words, STATE_FOCUSED),
+        checked,
+        disabled,
+        expanded,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawAtspiSnapshot {
     #[serde(default)]
@@ -69,6 +158,9 @@ struct RawAtspiNode {
     bounds: Bounds,
     #[serde(default)]
     focused: bool,
+    /// Raw AT-SPI2 state-set words; when present they override `focused`.
+    #[serde(default)]
+    states: Option<Vec<u32>>,
 }
 
 const fn is_valid_bounds(bounds: &Bounds) -> bool {
@@ -114,13 +206,24 @@ pub fn parse_atspi_snapshot_json(raw: &str) -> Result<AtspiSnapshot> {
         if !is_valid_bounds(&raw_node.bounds) {
             continue;
         }
+        let role = map_atspi_role(&raw_node.role);
+        let states = raw_node.states.as_deref().map_or_else(
+            || AtspiStates {
+                focused: raw_node.focused,
+                ..AtspiStates::default()
+            },
+            |words| decode_atspi_states(words, role),
+        );
         nodes.push(AccessibilityNode {
             id: raw_node.id,
-            role: map_atspi_role(&raw_node.role),
+            role,
             name: clean_optional_string(raw_node.name),
             value: clean_optional_string(raw_node.value),
             bounds: raw_node.bounds,
-            focused: raw_node.focused,
+            focused: states.focused,
+            checked: states.checked,
+            disabled: states.disabled,
+            expanded: states.expanded,
         });
     }
 
@@ -303,12 +406,19 @@ while queue and len(nodes) < MAX_NODES:
         pass
 
     focused = False
+    state_words = None
     try:
         states = acc.get_state_set()
         if states is not None:
             focused = bool(states.contains(Atspi.StateType.FOCUSED))
+            state_words = [0, 0]
+            for st in states.get_states():
+                bit = int(st)
+                if 0 <= bit < 64:
+                    state_words[bit // 32] |= 1 << (bit % 32)
     except Exception:
         focused = False
+        state_words = None
 
     if role_name in ("document web", "document frame"):
         if viewport_bounds is None and bw > 0.0 and bh > 0.0:
@@ -333,6 +443,7 @@ while queue and len(nodes) < MAX_NODES:
         "value": value if value else None,
         "bounds": {"x": bx, "y": by, "width": bw, "height": bh},
         "focused": focused,
+        "states": state_words,
     })
 
     try:
@@ -520,6 +631,105 @@ mod tests {
         assert_eq!(snap.nodes[0].id, "n-0");
         assert_eq!(snap.current_url, None);
         assert_eq!(snap.viewport_bounds, None);
+        Ok(())
+    }
+
+    fn words(states: &[u32]) -> Vec<u32> {
+        let mut out = vec![0u32, 0u32];
+        for &s in states {
+            if let Some(w) = out.get_mut(usize::try_from(s / 32).unwrap_or(usize::MAX)) {
+                *w |= 1 << (s % 32);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn decodes_checked_mixed_disabled_and_expanded_state_bits() {
+        let enabled = [STATE_ENABLED, STATE_SENSITIVE];
+
+        let unchecked = decode_atspi_states(&words(&enabled), Role::CheckBox);
+        assert_eq!(unchecked.checked, Some(false));
+        assert!(!unchecked.disabled);
+        assert_eq!(unchecked.expanded, None);
+
+        let checked = decode_atspi_states(
+            &words(&[STATE_ENABLED, STATE_SENSITIVE, STATE_CHECKED, STATE_FOCUSED]),
+            Role::CheckBox,
+        );
+        assert_eq!(checked.checked, Some(true));
+        assert!(checked.focused);
+
+        let mixed = decode_atspi_states(
+            &words(&[
+                STATE_ENABLED,
+                STATE_SENSITIVE,
+                STATE_CHECKED,
+                STATE_INDETERMINATE,
+            ]),
+            Role::CheckBox,
+        );
+        assert_eq!(mixed.checked, Some(false));
+
+        let disabled = decode_atspi_states(&words(&[STATE_CHECKED]), Role::Radio);
+        assert_eq!(disabled.checked, Some(true));
+        assert!(disabled.disabled);
+
+        let menu_checkbox = decode_atspi_states(
+            &words(&[STATE_ENABLED, STATE_CHECKABLE, STATE_CHECKED]),
+            Role::MenuItem,
+        );
+        assert_eq!(menu_checkbox.checked, Some(true));
+
+        let pressed_toggle =
+            decode_atspi_states(&words(&[STATE_ENABLED, STATE_PRESSED]), Role::Switch);
+        assert_eq!(pressed_toggle.checked, Some(true));
+
+        let button = decode_atspi_states(&words(&[STATE_ENABLED, STATE_SENSITIVE]), Role::Button);
+        assert_eq!(button.checked, None);
+        assert_eq!(button.expanded, None);
+
+        let collapsed = decode_atspi_states(
+            &words(&[STATE_ENABLED, STATE_SENSITIVE, STATE_EXPANDABLE]),
+            Role::ComboBox,
+        );
+        assert_eq!(collapsed.expanded, Some(false));
+        let expanded = decode_atspi_states(
+            &words(&[STATE_ENABLED, STATE_EXPANDABLE, STATE_EXPANDED]),
+            Role::Button,
+        );
+        assert_eq!(expanded.expanded, Some(true));
+
+        // FOCUSABLE (11) alone is not FOCUSED (12).
+        assert!(!decode_atspi_states(&words(&[11]), Role::Button).focused);
+        // Static text is never reported disabled, even without ENABLED / SENSITIVE.
+        assert!(!decode_atspi_states(&[], Role::StaticText).disabled);
+        // A short (or empty) state word array is tolerated.
+        assert_eq!(
+            decode_atspi_states(&[], Role::CheckBox).checked,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn snapshot_json_states_populate_node_fields() -> Result<()> {
+        let raw = format!(
+            r#"{{"nodes":[
+                {{"id":"a","role":"check box","name":"Agree",
+                  "bounds":{{"x":0,"y":0,"width":10,"height":10}},"focused":false,
+                  "states":[{}, 0]}},
+                {{"id":"b","role":"push button","name":"Legacy",
+                  "bounds":{{"x":0,"y":0,"width":10,"height":10}},"focused":true}}
+            ]}}"#,
+            (1u32 << STATE_CHECKED) | (1u32 << STATE_ENABLED)
+        );
+        let snap = parse_atspi_snapshot_json(&raw)?;
+        assert_eq!(snap.nodes[0].checked, Some(true));
+        assert!(!snap.nodes[0].disabled);
+        // Without `states`, the legacy `focused` flag is kept and the rest default.
+        assert!(snap.nodes[1].focused);
+        assert_eq!(snap.nodes[1].checked, None);
+        assert!(!snap.nodes[1].disabled);
         Ok(())
     }
 

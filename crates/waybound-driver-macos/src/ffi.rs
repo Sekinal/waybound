@@ -286,6 +286,26 @@ pub fn cf_to_bool(obj: &OwnedCf) -> Option<bool> {
     }
 }
 
+/// Converts an owned `CFTypeRef` to `i64` if its runtime type is `CFNumber`.
+#[must_use]
+pub fn cf_to_i64(obj: &OwnedCf) -> Option<i64> {
+    let raw = obj.as_ptr();
+    // SAFETY: `obj` guarantees `raw` is a live CoreFoundation object; the type ID check
+    // verifies `CFNumber` before `CFNumberGetValue` writes one `i64` into `out`.
+    unsafe {
+        if CFGetTypeID(raw) != CFNumberGetTypeID() {
+            return None;
+        }
+        let mut out = 0i64;
+        let ok = CFNumberGetValue(
+            raw,
+            K_CF_NUMBER_SINT64_TYPE,
+            (&raw mut out).cast::<c_void>(),
+        );
+        (ok != 0).then_some(out)
+    }
+}
+
 /// Extracts a URL string from an owned `CFURL` or `CFString` object.
 #[must_use]
 pub fn cf_to_url_string(obj: &OwnedCf) -> Option<String> {

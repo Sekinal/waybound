@@ -5,7 +5,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use waybound_core::{
-    AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Result, Role, WayboundError,
+    AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, MouseButton, Point, Result, Role,
+    WayboundError,
 };
 
 /// Minimal valid 1x1 transparent PNG bytes for hermetic screenshot tests.
@@ -18,44 +19,78 @@ const ONE_BY_ONE_PNG: &[u8] = &[
 ];
 
 /// In-memory driver exposing a deterministic accessibility tree and recording input events.
+///
+/// Left clicks landing on an enabled node with a checked state toggle that state, so
+/// `check()` / `uncheck()` can be exercised end to end.
 pub struct MockDriver {
-    nodes: Vec<AccessibilityNode>,
+    nodes: Mutex<Vec<AccessibilityNode>>,
+    pointer: Mutex<Option<Point>>,
     events: Mutex<Vec<InputEvent>>,
+}
+
+const fn bounds(x: f64, y: f64, width: f64, height: f64) -> Bounds {
+    Bounds {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 impl MockDriver {
     /// Creates a `MockDriver` populated with a sample search page tree.
     #[must_use]
     pub fn sample_page() -> Self {
+        let nodes = vec![
+            AccessibilityNode::new(
+                "input-origin".to_owned(),
+                Role::TextBox,
+                Some("Origin".to_owned()),
+                Some(String::new()),
+                bounds(100.0, 120.0, 240.0, 36.0),
+            ),
+            AccessibilityNode::new(
+                "btn-search".to_owned(),
+                Role::Button,
+                Some("Search Flights".to_owned()),
+                None,
+                bounds(360.0, 120.0, 140.0, 36.0),
+            ),
+            AccessibilityNode {
+                checked: Some(false),
+                ..AccessibilityNode::new(
+                    "chk-nonstop".to_owned(),
+                    Role::CheckBox,
+                    Some("Nonstop only".to_owned()),
+                    None,
+                    bounds(100.0, 180.0, 20.0, 20.0),
+                )
+            },
+            AccessibilityNode {
+                checked: Some(true),
+                disabled: true,
+                ..AccessibilityNode::new(
+                    "chk-insurance".to_owned(),
+                    Role::CheckBox,
+                    Some("Travel insurance".to_owned()),
+                    None,
+                    bounds(100.0, 220.0, 20.0, 20.0),
+                )
+            },
+            AccessibilityNode {
+                expanded: Some(false),
+                ..AccessibilityNode::new(
+                    "combo-cabin".to_owned(),
+                    Role::ComboBox,
+                    Some("Cabin".to_owned()),
+                    Some("Economy".to_owned()),
+                    bounds(360.0, 180.0, 140.0, 36.0),
+                )
+            },
+        ];
         Self {
-            nodes: vec![
-                AccessibilityNode {
-                    id: "input-origin".to_owned(),
-                    role: Role::TextBox,
-                    name: Some("Origin".to_owned()),
-                    value: Some(String::new()),
-                    bounds: Bounds {
-                        x: 100.0,
-                        y: 120.0,
-                        width: 240.0,
-                        height: 36.0,
-                    },
-                    focused: false,
-                },
-                AccessibilityNode {
-                    id: "btn-search".to_owned(),
-                    role: Role::Button,
-                    name: Some("Search Flights".to_owned()),
-                    value: None,
-                    bounds: Bounds {
-                        x: 360.0,
-                        y: 120.0,
-                        width: 140.0,
-                        height: 36.0,
-                    },
-                    focused: false,
-                },
-            ],
+            nodes: Mutex::new(nodes),
+            pointer: Mutex::new(None),
             events: Mutex::new(Vec::new()),
         }
     }
@@ -67,6 +102,21 @@ impl MockDriver {
             .lock()
             .map_or_else(|_| Vec::new(), |g| g.clone())
     }
+
+    /// Toggles the checked state of the enabled checkable node under `at`, if any.
+    fn toggle_at(&self, at: Point) {
+        let Ok(mut nodes) = self.nodes.lock() else {
+            return;
+        };
+        let probe = bounds(at.x, at.y, 0.0, 0.0);
+        if let Some(node) = nodes
+            .iter_mut()
+            .find(|n| n.checked.is_some() && n.bounds.contains_center(&probe))
+            && !node.disabled
+        {
+            node.checked = node.checked.map(|c| !c);
+        }
+    }
 }
 
 impl Driver for MockDriver {
@@ -75,7 +125,7 @@ impl Driver for MockDriver {
     }
 
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
-        Ok(self.nodes.clone())
+        Ok(self.nodes.lock().map_or_else(|_| Vec::new(), |g| g.clone()))
     }
 
     fn current_url(&self) -> Result<Option<String>> {
@@ -87,6 +137,23 @@ impl Driver for MockDriver {
     }
 
     fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
+        match event {
+            InputEvent::PointerMove { to } => {
+                if let Ok(mut guard) = self.pointer.lock() {
+                    *guard = Some(*to);
+                }
+            }
+            InputEvent::MouseClick {
+                button: MouseButton::Left,
+                ..
+            } => {
+                let at = self.pointer.lock().map_or(None, |g| *g);
+                if let Some(point) = at {
+                    self.toggle_at(point);
+                }
+            }
+            _ => {}
+        }
         if let Ok(mut guard) = self.events.lock() {
             guard.push(event.clone());
         }

@@ -86,6 +86,8 @@ fn strip_node_tag_prefix(tag_inner: &str) -> Option<&str> {
 }
 
 /// Raw attributes extracted from a single `<node ...>` element.
+// Mirrors the independent boolean attributes of a `uiautomator` node one to one.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct RawNodeAttrs<'a> {
     class_name: &'a str,
@@ -95,6 +97,10 @@ struct RawNodeAttrs<'a> {
     bounds: &'a str,
     clickable: bool,
     focused: bool,
+    checkable: bool,
+    checked: bool,
+    /// `enabled="false"` seen; a missing attribute means enabled.
+    disabled: bool,
 }
 
 fn parse_node_attributes(attrs: &str, index: usize) -> Option<AccessibilityNode> {
@@ -129,6 +135,11 @@ fn parse_node_attributes(attrs: &str, index: usize) -> Option<AccessibilityNode>
         value,
         bounds,
         focused: raw.focused,
+        // `uiautomator` has no tri-state: `checked` is only meaningful when `checkable`.
+        checked: raw.checkable.then_some(raw.checked),
+        disabled: raw.disabled,
+        // `uiautomator dump` does not expose an expanded/collapsed state.
+        expanded: None,
     })
 }
 
@@ -234,6 +245,9 @@ fn scan_attributes(attrs: &str) -> RawNodeAttrs<'_> {
             "bounds" => raw.bounds = attr_val,
             "clickable" => raw.clickable = attr_val == "true",
             "focused" => raw.focused = attr_val == "true",
+            "checkable" => raw.checkable = attr_val == "true",
+            "checked" => raw.checked = attr_val == "true",
+            "enabled" => raw.disabled = attr_val == "false",
             _ => {}
         }
     }
@@ -456,6 +470,31 @@ mod tests {
             assert_eq!(node.role, Role::Button);
             assert_eq!(node.name.as_deref(), Some("Continue > Next"));
         }
+    }
+
+    #[test]
+    fn parses_checkable_checked_and_enabled_states() {
+        let xml = r#"<hierarchy>
+  <node text="Nonstop" class="android.widget.CheckBox" checkable="true" checked="true" enabled="true" clickable="true" bounds="[0,0][10,10]" />
+  <node text="Insurance" class="android.widget.CheckBox" checkable="true" checked="false" enabled="false" clickable="true" bounds="[0,20][10,30]" />
+  <node text="Go" class="android.widget.Button" checkable="false" checked="false" enabled="true" clickable="true" bounds="[0,40][10,50]" />
+  <node text="Legacy" class="android.widget.Button" clickable="true" bounds="[0,60][10,70]" />
+</hierarchy>"#;
+        let nodes = parse_uiautomator_xml(xml);
+        assert_eq!(nodes.len(), 4);
+        let states: Vec<(Option<bool>, bool, Option<bool>)> = nodes
+            .iter()
+            .map(|n| (n.checked, n.disabled, n.expanded))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                (Some(true), false, None),
+                (Some(false), true, None),
+                (None, false, None),
+                (None, false, None),
+            ]
+        );
     }
 
     #[test]

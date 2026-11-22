@@ -131,6 +131,18 @@ pub enum Request {
     },
     /// Request a graceful daemon shutdown (unwinds RAII browser & socket guards).
     Shutdown,
+    /// Idempotently drive a checkbox / radio / switch to `checked`.
+    ///
+    /// Auto-waits for the element like `click`, refuses disabled elements and elements
+    /// without a checked state, clicks only when the current state differs, then re-reads
+    /// the node and fails if the state did not change. Answered with [`Response::Node`]
+    /// carrying the node as re-read after the action.
+    SetChecked {
+        /// Semantic locator query.
+        query: LocatorQuery,
+        /// Desired checked state (`true` for `check()`, `false` for `uncheck()`).
+        checked: bool,
+    },
 }
 
 /// Wire-level response returned by `waybound-daemon`.
@@ -187,6 +199,8 @@ impl From<&WayboundError> for Response {
             WayboundError::Io(_) => "io_error",
             WayboundError::Transient { .. } => "transient",
             WayboundError::UnsupportedInput { .. } => "unsupported_input",
+            WayboundError::ElementDisabled { .. } => "element_disabled",
+            WayboundError::InvalidElementState { .. } => "invalid_element_state",
         };
         Self::Error {
             code: code.to_owned(),
@@ -258,5 +272,29 @@ mod tests {
             Response::from(&unsupported),
             Response::Error { code, .. } if code == "unsupported_input"
         ));
+    }
+
+    #[test]
+    fn set_checked_request_uses_snake_case_method() {
+        let raw = r#"{"method":"set_checked","query":{"role":"check_box","name":"Agree","exact":false},"checked":true}"#;
+        let decoded: Result<Request, _> = serde_json::from_str(raw);
+        assert!(matches!(
+            decoded,
+            Ok(Request::SetChecked { checked: true, .. })
+        ));
+    }
+
+    #[test]
+    fn state_errors_map_to_stable_codes() {
+        let disabled = Response::from(&WayboundError::ElementDisabled {
+            query: "q".to_owned(),
+        });
+        assert!(matches!(disabled, Response::Error { ref code, .. } if code == "element_disabled"));
+        let invalid = Response::from(&WayboundError::InvalidElementState {
+            detail: "d".to_owned(),
+        });
+        assert!(
+            matches!(invalid, Response::Error { ref code, .. } if code == "invalid_element_state")
+        );
     }
 }

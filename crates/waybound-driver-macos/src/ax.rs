@@ -12,7 +12,7 @@ use crate::ffi::{
     AXUIElementGetTypeID, AXUIElementSetAttributeValue, AXValueGetTypeID, AXValueGetValue,
     CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFGetTypeID, CgPoint, CgSize,
     K_AX_ERROR_SUCCESS, K_AX_VALUE_TYPE_CG_POINT, K_AX_VALUE_TYPE_CG_SIZE, OwnedCf, cf_string,
-    cf_to_bool, cf_to_string, cf_to_url_string, kCFBooleanTrue,
+    cf_to_bool, cf_to_i64, cf_to_string, cf_to_url_string, kCFBooleanTrue,
 };
 
 const MAX_DEPTH: usize = 40;
@@ -356,6 +356,49 @@ fn accessible_name(role: Role, name: Option<String>, value: Option<&str>) -> Opt
     name
 }
 
+/// Maps a checkable role's raw `AXValue` to the node's checked state.
+///
+/// `AXCheckBox`, `AXRadioButton`, and switches report `0` (off), `1` (on), or `2` (mixed).
+/// Mixed is reported as `Some(false)` (not fully checked). Non-checkable roles, and values
+/// that are missing or out of range, yield `None`.
+fn checked_from_ax_value(role: Role, raw: Option<i64>) -> Option<bool> {
+    if !matches!(role, Role::CheckBox | Role::Radio | Role::Switch) {
+        return None;
+    }
+    match raw? {
+        1 => Some(true),
+        0 | 2 => Some(false),
+        _ => None,
+    }
+}
+
+/// Roles that are actionable controls, for which `AXEnabled` / `AXExpanded` are read.
+///
+/// Limiting these extra AX round trips to controls keeps snapshots of large pages fast;
+/// static text, headings, and containers report neither state.
+const fn is_control(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Button
+            | Role::Link
+            | Role::TextBox
+            | Role::SearchBox
+            | Role::CheckBox
+            | Role::Radio
+            | Role::Switch
+            | Role::ComboBox
+            | Role::ListBox
+            | Role::Option
+            | Role::Tab
+            | Role::MenuItem
+            | Role::ListItem
+    )
+}
+
+fn read_bool_attr(element: &OwnedCf, attr_name: &str) -> Option<bool> {
+    copy_attr(element, attr_name).and_then(|v| cf_to_bool(&v))
+}
+
 fn walk_node(
     element: &OwnedCf,
     depth: usize,
@@ -387,6 +430,23 @@ fn walk_node(
     let bounds = read_bounds(element);
 
     if role != Role::Unknown || name.is_some() {
+        // Checkable controls expose their state as a `CFNumber` `AXValue` (a `CFBoolean` on
+        // some native switches), which `read_string_attr` above skips.
+        let checked = if matches!(role, Role::CheckBox | Role::Radio | Role::Switch) {
+            let raw = copy_attr(element, "AXValue")
+                .and_then(|v| cf_to_i64(&v).or_else(|| cf_to_bool(&v).map(i64::from)));
+            checked_from_ax_value(role, raw)
+        } else {
+            None
+        };
+        let (disabled, expanded) = if is_control(role) {
+            (
+                read_bool_attr(element, "AXEnabled") == Some(false),
+                read_bool_attr(element, "AXExpanded"),
+            )
+        } else {
+            (false, None)
+        };
         let id = format!("ax-{}", out.len());
         out.push(AccessibilityNode {
             id,
@@ -395,6 +455,9 @@ fn walk_node(
             value,
             bounds,
             focused,
+            checked,
+            disabled,
+            expanded,
         });
     }
 
@@ -451,5 +514,18 @@ mod tests {
         );
         // Other roles keep value and name separate (a text box's value is user input).
         assert_eq!(accessible_name(Role::TextBox, None, Some("typed")), None);
+    }
+
+    #[test]
+    fn ax_value_maps_to_checked_state_for_checkable_roles_only() {
+        assert_eq!(checked_from_ax_value(Role::CheckBox, Some(0)), Some(false));
+        assert_eq!(checked_from_ax_value(Role::CheckBox, Some(1)), Some(true));
+        // Mixed / indeterminate is "not fully checked".
+        assert_eq!(checked_from_ax_value(Role::CheckBox, Some(2)), Some(false));
+        assert_eq!(checked_from_ax_value(Role::Radio, Some(1)), Some(true));
+        assert_eq!(checked_from_ax_value(Role::Switch, Some(0)), Some(false));
+        assert_eq!(checked_from_ax_value(Role::CheckBox, Some(7)), None);
+        assert_eq!(checked_from_ax_value(Role::CheckBox, None), None);
+        assert_eq!(checked_from_ax_value(Role::Button, Some(1)), None);
     }
 }

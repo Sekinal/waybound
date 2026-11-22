@@ -58,6 +58,21 @@ pub enum WayboundError {
         /// Which part of the input cannot be delivered, and why.
         reason: String,
     },
+
+    /// The matched element is disabled, so the requested action was refused.
+    #[error("element is disabled: {query}")]
+    ElementDisabled {
+        /// Human-readable representation of the locator query.
+        query: String,
+    },
+
+    /// The matched element does not support, or did not reach, the requested state
+    /// (for example `check()` on a node without a checked state).
+    #[error("invalid element state: {detail}")]
+    InvalidElementState {
+        /// Explanation of the mismatch, including the locator query.
+        detail: String,
+    },
 }
 
 impl WayboundError {

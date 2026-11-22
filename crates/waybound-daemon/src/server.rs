@@ -237,6 +237,12 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             state.shutdown.store(true, Ordering::Release);
             Response::Ok
         }
+        Request::SetChecked { query, checked } => {
+            match set_checked_element(driver, state, &query, checked) {
+                Ok(node) => Response::Node { node },
+                Err(err) => Response::from(&err),
+            }
+        }
     }
 }
 
@@ -651,6 +657,66 @@ fn navigate_url(driver: &dyn Driver, url: &str) -> Result<()> {
         modifiers: Vec::new(),
         hold_ms: 0,
     })
+}
+
+/// How long `set_checked` waits for the accessibility tree to reflect a toggle click.
+const CHECK_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Returns the node's current checked state, refusing disabled and non-checkable nodes.
+fn checked_state(node: &waybound_core::AccessibilityNode, query: &LocatorQuery) -> Result<bool> {
+    let Some(current) = node.checked else {
+        return Err(WayboundError::InvalidElementState {
+            detail: format!(
+                "element {:?} (role {:?}) matched {query:?} but has no checked state",
+                node.name, node.role
+            ),
+        });
+    };
+    Ok(current)
+}
+
+/// Idempotently drives a checkbox / radio / switch to `desired` (Playwright `setChecked`).
+///
+/// Reads the state first and returns without input when it already matches, so a disabled
+/// element that is already in the desired state is not an error. Otherwise the element must
+/// be enabled; it is clicked once and re-read until the state flips or
+/// [`CHECK_SETTLE_TIMEOUT`] elapses.
+fn set_checked_element(
+    driver: &dyn Driver,
+    state: &SessionState,
+    query: &LocatorQuery,
+    desired: bool,
+) -> Result<waybound_core::AccessibilityNode> {
+    let node = locate_with_auto_wait(driver, query)?;
+    if checked_state(&node, query)? == desired {
+        return Ok(node);
+    }
+    if node.disabled {
+        return Err(WayboundError::ElementDisabled {
+            query: format!("refusing to toggle disabled element matched by {query:?}"),
+        });
+    }
+
+    click_element(driver, state, query)?;
+
+    let deadline = Instant::now() + CHECK_SETTLE_TIMEOUT;
+    loop {
+        let after = driver.locate(query)?;
+        let now = checked_state(&after, query)?;
+        if now == desired {
+            return Ok(after);
+        }
+        if Instant::now() >= deadline {
+            return Err(WayboundError::InvalidElementState {
+                detail: format!(
+                    "clicking element matched by {query:?} did not set checked={desired} \
+                     (still checked={now} after {}ms)",
+                    CHECK_SETTLE_TIMEOUT.as_millis()
+                ),
+            });
+        }
+        thread::sleep(ACTION_POLL_INTERVAL);
+    }
 }
 
 #[cfg(unix)]
@@ -1219,5 +1285,99 @@ mod tests {
             Err(WayboundError::BackendUnavailable { .. })
         ));
         assert_eq!(key_events(&driver.0), Vec::new());
+    }
+
+    fn mouse_clicks(driver: &MockDriver) -> usize {
+        driver
+            .recorded_events()
+            .iter()
+            .filter(|event| matches!(event, InputEvent::MouseClick { .. }))
+            .count()
+    }
+
+    fn checkbox(name: &str) -> LocatorQuery {
+        LocatorQuery::by_role(Role::CheckBox, Some(name.to_owned()))
+    }
+
+    #[test]
+    fn set_checked_clicks_once_then_is_idempotent() {
+        let driver = MockDriver::sample_page();
+        let st = state();
+        let query = checkbox("Nonstop");
+
+        let checked = set_checked_element(&driver, &st, &query, true);
+        assert!(matches!(checked, Ok(ref node) if node.checked == Some(true)));
+        assert_eq!(mouse_clicks(&driver), 1);
+
+        let again = set_checked_element(&driver, &st, &query, true);
+        assert!(matches!(again, Ok(ref node) if node.checked == Some(true)));
+        assert_eq!(mouse_clicks(&driver), 1);
+
+        let unchecked = set_checked_element(&driver, &st, &query, false);
+        assert!(matches!(unchecked, Ok(ref node) if node.checked == Some(false)));
+        assert_eq!(mouse_clicks(&driver), 2);
+
+        let unchecked_again = set_checked_element(&driver, &st, &query, false);
+        assert!(unchecked_again.is_ok());
+        assert_eq!(mouse_clicks(&driver), 2);
+    }
+
+    #[test]
+    fn set_checked_refuses_disabled_element_that_needs_a_click() {
+        let driver = MockDriver::sample_page();
+        let st = state();
+        let query = checkbox("Travel insurance");
+
+        // Already checked: nothing to do, so the disabled state is not an error.
+        assert!(set_checked_element(&driver, &st, &query, true).is_ok());
+
+        let response = handle_request(
+            &driver,
+            &st,
+            Request::SetChecked {
+                query,
+                checked: false,
+            },
+        );
+        assert!(matches!(
+            response,
+            Response::Error { ref code, .. } if code == "element_disabled"
+        ));
+        assert_eq!(mouse_clicks(&driver), 0);
+    }
+
+    #[test]
+    fn set_checked_rejects_node_without_checked_state() {
+        let driver = MockDriver::sample_page();
+        let response = handle_request(
+            &driver,
+            &state(),
+            Request::SetChecked {
+                query: LocatorQuery::by_role(Role::Button, Some("Search".to_owned())),
+                checked: true,
+            },
+        );
+        assert!(matches!(
+            response,
+            Response::Error { ref code, .. } if code == "invalid_element_state"
+        ));
+        assert_eq!(mouse_clicks(&driver), 0);
+    }
+
+    #[test]
+    fn set_checked_returns_node_response() {
+        let driver = MockDriver::sample_page();
+        let response = handle_request(
+            &driver,
+            &state(),
+            Request::SetChecked {
+                query: checkbox("Nonstop"),
+                checked: true,
+            },
+        );
+        assert!(matches!(
+            response,
+            Response::Node { ref node } if node.id == "chk-nonstop" && node.checked == Some(true)
+        ));
     }
 }
