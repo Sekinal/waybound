@@ -73,6 +73,11 @@ pub enum Request {
         /// Maximum wait time in milliseconds.
         timeout_ms: u64,
     },
+    /// Capture a native OS PNG screenshot of the browser window to `path`.
+    Screenshot {
+        /// Destination PNG file path.
+        path: String,
+    },
     /// Request a graceful daemon shutdown (unwinds RAII browser & socket guards).
     Shutdown,
 }

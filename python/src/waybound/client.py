@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from waybound.types import AccessibilityNode, CapturedResponse, KeyModifier, LocatorQuery, Role
@@ -85,6 +87,18 @@ class Page:
     def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
         """Wait until a passively decrypted HTTP response matches `url_contains`."""
         return self._transport.wait_for_response(url_contains, timeout_ms=timeout_ms)
+
+    def screenshot(self, path: Path | str | None = None) -> bytes:
+        """Capture a native OS PNG screenshot of the browser window and return PNG bytes."""
+        if path is not None:
+            out_path = Path(path)
+            self._transport.screenshot(str(out_path))
+            return out_path.read_bytes()
+
+        with tempfile.TemporaryDirectory(prefix="wb-shot-") as tmp_dir:
+            out_path = Path(tmp_dir) / "shot.png"
+            self._transport.screenshot(str(out_path))
+            return out_path.read_bytes()
 
     def get_by_role(self, role: Role, *, name: str | None = None, exact: bool = False) -> Locator:
         """Return a locator targeting an element by its semantic accessibility role."""

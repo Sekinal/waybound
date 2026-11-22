@@ -1,8 +1,21 @@
 //! Deterministic in-memory driver for hermetic IPC and SDK testing.
 
+use std::fs;
+use std::path::Path;
 use std::sync::Mutex;
 
-use waybound_core::{AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Result, Role};
+use waybound_core::{
+    AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Result, Role, WayboundError,
+};
+
+/// Minimal valid 1x1 transparent PNG bytes for hermetic screenshot tests.
+const ONE_BY_ONE_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
 
 /// In-memory driver exposing a deterministic accessibility tree and recording input events.
 pub struct MockDriver {
@@ -59,6 +72,10 @@ impl Driver for MockDriver {
 
     fn current_url(&self) -> Result<Option<String>> {
         Ok(Some("https://mock.waybound.local/".to_owned()))
+    }
+
+    fn screenshot(&self, output_path: &Path) -> Result<()> {
+        fs::write(output_path, ONE_BY_ONE_PNG).map_err(WayboundError::Io)
     }
 
     fn dispatch_input(&self, event: &InputEvent) -> Result<()> {

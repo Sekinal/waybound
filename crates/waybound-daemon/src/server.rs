@@ -135,6 +135,10 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             Ok(response) => Response::HttpResponse { response },
             Err(err) => Response::from(&err),
         },
+        Request::Screenshot { path } => match driver.screenshot(Path::new(&path)) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
         Request::Shutdown => {
             state.shutdown.store(true, Ordering::Release);
             Response::Ok

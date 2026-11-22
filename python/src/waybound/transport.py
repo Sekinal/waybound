@@ -179,6 +179,10 @@ class UnixSocketTransport:
         """Navigate the active browser tab to `url`."""
         self._expect_ok({"method": "navigate", "url": url}, "navigate")
 
+    def screenshot(self, path: str) -> None:
+        """Capture a native OS PNG screenshot of the browser window to `path`."""
+        self._expect_ok({"method": "screenshot", "path": path}, "screenshot")
+
     def scroll(self, delta_x: float, delta_y: float) -> None:
         """Emit a native scroll event."""
         self._expect_ok({"method": "scroll", "delta_x": delta_x, "delta_y": delta_y}, "scroll")

@@ -139,3 +139,7 @@ class Transport(Protocol):
     def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
         """Wait until a passively captured HTTP response matches `url_contains`."""
         ...
+
+    def screenshot(self, path: str) -> None:
+        """Capture a native OS PNG screenshot of the browser window to `path`."""
+        ...

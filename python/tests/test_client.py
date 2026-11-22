@@ -68,6 +68,9 @@ class FakeTransport:
             body="{}",
         )
 
+    def screenshot(self, path: str) -> None:
+        self.events.append(("screenshot", path))
+
 
 def test_bounds_center() -> None:
     bounds = Bounds(x=10.0, y=20.0, width=100.0, height=40.0)

@@ -1,5 +1,7 @@
 //! Platform driver trait implemented by OS and container backends.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -98,6 +100,19 @@ pub trait Driver: Send + Sync {
     /// Returns an error if the OS accessibility bus cannot be queried.
     fn current_url(&self) -> Result<Option<String>> {
         Ok(None)
+    }
+
+    /// Captures a native OS screenshot of the active browser window as PNG to `output_path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if screen capture is unsupported or fails.
+    fn screenshot(&self, output_path: &Path) -> Result<()> {
+        let _ = output_path;
+        Err(crate::WayboundError::BackendUnavailable {
+            backend: format!("{:?}", self.backend_kind()),
+            reason: "native screenshot not implemented for this backend".to_owned(),
+        })
     }
 
     /// Dispatches a native OS input event to the active browser surface.

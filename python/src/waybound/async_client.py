@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from waybound.session import BackendName, LaunchOptions, Session
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from types import TracebackType
 
     from waybound.client import Locator, Page
@@ -89,6 +90,10 @@ class AsyncPage:
         return await asyncio.to_thread(
             self._inner.wait_for_response, url_contains, timeout_ms=timeout_ms
         )
+
+    async def screenshot(self, path: Path | str | None = None) -> bytes:
+        """Capture a native OS PNG screenshot of the browser window and return PNG bytes."""
+        return await asyncio.to_thread(self._inner.screenshot, path)
 
     def get_by_role(
         self, role: Role, *, name: str | None = None, exact: bool = False

@@ -37,6 +37,9 @@ def test_ergonomic_launch_full_workflow() -> None:
         page.press("enter")
         page.press("l", modifiers=(KeyModifier.META,))
 
+        png_bytes = page.screenshot()
+        assert png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+
         with pytest.raises(WayboundDaemonError) as exc_info:
             page.get_by_role(Role.BUTTON, name="Nonexistent").wait_for(timeout_ms=120)
         assert exc_info.value.code == "timeout"

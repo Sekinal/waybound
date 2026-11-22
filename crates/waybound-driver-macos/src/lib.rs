@@ -7,7 +7,10 @@ mod ax;
 mod ffi;
 #[cfg(target_os = "macos")]
 mod input;
+#[cfg(target_os = "macos")]
+mod screenshot;
 
+use std::path::Path;
 use std::sync::Mutex;
 
 use waybound_core::{AccessibilityNode, BackendKind, Driver, InputEvent, Point, Result};
@@ -65,6 +68,21 @@ impl Driver for MacOsDriver {
         #[cfg(not(target_os = "macos"))]
         {
             Ok(None)
+        }
+    }
+
+    fn screenshot(&self, output_path: &Path) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            screenshot::capture_window_png(self.pid, output_path)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = output_path;
+            Err(waybound_core::WayboundError::BackendUnavailable {
+                backend: "macos_native".to_owned(),
+                reason: "MacOsDriver screenshot is only supported on macOS hosts".to_owned(),
+            })
         }
     }
 
