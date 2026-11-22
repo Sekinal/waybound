@@ -199,27 +199,29 @@ impl StreamCorrelator {
             return;
         }
 
-        let tcp_stream = cols[0].trim();
-        let udp_stream = cols[1].trim();
-        let h2_stream = cols[2].trim();
-        let h3_stream = cols[3].trim();
+        let tcp_stream = last_occurrence(cols[0]);
+        let udp_stream = last_occurrence(cols[1]);
+        let (h2_stream, h2_single_stream) = stream_id_occurrence(cols[2]);
+        let (h3_stream, h3_single_stream) = stream_id_occurrence(cols[3]);
 
-        let h1_status = cols[4].trim();
-        let h2_status = cols[5].trim();
-        let h3_status = cols[6].trim();
+        let status_code = first_last_occurrence(&cols[4..7]).and_then(|s| s.parse::<u16>().ok());
 
-        let h1_uri = cols[7].trim();
-        let h2_auth = cols[8].trim();
-        let h2_path = cols[9].trim();
-        let h3_auth = cols[10].trim();
-        let h3_path = cols[11].trim();
+        let h1_uri = last_occurrence(cols[7]);
+        let h2_auth = last_occurrence(cols[8]);
+        let h2_path = last_occurrence(cols[9]);
+        let h3_auth = last_occurrence(cols[10]);
+        let h3_path = last_occurrence(cols[11]);
 
-        let content_type = first_non_empty(&[cols[12], cols[13], cols[14]]);
-        let body_hex = (cols.len() >= 18)
-            .then(|| first_non_empty(&[cols[15], cols[16], cols[17]]))
-            .flatten();
+        let content_type = first_last_occurrence(&cols[12..15]);
+        let body_hex = extract_body_hex(
+            &cols,
+            h2_stream,
+            h2_single_stream,
+            h3_stream,
+            h3_single_stream,
+        );
         let content_encoding = (cols.len() >= 21)
-            .then(|| first_non_empty(&[cols[18], cols[19], cols[20]]))
+            .then(|| first_last_occurrence(&cols[18..21]))
             .flatten();
 
         let Some(key) = build_stream_key(tcp_stream, udp_stream, h2_stream, h3_stream) else {
@@ -265,9 +267,7 @@ impl StreamCorrelator {
             entry.url = Some(build_https_url(h3_auth, h3_path));
         }
 
-        if let Some(code_str) = first_non_empty(&[h1_status, h2_status, h3_status])
-            && let Ok(code) = code_str.parse::<u16>()
-        {
+        if let Some(code) = status_code {
             entry.status = Some(code);
         }
 
@@ -377,6 +377,67 @@ fn first_non_empty<'a>(items: &[&'a str]) -> Option<&'a str> {
     items.iter().map(|s| s.trim()).find(|s| !s.is_empty())
 }
 
+/// Extracts hex payload chunks for a `tshark -E occurrence=a` row, preserving all comma-separated
+/// DATA frames when they belong to a single HTTP/2 or HTTP/3 stream.
+fn extract_body_hex<'a>(
+    cols: &[&'a str],
+    h2_stream: &str,
+    h2_single_stream: bool,
+    h3_stream: &str,
+    h3_single_stream: bool,
+) -> Option<&'a str> {
+    if cols.len() < 18 {
+        return None;
+    }
+    let raw = first_non_empty(&[cols[15], cols[16], cols[17]])?;
+    let single_stream = if !h2_stream.is_empty() {
+        h2_single_stream
+    } else if !h3_stream.is_empty() {
+        h3_single_stream
+    } else {
+        true
+    };
+    Some(if single_stream {
+        raw
+    } else {
+        last_occurrence(raw)
+    })
+}
+
+fn first_last_occurrence<'a>(items: &[&'a str]) -> Option<&'a str> {
+    items
+        .iter()
+        .map(|s| last_occurrence(s))
+        .find(|s| !s.is_empty())
+}
+
+/// Returns the last comma-separated non-empty value from a `tshark -E occurrence=a` field.
+fn last_occurrence(col: &str) -> &str {
+    col.rsplit(',')
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or("")
+}
+
+/// Extracts the last non-empty stream ID from a `tshark -E occurrence=a` field and reports
+/// whether all non-empty stream IDs in the packet are identical.
+fn stream_id_occurrence(col: &str) -> (&str, bool) {
+    let mut first: Option<&str> = None;
+    let mut last = "";
+    let mut all_same = true;
+    for part in col.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(f) = first {
+            if f != part {
+                all_same = false;
+            }
+        } else {
+            first = Some(part);
+        }
+        last = part;
+    }
+    (last, all_same)
+}
+
 fn build_https_url(authority: &str, path: &str) -> String {
     if authority.is_empty() {
         path.to_owned()
@@ -473,7 +534,7 @@ pub fn start_passive_tap(ssl_keylog: &Path, store: Arc<ResponseStore>) -> Result
             "-E",
             "quote=n",
             "-E",
-            "occurrence=l",
+            "occurrence=a",
             "-e",
             "tcp.stream",
             "-e",
