@@ -296,7 +296,7 @@ pub fn plan_scroll_burst(delta_x: f64, delta_y: f64, rng: &mut SplitMix64) -> Ve
     for i in 0..count {
         // Ease-out weight curve (stronger initial flick, tapering tail).
         let t = (i as f64 + 1.0) / (count as f64 + 1.0);
-        let w = (1.0 - t * 0.75).max(0.15);
+        let w = t.mul_add(-0.75, 1.0).max(0.15);
         weights.push(w);
         weight_sum += w;
     }

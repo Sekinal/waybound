@@ -249,8 +249,13 @@ pub fn map_class_to_role(class_name: &str, clickable: bool, resource_id: Option<
 
     match simple {
         "EditText" | "AutoCompleteTextView" | "MultiAutoCompleteTextView" => Role::TextBox,
-        "CheckBox" | "Switch" | "RadioButton" | "CheckedTextView" => Role::CheckBox,
-        "Button" | "ImageButton" | "ToggleButton" => Role::Button,
+        "Spinner" => Role::ComboBox,
+        "CheckBox" | "CheckedTextView" => Role::CheckBox,
+        "RadioButton" => Role::Radio,
+        "Switch" | "ToggleButton" => Role::Switch,
+        "Button" | "ImageButton" => Role::Button,
+        "ListView" | "RecyclerView" => Role::ListBox,
+        "TabWidget" => Role::Tab,
         "WebView" => Role::Document,
         "TextView" => {
             if clickable {

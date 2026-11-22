@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from waybound.binary import cached_daemon_path
 from waybound.client import Page
 from waybound.transport import UnixSocketTransport, WayboundDaemonError
 
@@ -56,6 +57,10 @@ def _resolve_daemon_binary(explicit: Path | str | None) -> Path:
     on_path = shutil.which("waybound-daemon")
     if on_path is not None:
         return Path(on_path)
+
+    cached = cached_daemon_path()
+    if cached.exists():
+        return cached
 
     parents = Path(__file__).resolve().parents
     if len(parents) >= _MIN_WORKSPACE_PARENTS:

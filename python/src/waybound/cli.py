@@ -7,6 +7,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from waybound.binary import DEFAULT_VERSION, download_daemon_binary
 from waybound.session import _resolve_daemon_binary
 
 
@@ -70,7 +71,13 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(f"{key:>10}: {value}\n")
         return 0
 
-    sys.stderr.write(f"usage: waybound [doctor] (unknown command: {args[0]})\n")
+    if args[0] == "fetch":
+        version = args[1] if len(args) > 1 else DEFAULT_VERSION
+        path = download_daemon_binary(version=version)
+        sys.stdout.write(f"Installed waybound-daemon ({version}) -> {path}\n")
+        return 0
+
+    sys.stderr.write(f"usage: waybound [doctor|fetch [version]] (unknown command: {args[0]})\n")
     return 2
 
 

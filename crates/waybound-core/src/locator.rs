@@ -16,6 +16,22 @@ pub enum Role {
     TextBox,
     /// Checkbox toggle.
     CheckBox,
+    /// Radio button option.
+    Radio,
+    /// On/off toggle switch.
+    Switch,
+    /// Combobox / autocomplete input.
+    ComboBox,
+    /// Selectable list container.
+    ListBox,
+    /// Individual option inside a listbox or select menu.
+    Option,
+    /// Tab selector inside a tablist.
+    Tab,
+    /// Modal or dialog container.
+    Dialog,
+    /// Menu item entry.
+    MenuItem,
     /// Document root or web area.
     Document,
     /// Heading element.
