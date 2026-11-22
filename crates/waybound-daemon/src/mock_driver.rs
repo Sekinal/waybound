@@ -2,7 +2,8 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use waybound_core::{
     AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Result, Role, WayboundError,
@@ -24,6 +25,14 @@ pub struct MockDriver {
     /// When set, the `n`-th (0-based) [`InputEvent::PointerDrag`] fails instead of being
     /// recorded, to exercise cleanup paths in the middle of a drag.
     fail_drag_at: Option<usize>,
+    /// When set, every [`InputEvent::MouseDown`] fails (after being recorded, as if the
+    /// backend delivered the press and then reported an error).
+    fail_press: bool,
+    /// Visible viewport reported by [`Driver::viewport_bounds`].
+    viewport: Option<Bounds>,
+    /// Flag raised as soon as the first [`InputEvent::PointerDrag`] is dispatched, to
+    /// simulate a daemon shutdown arriving mid-drag.
+    raise_on_drag: Option<Arc<AtomicBool>>,
 }
 
 impl MockDriver {
@@ -61,6 +70,39 @@ impl MockDriver {
             ],
             events: Mutex::new(Vec::new()),
             fail_drag_at: None,
+            fail_press: false,
+            viewport: None,
+            raise_on_drag: None,
+        }
+    }
+
+    /// Returns a sample-page driver whose mouse presses report failure.
+    #[cfg(test)]
+    #[must_use]
+    pub fn failing_press() -> Self {
+        Self {
+            fail_press: true,
+            ..Self::sample_page()
+        }
+    }
+
+    /// Returns a sample-page driver reporting `viewport` as the visible web area.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_viewport(viewport: Bounds) -> Self {
+        Self {
+            viewport: Some(viewport),
+            ..Self::sample_page()
+        }
+    }
+
+    /// Returns a sample-page driver that sets `flag` when the first drag step arrives.
+    #[cfg(test)]
+    #[must_use]
+    pub fn raising_on_drag(flag: Arc<AtomicBool>) -> Self {
+        Self {
+            raise_on_drag: Some(flag),
+            ..Self::sample_page()
         }
     }
 
@@ -96,6 +138,10 @@ impl Driver for MockDriver {
         Ok(Some("https://mock.waybound.local/".to_owned()))
     }
 
+    fn viewport_bounds(&self) -> Result<Option<Bounds>> {
+        Ok(self.viewport)
+    }
+
     fn screenshot(&self, output_path: &Path) -> Result<()> {
         fs::write(output_path, ONE_BY_ONE_PNG).map_err(WayboundError::Io)
     }
@@ -115,6 +161,15 @@ impl Driver for MockDriver {
                 }
             }
             guard.push(event.clone());
+        }
+        if let (InputEvent::PointerDrag { .. }, Some(flag)) = (event, &self.raise_on_drag) {
+            flag.store(true, Ordering::Release);
+        }
+        if self.fail_press && matches!(event, InputEvent::MouseDown { .. }) {
+            return Err(WayboundError::BackendUnavailable {
+                backend: "mock".to_owned(),
+                reason: "injected failure on mouse press".to_owned(),
+            });
         }
         Ok(())
     }

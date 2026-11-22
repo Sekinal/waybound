@@ -8,7 +8,7 @@ pub mod xml;
 pub use waydroid::{WaydroidConfig, WaydroidSession};
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use waybound_core::{
     AccessibilityNode, BackendKind, Driver, InputEvent, Point, Result, WayboundError,
@@ -20,6 +20,8 @@ pub struct AndroidDriver {
     serial: Option<String>,
     cursor: Mutex<Point>,
     pending_drag: Mutex<Option<adb::PendingDrag>>,
+    /// Device API level, probed on the first drag release and cached once read.
+    sdk_level: OnceLock<u32>,
 }
 
 impl AndroidDriver {
@@ -33,6 +35,7 @@ impl AndroidDriver {
             serial,
             cursor: Mutex::new(Point { x: 0.0, y: 0.0 }),
             pending_drag: Mutex::new(None),
+            sdk_level: OnceLock::new(),
         }
     }
 
@@ -50,6 +53,20 @@ impl AndroidDriver {
     /// or if `adb` fails to launch the intent.
     pub fn open_url(&self, url: &str) -> Result<()> {
         adb::open_chrome_url(self.serial.as_deref(), url)
+    }
+}
+
+impl AndroidDriver {
+    /// Returns the device API level, probing it once; a failed probe is retried next time.
+    fn sdk_level(&self) -> Option<u32> {
+        if let Some(level) = self.sdk_level.get() {
+            return Some(*level);
+        }
+        let probed = adb::probe_sdk_level(self.serial.as_deref());
+        if let Some(level) = probed {
+            let _ = self.sdk_level.set(level);
+        }
+        probed
     }
 }
 
@@ -91,7 +108,13 @@ impl Driver for AndroidDriver {
             .pending_drag
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        adb::dispatch_input(self.serial.as_deref(), event, &mut guard, &mut pending)
+        adb::dispatch_input(
+            self.serial.as_deref(),
+            event,
+            &mut guard,
+            &mut pending,
+            || self.sdk_level(),
+        )
     }
 }
 

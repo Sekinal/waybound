@@ -21,6 +21,9 @@ const SCROLL_SWIPE_DURATION_MS: u64 = 250;
 const MIN_DRAG_DURATION_MS: u64 = 300;
 /// Longest touch drag gesture, bounded well below [`ADB_TIMEOUT`].
 const MAX_DRAG_DURATION_MS: u64 = 10_000;
+/// First Android API level whose `input` tool has `draganddrop` (Android 8.0 / Oreo; absent
+/// from the Nougat sources).
+pub const DRAG_AND_DROP_MIN_SDK: u32 = 26;
 
 /// Android `KeyEvent` keycodes for non-character keys.
 const KEYCODE_ENTER: u32 = 66;
@@ -69,8 +72,9 @@ pub fn dump_ui_xml(serial: Option<&str>) -> Result<String> {
 ///
 /// `adb shell input` cannot hold a finger down across separate commands, so a
 /// [`InputEvent::MouseDown`] only records where and when the gesture started; the
-/// matching [`InputEvent::MouseUp`] then emits the whole drag as a single `input swipe`
-/// from that point to the last [`InputEvent::PointerDrag`] position.
+/// matching [`InputEvent::MouseUp`] then emits the whole drag as one `input draganddrop`
+/// (or `input swipe` on old devices) from that point to the last
+/// [`InputEvent::PointerDrag`] position.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PendingDrag {
     /// Where the finger went down.
@@ -83,7 +87,8 @@ pub struct PendingDrag {
 ///
 /// Tracks `last_cursor` across [`InputEvent::PointerMove`], [`InputEvent::MouseClick`],
 /// and [`InputEvent::Scroll`] events, and buffers press / drag / release sequences in
-/// `pending_drag` (see [`PendingDrag`]).
+/// `pending_drag` (see [`PendingDrag`]). `sdk_level` is only called when a drag is
+/// released, to choose between `draganddrop` and `swipe`.
 ///
 /// # Errors
 ///
@@ -93,36 +98,82 @@ pub fn dispatch_input(
     event: &InputEvent,
     last_cursor: &mut Point,
     pending_drag: &mut Option<PendingDrag>,
+    sdk_level: impl FnOnce() -> Option<u32>,
 ) -> Result<()> {
-    let shell_args = match event {
+    dispatch_input_with(event, last_cursor, pending_drag, sdk_level, |shell_args| {
+        let arg_refs: Vec<&str> = shell_args.iter().map(String::as_str).collect();
+        let args = build_adb_args(serial, &arg_refs);
+        let output = run_adb(&args)?;
+        ensure_success(&output, "input dispatch")
+    })
+}
+
+/// [`dispatch_input`] with the `adb shell` runner injected, so gesture buffering and error
+/// handling can be tested without a device.
+///
+/// A buffered drag is only cleared once its gesture command succeeded, so a failed release
+/// is reported and a retried release sends the gesture again.
+///
+/// # Errors
+///
+/// Returns whatever `run` returns for the command it is given.
+pub fn dispatch_input_with(
+    event: &InputEvent,
+    last_cursor: &mut Point,
+    pending_drag: &mut Option<PendingDrag>,
+    sdk_level: impl FnOnce() -> Option<u32>,
+    mut run: impl FnMut(&[String]) -> Result<()>,
+) -> Result<()> {
+    match event {
         InputEvent::MouseDown { .. } => {
             *pending_drag = Some(PendingDrag {
                 from: *last_cursor,
                 pressed_at: Instant::now(),
             });
-            None
+            Ok(())
         }
         InputEvent::MouseUp { .. } => {
-            let swipe = pending_drag.take().map(|drag| {
-                let held_ms = u64::try_from(drag.pressed_at.elapsed().as_millis()).unwrap_or(0);
-                build_drag_swipe_args(drag.from, *last_cursor, held_ms)
-            });
-            if swipe.is_none() {
+            let Some(drag) = *pending_drag else {
                 // No finger is down on the device, so there is nothing to lift.
                 debug!("ignoring adb release without a pending press");
-            }
-            swipe
+                return Ok(());
+            };
+            let held_ms = u64::try_from(drag.pressed_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let args = build_drag_args(
+                drag.from,
+                *last_cursor,
+                held_ms,
+                supports_drag_and_drop(sdk_level()),
+            );
+            run(&args)?;
+            *pending_drag = None;
+            Ok(())
         }
-        other => build_input_shell_args(other, last_cursor),
-    };
-    let Some(shell_args) = shell_args else {
-        return Ok(());
-    };
+        other => build_input_shell_args(other, last_cursor).map_or(Ok(()), |args| run(&args)),
+    }
+}
 
-    let arg_refs: Vec<&str> = shell_args.iter().map(String::as_str).collect();
-    let args = build_adb_args(serial, &arg_refs);
-    let output = run_adb(&args)?;
-    ensure_success(&output, "input dispatch")
+/// Reads the device API level (`ro.build.version.sdk`), or `None` if it cannot be read.
+#[must_use]
+pub fn probe_sdk_level(serial: Option<&str>) -> Option<u32> {
+    let args = build_adb_args(serial, &["shell", "getprop", "ro.build.version.sdk"]);
+    let output = run_adb(&args).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_sdk_level(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parses `getprop ro.build.version.sdk` output.
+#[must_use]
+pub fn parse_sdk_level(raw: &str) -> Option<u32> {
+    raw.trim().parse().ok()
+}
+
+/// Whether a device at API level `sdk` has `input draganddrop` (unknown levels do not).
+#[must_use]
+pub const fn supports_drag_and_drop(sdk: Option<u32>) -> bool {
+    matches!(sdk, Some(level) if level >= DRAG_AND_DROP_MIN_SDK)
 }
 
 /// Captures a PNG screenshot of the Android display to `output_path` via
@@ -184,14 +235,28 @@ pub fn build_adb_args(serial: Option<&str>, subcommand: &[&str]) -> Vec<String> 
     args
 }
 
-/// Builds the `adb shell input swipe` arguments for a touch drag from `from` to `to`
-/// lasting `duration_ms` (clamped to a range Chrome reads as a drag, not a fling).
+/// Builds the `adb shell input` arguments for a touch drag from `from` to `to` lasting
+/// `duration_ms` (clamped to a range Chrome reads as a drag, not a fling).
+///
+/// With `drag_and_drop`, uses `input draganddrop`, which holds for the system long-press
+/// timeout before moving, so HTML5 and touch-sortable drags start instead of the page
+/// scrolling. Otherwise (Android < 8.0) falls back to a plain `input swipe`.
 #[must_use]
-pub fn build_drag_swipe_args(from: Point, to: Point, duration_ms: u64) -> Vec<String> {
+pub fn build_drag_args(
+    from: Point,
+    to: Point,
+    duration_ms: u64,
+    drag_and_drop: bool,
+) -> Vec<String> {
     vec![
         "shell".to_owned(),
         "input".to_owned(),
-        "swipe".to_owned(),
+        if drag_and_drop {
+            "draganddrop"
+        } else {
+            "swipe"
+        }
+        .to_owned(),
         coord_to_i32(from.x).to_string(),
         coord_to_i32(from.y).to_string(),
         coord_to_i32(to.x).to_string(),
@@ -206,7 +271,7 @@ pub fn build_drag_swipe_args(from: Point, to: Point, duration_ms: u64) -> Vec<St
 ///
 /// Returns `None` for events that only update local pointer state (such as `PointerMove`
 /// and `PointerDrag`). [`InputEvent::MouseDown`] and [`InputEvent::MouseUp`] also return
-/// `None` here: [`dispatch_input`] turns a press / release pair into one swipe.
+/// `None` here: [`dispatch_input`] turns a press / release pair into one gesture.
 #[must_use]
 pub fn build_input_shell_args(event: &InputEvent, last_cursor: &mut Point) -> Option<Vec<String>> {
     match event {
@@ -596,59 +661,116 @@ mod tests {
     }
 
     #[test]
-    fn build_drag_swipe_args_clamps_duration() {
+    fn build_drag_args_picks_gesture_and_clamps_duration() {
         let from = Point { x: 100.4, y: 200.6 };
         let to = Point { x: 300.0, y: 50.0 };
         assert_eq!(
-            build_drag_swipe_args(from, to, 850),
+            build_drag_args(from, to, 850, false),
             vec!["shell", "input", "swipe", "100", "201", "300", "50", "850"]
         );
-        assert_eq!(build_drag_swipe_args(from, to, 5)[7], "300");
-        assert_eq!(build_drag_swipe_args(from, to, 120_000)[7], "10000");
+        assert_eq!(
+            build_drag_args(from, to, 850, true),
+            vec![
+                "shell",
+                "input",
+                "draganddrop",
+                "100",
+                "201",
+                "300",
+                "50",
+                "850"
+            ]
+        );
+        assert_eq!(build_drag_args(from, to, 5, true)[7], "300");
+        assert_eq!(build_drag_args(from, to, u64::MAX, false)[7], "10000");
+    }
+
+    #[test]
+    fn parses_sdk_level_and_gates_drag_and_drop() {
+        assert_eq!(parse_sdk_level("33\r\n"), Some(33));
+        assert_eq!(parse_sdk_level(""), None);
+        assert_eq!(parse_sdk_level("error: no devices"), None);
+        assert!(supports_drag_and_drop(Some(26)));
+        assert!(supports_drag_and_drop(Some(34)));
+        assert!(!supports_drag_and_drop(Some(25)));
+        assert!(!supports_drag_and_drop(None));
+    }
+
+    fn failing_adb(_: &[String]) -> Result<()> {
+        Err(WayboundError::BackendUnavailable {
+            backend: BACKEND_NAME.to_owned(),
+            reason: "injected adb failure".to_owned(),
+        })
+    }
+
+    #[test]
+    fn failed_drag_release_is_reported_and_retried() {
+        let mut cursor = Point { x: 10.0, y: 20.0 };
+        let mut pending = None;
+        let left = MouseButton::Left;
+        let sent: std::cell::RefCell<Vec<Vec<String>>> = std::cell::RefCell::new(Vec::new());
+        let record = |args: &[String]| {
+            sent.borrow_mut().push(args.to_vec());
+            Ok(())
+        };
+
+        let down = InputEvent::MouseDown { button: left };
+        let drag = InputEvent::PointerDrag {
+            to: Point { x: 90.0, y: 40.0 },
+            button: left,
+        };
+        let up = InputEvent::MouseUp { button: left };
+        assert!(dispatch_input_with(&down, &mut cursor, &mut pending, || Some(30), record).is_ok());
+        assert!(dispatch_input_with(&drag, &mut cursor, &mut pending, || Some(30), record).is_ok());
+
+        // The gesture fails: the error surfaces and the drag stays buffered.
+        let failed = dispatch_input_with(&up, &mut cursor, &mut pending, || Some(30), failing_adb);
+        assert!(failed.is_err());
+        assert!(pending.is_some());
+
+        // The retry sends the same gesture and only then forgets the drag.
+        assert!(dispatch_input_with(&up, &mut cursor, &mut pending, || Some(30), record).is_ok());
+        assert!(pending.is_none());
+        assert_eq!(sent.borrow().len(), 1);
+        assert_eq!(
+            sent.borrow()[0][..7],
+            ["shell", "input", "draganddrop", "10", "20", "90", "40"]
+        );
+
+        // Old devices fall back to a swipe.
+        assert!(dispatch_input_with(&down, &mut cursor, &mut pending, || Some(25), record).is_ok());
+        assert!(dispatch_input_with(&up, &mut cursor, &mut pending, || Some(25), record).is_ok());
+        assert_eq!(sent.borrow().len(), 2);
+        assert_eq!(sent.borrow()[1][2], "swipe");
     }
 
     #[test]
     fn press_drag_and_release_buffer_without_invoking_adb() {
         let mut cursor = Point { x: 10.0, y: 20.0 };
         let mut pending = None;
+        let left = MouseButton::Left;
+        let no_sdk_probe = || -> Option<u32> { None };
 
-        // A release with nothing pressed has nothing to send.
+        // A release with nothing pressed has nothing to send (`failing_adb` would error).
+        let up = InputEvent::MouseUp { button: left };
         assert!(
-            dispatch_input(
-                None,
-                &InputEvent::MouseUp {
-                    button: MouseButton::Left,
-                },
-                &mut cursor,
-                &mut pending,
-            )
-            .is_ok()
+            dispatch_input_with(&up, &mut cursor, &mut pending, no_sdk_probe, failing_adb).is_ok()
         );
 
+        let down = InputEvent::MouseDown { button: left };
         assert!(
-            dispatch_input(
-                None,
-                &InputEvent::MouseDown {
-                    button: MouseButton::Left,
-                },
-                &mut cursor,
-                &mut pending,
-            )
-            .is_ok()
+            dispatch_input_with(&down, &mut cursor, &mut pending, no_sdk_probe, failing_adb)
+                .is_ok()
         );
         assert_eq!(pending.map(|d| d.from), Some(Point { x: 10.0, y: 20.0 }));
 
+        let drag = InputEvent::PointerDrag {
+            to: Point { x: 90.0, y: 40.0 },
+            button: left,
+        };
         assert!(
-            dispatch_input(
-                None,
-                &InputEvent::PointerDrag {
-                    to: Point { x: 90.0, y: 40.0 },
-                    button: MouseButton::Left,
-                },
-                &mut cursor,
-                &mut pending,
-            )
-            .is_ok()
+            dispatch_input_with(&drag, &mut cursor, &mut pending, no_sdk_probe, failing_adb)
+                .is_ok()
         );
         assert_eq!(cursor, Point { x: 90.0, y: 40.0 });
         assert!(pending.is_some());
