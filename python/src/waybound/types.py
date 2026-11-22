@@ -81,13 +81,35 @@ class AccessibilityNode:
 
 
 @dataclass(frozen=True, slots=True)
+class HttpHeader:
+    """Single HTTP header field as seen on the wire (repeated names are kept separately)."""
+
+    name: str
+    value: str
+
+
+def _header_values(headers: tuple[HttpHeader, ...], name: str) -> list[str]:
+    wanted = name.lower()
+    return [h.value for h in headers if h.name.lower() == wanted]
+
+
+@dataclass(frozen=True, slots=True)
 class CapturedResponse:
-    """Passively decrypted HTTP/1.1, HTTP/2, or HTTP/3 response."""
+    """Passively decrypted HTTP/1.1, HTTP/2, or HTTP/3 response.
+
+    `headers`, `request_method`, `request_headers`, and `request_body` are empty when the
+    daemon did not observe them (for example with the legacy `tshark` capture path or an
+    older daemon).
+    """
 
     url: str
     status: int
     content_type: str | None
     body: str | None
+    headers: tuple[HttpHeader, ...] = ()
+    request_method: str | None = None
+    request_headers: tuple[HttpHeader, ...] = ()
+    request_body: str | None = None
 
     def json(self) -> object:
         """Parse and return the captured response body as JSON."""
@@ -95,6 +117,69 @@ class CapturedResponse:
             msg = f"captured response for {self.url!r} has no body"
             raise ValueError(msg)
         return json.loads(self.body)
+
+    def header(self, name: str) -> str | None:
+        """Return the first response header named `name` (case-insensitive), if present."""
+        values = _header_values(self.headers, name)
+        return values[0] if values else None
+
+    def header_values(self, name: str) -> list[str]:
+        """Return every response header value named `name` (e.g. all `set-cookie` lines)."""
+        return _header_values(self.headers, name)
+
+    def request_header(self, name: str) -> str | None:
+        """Return the first request header named `name` (case-insensitive), if present."""
+        values = _header_values(self.request_headers, name)
+        return values[0] if values else None
+
+    def request_header_values(self, name: str) -> list[str]:
+        """Return every request header value named `name`."""
+        return _header_values(self.request_headers, name)
+
+    def request_json(self) -> object:
+        """Parse and return the captured request body (e.g. a POST payload) as JSON."""
+        if self.request_body is None:
+            msg = f"captured request for {self.url!r} has no body"
+            raise ValueError(msg)
+        return json.loads(self.request_body)
+
+
+class WebSocketDirection(StrEnum):
+    """Direction of a captured WebSocket message."""
+
+    SENT = "sent"
+    RECEIVED = "received"
+
+
+class WebSocketOpcode(StrEnum):
+    """Opcode of a captured WebSocket message (RFC 6455)."""
+
+    TEXT = "text"
+    BINARY = "binary"
+    CLOSE = "close"
+    PING = "ping"
+    PONG = "pong"
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedWebSocketFrame:
+    """Passively decrypted WebSocket message (fragments reassembled) or control frame."""
+
+    url: str
+    direction: WebSocketDirection
+    opcode: WebSocketOpcode
+    payload: str | None = None
+    payload_len: int = 0
+    compressed: bool = False
+    truncated: bool = False
+    close_code: int | None = None
+
+    def json(self) -> object:
+        """Parse and return the message payload as JSON."""
+        if self.payload is None:
+            msg = f"captured WebSocket message for {self.url!r} has no decoded payload"
+            raise ValueError(msg)
+        return json.loads(self.payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +284,12 @@ class Transport(Protocol):
 
     def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
         """Wait until a passively captured HTTP response matches `url_contains`."""
+        ...
+
+    def captured_websocket_frames(
+        self, *, url_contains: str | None = None
+    ) -> list[CapturedWebSocketFrame]:
+        """Return passively captured WebSocket messages, optionally filtered by URL substring."""
         ...
 
     def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:

@@ -9,10 +9,14 @@ from waybound.types import (
     BackendKind,
     Bounds,
     CapturedResponse,
+    CapturedWebSocketFrame,
+    HttpHeader,
     KeyModifier,
     LocatorQuery,
     Role,
     Transport,
+    WebSocketDirection,
+    WebSocketOpcode,
 )
 
 __all__ = [
@@ -23,6 +27,8 @@ __all__ = [
     "BackendKind",
     "Bounds",
     "CapturedResponse",
+    "CapturedWebSocketFrame",
+    "HttpHeader",
     "KeyModifier",
     "LaunchOptions",
     "Locator",
@@ -33,6 +39,8 @@ __all__ = [
     "Transport",
     "UnixSocketTransport",
     "WayboundDaemonError",
+    "WebSocketDirection",
+    "WebSocketOpcode",
     "launch",
     "launch_async",
 ]

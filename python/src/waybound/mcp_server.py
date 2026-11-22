@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
     from waybound.client import Page
     from waybound.session import Session
+    from waybound.types import HttpHeader
 
 PROTOCOL_VERSION = "2024-11-05"
 
@@ -95,6 +96,20 @@ TOOLS: list[dict[str, object]] = [
                 "timeout_ms": {"type": "integer", "default": 10000},
             },
             "required": ["url_contains"],
+        },
+    },
+    {
+        "name": "waybound_websocket_frames",
+        "description": (
+            "List passively decrypted WebSocket messages (newest last), optionally filtered "
+            "by URL substring."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url_contains": {"type": "string"},
+                "limit": {"type": "integer", "default": 50},
+            },
         },
     },
 ]
@@ -196,16 +211,49 @@ def _tool_screenshot(page: Page, _args: dict[str, object]) -> dict[str, object]:
     return {"content": [{"type": "image", "data": encoded, "mimeType": "image/png"}]}
 
 
+def _headers_payload(headers: tuple[HttpHeader, ...]) -> list[dict[str, str]]:
+    return [{"name": h.name, "value": h.value} for h in headers]
+
+
 def _tool_wait_for_response(page: Page, args: dict[str, object]) -> dict[str, object]:
     needle = str(args.get("url_contains", ""))
     timeout_ms = _as_int(args.get("timeout_ms"), 10_000)
     resp = page.wait_for_response(needle, timeout_ms=timeout_ms)
-    payload = {
+    payload: dict[str, object] = {
         "url": resp.url,
         "status": resp.status,
         "content_type": resp.content_type,
         "body": resp.body,
     }
+    if resp.headers:
+        payload["headers"] = _headers_payload(resp.headers)
+    if resp.request_method is not None:
+        payload["request_method"] = resp.request_method
+    if resp.request_headers:
+        payload["request_headers"] = _headers_payload(resp.request_headers)
+    if resp.request_body is not None:
+        payload["request_body"] = resp.request_body
+    return _text_result(json.dumps(payload))
+
+
+def _tool_websocket_frames(page: Page, args: dict[str, object]) -> dict[str, object]:
+    raw_needle = args.get("url_contains")
+    needle = raw_needle if isinstance(raw_needle, str) and raw_needle else None
+    limit = max(1, _as_int(args.get("limit"), 50))
+    frames = page.captured_websocket_frames(url_contains=needle)[-limit:]
+    payload = [
+        {
+            "url": f.url,
+            "direction": f.direction.value,
+            "opcode": f.opcode.value,
+            "payload": f.payload,
+            "payload_len": f.payload_len,
+            "compressed": f.compressed,
+            "truncated": f.truncated,
+            "close_code": f.close_code,
+        }
+        for f in frames
+    ]
     return _text_result(json.dumps(payload))
 
 
@@ -218,6 +266,7 @@ _TOOL_HANDLERS: dict[str, Callable[[Page, dict[str, object]], dict[str, object]]
     "waybound_scroll": _tool_scroll,
     "waybound_screenshot": _tool_screenshot,
     "waybound_wait_for_response": _tool_wait_for_response,
+    "waybound_websocket_frames": _tool_websocket_frames,
 }
 
 
