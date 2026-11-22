@@ -17,6 +17,9 @@
 //! - **Linux:** only sockets owned by the daemon's effective UID are admitted (looked up in
 //!   `/proc/net/tcp{,6}`). Other users are locked out; other processes of the *same* user
 //!   are not, as they could read the credentials from the daemon's environment anyway.
+//!   Caveats, each logged as a startup warning: if the daemon cannot see its own listener
+//!   in `/proc/net/tcp` it runs unrestricted, and as root (UID 0) or the overflow UID 65534
+//!   the UID check does not separate users.
 //! - **macOS / Windows:** no check is possible without FFI or a per-connection subprocess,
 //!   so any local process, under any user, can use the forwarder while a session runs.
 //!
@@ -50,6 +53,8 @@ const CONNECT_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n
 /// How long a refused client gets to finish sending its request before the socket closes
 /// (closing with unread data would reset the connection and could discard the `403`).
 const REJECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// Minimum spacing of refusal warnings, so another local user cannot flood the log.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Read-only observer of the bytes relayed through a `CONNECT` tunnel.
 ///
@@ -298,6 +303,7 @@ impl ProxyForwarder {
             .unwrap_or_else(|| platform_verifier(local_addr));
         #[cfg(not(test))]
         let verifier = platform_verifier(local_addr);
+        let refusals = Arc::new(RefusalLog::default());
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_ref = Arc::clone(&shutdown);
@@ -325,6 +331,7 @@ impl ProxyForwarder {
                             }
                             let c = Arc::clone(&cfg_thread);
                             let v = Arc::clone(&verifier);
+                            let r = Arc::clone(&refusals);
                             let guard = TunnelGuard {
                                 counter: Arc::clone(&active_tunnels),
                             };
@@ -332,7 +339,7 @@ impl ProxyForwarder {
                                 .name("waybound-proxy-conn".to_owned())
                                 .spawn(move || {
                                     let _guard = guard;
-                                    if let Err(err) = serve_client(client, &c, v.as_ref()) {
+                                    if let Err(err) = serve_client(client, &c, v.as_ref(), &r) {
                                         tracing::debug!(error = %err, "proxy client tunnel closed");
                                     }
                                 });
@@ -400,12 +407,58 @@ fn connect_upstream(host_port: &str) -> io::Result<TcpStream> {
 
 /// Checks the local process behind `client` before anything is read from it, so a refused
 /// client never causes an upstream connection or sees credentials being used.
-fn admit_client(client: &TcpStream, verifier: &dyn PeerVerifier) -> PeerDecision {
+/// Rate limiter for refusal warnings: the first refusal is logged at `warn`, later ones at
+/// most once per [`REFUSAL_LOG_INTERVAL`] with a count of those logged only at `debug`.
+#[derive(Default)]
+struct RefusalLog {
+    state: std::sync::Mutex<RefusalLogState>,
+}
+
+#[derive(Default)]
+struct RefusalLogState {
+    last_warn: Option<Instant>,
+    suppressed: u64,
+}
+
+impl RefusalLog {
+    /// Records a refusal at `now`. Returns `Some(suppressed since the last warning)` when
+    /// this one should be logged at `warn`.
+    fn record(&self, now: Instant) -> Option<u64> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        match state.last_warn {
+            Some(last) if now.saturating_duration_since(last) < REFUSAL_LOG_INTERVAL => {
+                state.suppressed += 1;
+                None
+            }
+            _ => {
+                state.last_warn = Some(now);
+                Some(std::mem::take(&mut state.suppressed))
+            }
+        }
+    }
+}
+
+fn admit_client(
+    client: &TcpStream,
+    verifier: &dyn PeerVerifier,
+    refusals: &RefusalLog,
+) -> PeerDecision {
     match (client.peer_addr(), client.local_addr()) {
         (Ok(peer), Ok(local)) => match verifier.verify(peer, local) {
             PeerDecision::Allow => PeerDecision::Allow,
             PeerDecision::Deny(reason) => {
-                tracing::warn!(%peer, %reason, "refused local proxy client");
+                if let Some(suppressed) = refusals.record(Instant::now()) {
+                    tracing::warn!(
+                        %peer,
+                        %reason,
+                        suppressed_since_last_warning = suppressed,
+                        "refused local proxy client"
+                    );
+                } else {
+                    tracing::debug!(%peer, %reason, "refused local proxy client");
+                }
                 PeerDecision::Deny(reason)
             }
         },
@@ -437,11 +490,12 @@ fn serve_client(
     client: TcpStream,
     cfg: &ForwarderConfig,
     verifier: &dyn PeerVerifier,
+    refusals: &RefusalLog,
 ) -> io::Result<()> {
     // Accepted sockets inherit the listener's non-blocking mode on BSD-derived systems.
     client.set_nonblocking(false)?;
     client.set_write_timeout(Some(HEADER_IO_TIMEOUT))?;
-    if admit_client(&client, verifier) != PeerDecision::Allow {
+    if admit_client(&client, verifier, refusals) != PeerDecision::Allow {
         reject_client(client);
         return Ok(());
     }
@@ -1231,6 +1285,18 @@ mod tests {
 
         let received = server_thread.join().unwrap_or_default();
         assert!(received.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+    }
+
+    #[test]
+    fn refusal_warnings_are_rate_limited() {
+        let log = RefusalLog::default();
+        let t0 = Instant::now();
+        assert_eq!(log.record(t0), Some(0));
+        assert_eq!(log.record(t0 + Duration::from_secs(1)), None);
+        assert_eq!(log.record(t0 + Duration::from_secs(59)), None);
+        assert_eq!(log.record(t0 + REFUSAL_LOG_INTERVAL), Some(2));
+        assert_eq!(log.record(t0 + REFUSAL_LOG_INTERVAL), None);
+        assert_eq!(log.record(t0 + 3 * REFUSAL_LOG_INTERVAL), Some(1));
     }
 
     /// Fake verifier that refuses everyone and records the addresses it was asked about.
