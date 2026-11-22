@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use waybound_core::Result;
 use waybound_net::{
-    Direction, HostBlocker, InflightCounter, KeyLogStore, PassiveConnectionTap, ResponseCallback,
+    Direction, FingerprintRecorder, HostBlocker, InflightCounter, KeyLogStore,
+    PassiveConnectionTap, ResponseCallback,
 };
 
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
@@ -141,6 +142,8 @@ pub struct PassiveTapConfig {
     pub keylog: KeyLogStore,
     /// Shared inflight request counter powering `wait_for_network_idle`.
     pub inflight: InflightCounter,
+    /// Shared session-wide TLS/HTTP2/header/cookie fingerprint recorder.
+    pub fingerprint: FingerprintRecorder,
     /// Callback invoked with each decrypted HTTP response.
     pub on_response: ResponseCallback,
 }
@@ -344,11 +347,12 @@ fn handle_client(mut client: TcpStream, cfg: &ForwarderConfig) -> io::Result<()>
 
     let tap = if is_connect && !strip_http_connect_reply {
         cfg.tap.as_ref().map(|t| {
-            PassiveConnectionTap::new(
+            PassiveConnectionTap::new_with_fingerprint(
                 target_host.clone(),
                 t.keylog.clone(),
                 t.inflight.clone(),
                 Arc::clone(&t.on_response),
+                Some(t.fingerprint.clone()),
             )
         })
     } else {

@@ -8,8 +8,10 @@ rust-version.workspace = true
 [dependencies]
 brotli.workspace = true
 flate2.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 waybound-core.workspace = true
@@ -17,6 +19,7 @@ waybound-driver-android.workspace = true
 waybound-driver-linux.workspace = true
 waybound-driver-macos.workspace = true
 waybound-driver-windows.workspace = true
+waybound-http.workspace = true
 waybound-net.workspace = true
 
 [lints]

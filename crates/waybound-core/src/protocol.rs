@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::WayboundError;
+use crate::fingerprint::SessionFingerprint;
 use crate::input::{KeyCode, KeyModifier};
 use crate::locator::{AccessibilityNode, LocatorQuery};
 use crate::network::CapturedResponse;
@@ -119,6 +120,8 @@ pub enum Request {
         /// Maximum wait time in milliseconds.
         timeout_ms: u64,
     },
+    /// Export the live TLS, HTTP/2, header, and cookie fingerprint captured from the browser session.
+    ExportSessionFingerprint,
     /// Capture a native OS PNG screenshot of the browser window to `path`.
     Screenshot {
         /// Destination PNG file path.
@@ -163,6 +166,11 @@ pub enum Response {
     HttpResponses {
         /// Captured HTTP responses matching the filter.
         responses: Vec<CapturedResponse>,
+    },
+    /// Response to [`Request::ExportSessionFingerprint`].
+    SessionFingerprint {
+        /// Captured live TLS, HTTP/2, header, and cookie snapshot.
+        fingerprint: Box<SessionFingerprint>,
     },
     /// Structured error returned when a request fails.
     Error {

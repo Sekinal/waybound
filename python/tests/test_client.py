@@ -10,6 +10,7 @@ from waybound import (
     LocatorQuery,
     Page,
     Role,
+    SessionFingerprint,
 )
 
 
@@ -106,6 +107,10 @@ class FakeTransport:
 
     def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
         self.events.append(("wait_for_network_idle", (idle_ms, timeout_ms)))
+
+    def export_fingerprint(self) -> SessionFingerprint:
+        self.events.append(("export_fingerprint", None))
+        return SessionFingerprint(tls=None, http2=None, default_headers=(), cookies=())
 
     def screenshot(self, path: str) -> None:
         self.events.append(("screenshot", path))
