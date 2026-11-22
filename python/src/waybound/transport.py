@@ -31,6 +31,7 @@ class UnixSocketTransport:
 
     def __init__(self, socket_path: Path | str, *, timeout_s: float = 30.0) -> None:
         self._socket_path = Path(socket_path)
+        self._base_timeout_s = timeout_s
         self._sock: socket.socket | None = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._reader: TextIOWrapper | None = None
         self._writer: TextIOWrapper | None = None
@@ -94,18 +95,30 @@ class UnixSocketTransport:
 
     def wait_for(self, query: LocatorQuery, *, timeout_ms: int = 10_000) -> AccessibilityNode:
         """Poll until an element matching `query` appears or `timeout_ms` elapses."""
-        response = self._request(
-            {
-                "method": "wait_for",
-                "query": _encode_query(query),
-                "timeout_ms": max(0, timeout_ms),
-            }
-        )
+        clamped_ms = max(0, timeout_ms)
+        sock = self._sock
+        if sock is not None:
+            sock.settimeout(max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0))
+        try:
+            response = self._request(
+                {
+                    "method": "wait_for",
+                    "query": _encode_query(query),
+                    "timeout_ms": clamped_ms,
+                }
+            )
+        finally:
+            if self._sock is not None:
+                self._sock.settimeout(self._base_timeout_s)
         raw_node = response.get("node")
         if not isinstance(raw_node, dict):
             msg = f"unexpected wait_for response: {response!r}"
             raise WayboundDaemonError("protocol_error", msg)
         return _parse_node(raw_node)
+
+    def shutdown(self) -> None:
+        """Request a graceful daemon shutdown so RAII browser & socket guards run."""
+        self._expect_ok({"method": "shutdown"}, "shutdown")
 
     def click(self, query: LocatorQuery) -> None:
         """Locate the target element and dispatch a native click."""

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from waybound.client import Page
-from waybound.transport import UnixSocketTransport
+from waybound.transport import UnixSocketTransport, WayboundDaemonError
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -58,14 +58,16 @@ def _resolve_daemon_binary(explicit: Path | str | None) -> Path:
 
 def _connect_with_retry(
     socket_path: Path,
+    stderr_log: Path,
     proc: subprocess.Popen[bytes],
     timeout_s: float,
 ) -> UnixSocketTransport:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            stderr_bytes = proc.stderr.read() if proc.stderr is not None else b""
-            stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+            stderr_text = ""
+            if stderr_log.exists():
+                stderr_text = stderr_log.read_text(encoding="utf-8", errors="replace").strip()
             msg = f"waybound-daemon exited early (code {proc.returncode}): {stderr_text}"
             raise RuntimeError(msg)
         if socket_path.exists():
@@ -98,6 +100,7 @@ class Session:
         tmp_dir = tempfile.TemporaryDirectory(prefix="wb-", dir="/tmp")
         self._tmp_dir = tmp_dir
         socket_path = Path(tmp_dir.name) / "w.sock"
+        stderr_log = Path(tmp_dir.name) / "daemon.stderr.log"
 
         opts = self._options
         cmd = [
@@ -121,13 +124,14 @@ class Session:
             cmd.append("--no-motion")
 
         try:
-            proc = subprocess.Popen(  # noqa: S603
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            with stderr_log.open("wb") as stderr_file:
+                proc = subprocess.Popen(  # noqa: S603
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                )
             self._proc = proc
-            transport = _connect_with_retry(socket_path, proc, opts.startup_timeout_s)
+            transport = _connect_with_retry(socket_path, stderr_log, proc, opts.startup_timeout_s)
             self._transport = transport
             return Page(transport)
         except BaseException:
@@ -143,9 +147,11 @@ class Session:
         self.close()
 
     def close(self) -> None:
-        """Close the IPC transport, terminate the daemon, and clean up the socket dir safely."""
+        """Gracefully shut down the daemon (unwinding browser & socket guards) and clean up."""
         try:
             if self._transport is not None:
+                with contextlib.suppress(OSError, WayboundDaemonError):
+                    self._transport.shutdown()
                 with contextlib.suppress(OSError):
                     self._transport.close()
                 self._transport = None
@@ -154,19 +160,17 @@ class Session:
                 if self._proc is not None:
                     proc = self._proc
                     self._proc = None
-                    try:
-                        if proc.poll() is None:
+                    if proc.poll() is None:
+                        try:
+                            proc.wait(timeout=2.0)
+                        except subprocess.TimeoutExpired:
                             proc.terminate()
                             try:
-                                proc.wait(timeout=3.0)
+                                proc.wait(timeout=2.0)
                             except subprocess.TimeoutExpired:
                                 proc.kill()
                                 with contextlib.suppress(subprocess.TimeoutExpired):
                                     proc.wait(timeout=1.0)
-                    finally:
-                        if proc.stderr is not None:
-                            with contextlib.suppress(OSError):
-                                proc.stderr.close()
             finally:
                 if self._tmp_dir is not None:
                     with contextlib.suppress(OSError):

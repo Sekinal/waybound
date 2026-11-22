@@ -53,6 +53,8 @@ pub enum Request {
         #[serde(default)]
         modifiers: Vec<KeyModifier>,
     },
+    /// Request a graceful daemon shutdown (unwinds RAII browser & socket guards).
+    Shutdown,
 }
 
 /// Wire-level response returned by `waybound-daemon`.

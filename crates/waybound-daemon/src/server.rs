@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ const MAX_UNIX_PATH_BYTES: usize = 100;
 const MAX_FRAME_BYTES: u64 = 1024 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(75);
 const MAX_WAIT_TIMEOUT_MS: u64 = 120_000;
 
@@ -53,6 +54,7 @@ pub struct ServerOptions {
 
 struct SessionState {
     last_cursor: Mutex<Point>,
+    shutdown: AtomicBool,
     options: ServerOptions,
 }
 
@@ -60,6 +62,7 @@ impl SessionState {
     const fn new(options: ServerOptions) -> Self {
         Self {
             last_cursor: Mutex::new(Point { x: 0.0, y: 0.0 }),
+            shutdown: AtomicBool::new(false),
             options,
         }
     }
@@ -109,6 +112,10 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
                 Ok(()) => Response::Ok,
                 Err(err) => Response::from(&err),
             }
+        }
+        Request::Shutdown => {
+            state.shutdown.store(true, Ordering::Release);
+            Response::Ok
         }
     }
 }
@@ -277,7 +284,8 @@ fn prepare_socket_path(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Binds a Unix domain socket at `socket_path` and serves requests concurrently.
+/// Binds a Unix domain socket at `socket_path` and serves requests concurrently
+/// until a graceful [`Request::Shutdown`] is received.
 ///
 /// # Errors
 ///
@@ -294,14 +302,20 @@ pub fn serve_unix(
         path: socket_path.to_path_buf(),
     };
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
     tracing::info!(socket = %socket_path.display(), "listening on unix socket");
 
     let active_connections = Arc::new(AtomicUsize::new(0));
     let state = Arc::new(SessionState::new(options));
 
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
+    while !state.shutdown.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                if let Err(err) = stream.set_nonblocking(false) {
+                    tracing::warn!(error = %err, "failed to configure accepted stream");
+                    continue;
+                }
+
                 let current = active_connections.fetch_add(1, Ordering::AcqRel);
                 if current >= MAX_CONCURRENT_CONNECTIONS {
                     let _ = active_connections.fetch_sub(1, Ordering::AcqRel);
@@ -323,6 +337,9 @@ pub fn serve_unix(
                     }
                 });
             }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
             Err(err)
                 if matches!(
                     err.kind(),
@@ -337,6 +354,7 @@ pub fn serve_unix(
         }
     }
 
+    tracing::info!("shutdown requested; exiting accept loop cleanly");
     Ok(())
 }
 
@@ -394,6 +412,9 @@ fn handle_connection(
         };
 
         write_response(&mut stream, &response)?;
+        if state.shutdown.load(Ordering::Acquire) {
+            break;
+        }
     }
 
     Ok(())
