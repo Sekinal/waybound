@@ -38,6 +38,7 @@ def test_ergonomic_launch_full_workflow() -> None:
         page.goto("https://example.com")
         page.get_by_role(Role.TEXTBOX, name="Origin").fill("NRT")
         page.get_by_role(Role.BUTTON, name="Search").click()
+        page.get_by_role(Role.BUTTON, name="Search").dblclick()
         page.scroll(delta_y=-200.0)
         page.press("enter")
         page.press("l", modifiers=(KeyModifier.META,))

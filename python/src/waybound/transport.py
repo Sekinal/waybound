@@ -233,7 +233,7 @@ class UnixSocketTransport:
 
     def dblclick(self, query: LocatorQuery) -> None:
         """Locate the target element and dispatch a native double-click."""
-        self._expect_ok({"method": "dblclick", "query": _encode_query(query)}, "dblclick")
+        self._expect_ok({"method": "dbl_click", "query": _encode_query(query)}, "dblclick")
 
     def select_option(
         self,
