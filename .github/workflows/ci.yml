@@ -39,7 +39,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v5
       - name: Build daemon for end-to-end tests
-        run: cargo build -p waybound-daemon
+        run: cargo build -p waybound-daemon --features replay
         working-directory: .
       - name: Sync dependencies
         run: uv sync --dev

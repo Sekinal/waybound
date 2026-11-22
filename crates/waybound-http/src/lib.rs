@@ -12,6 +12,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use waybound_core::{
@@ -23,6 +24,9 @@ use wreq::http2::{Http2Options, PseudoId, PseudoOrder, SettingId, SettingsOrder}
 use wreq::tls::compress::{CertificateCompressionAlgorithm, CertificateCompressor, Codec};
 use wreq::tls::{AlpnProtocol, AlpsProtocol, TlsOptions, TlsVersion};
 use wreq::{Client, Emulation, Group, Method, Proxy, Uri};
+
+/// Maximum HTTP response body buffered per request (16 MiB).
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Errors returned by [`HandoffClient`].
 #[derive(Debug, Error)]
@@ -598,10 +602,17 @@ impl HandoffClient {
             }
         }
 
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| HandoffError::Request(e.to_string()))?;
+        let mut bytes = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(item) = stream.next().await {
+            let chunk = item.map_err(|e| HandoffError::Request(e.to_string()))?;
+            if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                return Err(HandoffError::Request(format!(
+                    "response body exceeded {MAX_RESPONSE_BYTES}-byte limit"
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         let body_str = String::from_utf8_lossy(&bytes).into_owned();
 
         Ok(HandoffResponse {

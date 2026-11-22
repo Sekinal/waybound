@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release --bin waybound-daemon
+RUN cargo build --release --bin waybound-daemon --features replay
 
 FROM debian:trixie-slim AS runtime
 ARG TARGETARCH

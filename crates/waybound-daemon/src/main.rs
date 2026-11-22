@@ -7,6 +7,7 @@ mod launcher;
 mod mock_driver;
 mod net_tap;
 mod proxy;
+#[cfg(feature = "replay")]
 mod replay;
 mod server;
 
@@ -384,6 +385,20 @@ const TERMINATION_SIGNALS: &[i32] = &[
 #[cfg(not(unix))]
 const TERMINATION_SIGNALS: &[i32] = &[signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT];
 
+fn run_replay_mode() -> ExitCode {
+    #[cfg(feature = "replay")]
+    {
+        replay::run_replay_stdio()
+    }
+    #[cfg(not(feature = "replay"))]
+    {
+        tracing::error!(
+            "waybound-daemon was built without `--features replay`; rebuild with `cargo build -p waybound-daemon --features replay`"
+        );
+        ExitCode::FAILURE
+    }
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -401,7 +416,7 @@ fn main() -> ExitCode {
     };
 
     if cli.replay {
-        return replay::run_replay_stdio();
+        return run_replay_mode();
     }
 
     let tcp_addr = cli.tcp_addr.clone();

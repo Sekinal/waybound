@@ -101,7 +101,7 @@ class HandoffHttpClient:
             [str(binary), "--replay"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             bufsize=1,
@@ -309,6 +309,19 @@ class HandoffHttpClient:
         if proc.stdout is not None:
             with contextlib.suppress(OSError):
                 proc.stdout.close()
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
+
+    def _read_stderr_tail(self, proc: subprocess.Popen[str]) -> str:
+        if proc.stderr is None:
+            return ""
+        try:
+            proc.wait(timeout=1.0)
+            raw = proc.stderr.read()
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        return raw.strip()[-500:]
 
     def _rpc(self, payload: dict[str, object]) -> dict[str, object]:
         with self._lock:
@@ -320,12 +333,20 @@ class HandoffHttpClient:
                 proc.stdin.flush()
                 raw_line = proc.stdout.readline()
             except OSError as exc:
+                detail = self._read_stderr_tail(proc)
                 self.close()
-                raise WayboundDaemonError("io_error", str(exc)) from exc
+                msg = f"{exc}: {detail}" if detail else str(exc)
+                raise WayboundDaemonError("io_error", msg) from exc
 
             if not raw_line:
+                detail = self._read_stderr_tail(proc)
                 self.close()
-                raise WayboundDaemonError("eof", "replay worker closed unexpectedly")
+                msg = (
+                    f"replay worker closed unexpectedly: {detail}"
+                    if detail
+                    else "replay worker closed unexpectedly"
+                )
+                raise WayboundDaemonError("eof", msg)
 
             try:
                 decoded: object = json.loads(raw_line)

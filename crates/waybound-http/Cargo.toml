@@ -9,13 +9,14 @@ description = "Dynamic BoringSSL + HTTP/2 browser-to-HTTP handoff client replayi
 [dependencies]
 brotli.workspace = true
 flate2.workspace = true
+futures-util = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing.workspace = true
 waybound-core.workspace = true
-wreq = { version = "6.0.0-rc.31", features = ["cookies", "gzip", "brotli", "deflate", "zstd", "socks"] }
+wreq = { version = "6.0.0-rc.31", features = ["cookies", "gzip", "brotli", "deflate", "zstd", "socks", "stream"] }
 
 [lints]
 workspace = true

@@ -237,7 +237,9 @@ impl HttpConnectionCorrelator {
                 if let Some(ref rec) = self.fingerprint {
                     if ftype == H2_FRAME_SETTINGS && (flags & H2_FLAG_ACK) == 0 {
                         let settings: Vec<Http2Setting> = payload
-                            .chunks_exact(6)
+                            .as_chunks::<6>()
+                            .0
+                            .iter()
                             .map(|c| Http2Setting {
                                 id: u16::from_be_bytes([c[0], c[1]]),
                                 value: u32::from_be_bytes([c[2], c[3], c[4], c[5]]),
