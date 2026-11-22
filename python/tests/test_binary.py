@@ -2,9 +2,25 @@
 
 from __future__ import annotations
 
+import tomllib
+from pathlib import Path
+
 import pytest
 
-from waybound.binary import cached_daemon_path, download_daemon_binary, platform_artifact_name
+from waybound.binary import (
+    _FALLBACK_VERSION,
+    DEFAULT_VERSION,
+    cached_daemon_path,
+    download_daemon_binary,
+    platform_artifact_name,
+)
+
+
+def test_default_version_matches_the_package_version() -> None:
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    package_version = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert f"v{package_version}" == DEFAULT_VERSION
+    assert f"v{package_version}" == _FALLBACK_VERSION
 
 
 def test_platform_artifact_name_returns_known_target() -> None:
