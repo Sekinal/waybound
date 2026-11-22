@@ -9,6 +9,7 @@ pub mod atspi;
 pub mod input;
 mod process;
 pub mod screenshot;
+pub mod x11_native;
 pub mod xvfb;
 
 pub use atspi::AtspiSnapshot;
@@ -16,37 +17,42 @@ pub use input::DisplayServer;
 pub use xvfb::{HeadlessDisplayConfig, HeadlessDisplaySession};
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
+use tracing::debug;
 use waybound_core::{AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Result};
 
 /// Native Linux browser driver targeting unmodified Chrome/Chromium over AT-SPI2
-/// and OS-level X11/Wayland input and screen capture utilities.
+/// and pure-Rust X11 `XTEST`/`GetImage` (with `xdotool`/`ydotool`/`scrot`/`grim` fallback).
 #[derive(Debug, Clone)]
 pub struct LinuxDriver {
     pid: Option<i32>,
     display: Option<String>,
     display_server: Option<DisplayServer>,
+    x11: Arc<Mutex<Option<x11_native::X11Client>>>,
 }
 
 impl LinuxDriver {
     /// Creates a new [`LinuxDriver`] optionally scoped to browser process `pid`.
     #[must_use]
-    pub const fn new(pid: Option<i32>) -> Self {
+    pub fn new(pid: Option<i32>) -> Self {
         Self {
             pid,
             display: None,
             display_server: None,
+            x11: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Creates a new [`LinuxDriver`] targeting an optional browser `pid` and explicit
     /// X11 `DISPLAY` string (such as `":99"` for a headless `Xvfb` session).
     #[must_use]
-    pub const fn with_display(pid: Option<i32>, display: Option<String>) -> Self {
+    pub fn with_display(pid: Option<i32>, display: Option<String>) -> Self {
         Self {
             pid,
             display,
             display_server: None,
+            x11: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -84,6 +90,26 @@ impl LinuxDriver {
         }
         DisplayServer::detect()
     }
+
+    fn with_x11<T, F>(&self, op: F) -> Option<Result<T>>
+    where
+        F: FnOnce(&x11_native::X11Client) -> Result<T>,
+    {
+        if self.resolved_display_server() != DisplayServer::X11 {
+            return None;
+        }
+        let mut guard = self.x11.lock().ok()?;
+        if guard.is_none() {
+            match x11_native::X11Client::connect(self.display.as_deref()) {
+                Ok(client) => *guard = Some(client),
+                Err(err) => {
+                    debug!(%err, "native X11Client unavailable; falling back to CLI tools");
+                    return None;
+                }
+            }
+        }
+        guard.as_ref().map(op)
+    }
 }
 
 impl Driver for LinuxDriver {
@@ -107,6 +133,12 @@ impl Driver for LinuxDriver {
     }
 
     fn screenshot(&self, output_path: &Path) -> Result<()> {
+        if self
+            .with_x11(|client| client.capture_png(output_path))
+            .is_some_and(|r| r.is_ok())
+        {
+            return Ok(());
+        }
         screenshot::capture_screenshot(
             output_path,
             self.resolved_display_server(),
@@ -115,6 +147,12 @@ impl Driver for LinuxDriver {
     }
 
     fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
+        if self
+            .with_x11(|client| client.dispatch_input(event))
+            .is_some_and(|r| r.is_ok())
+        {
+            return Ok(());
+        }
         input::dispatch_input(
             event,
             self.resolved_display_server(),

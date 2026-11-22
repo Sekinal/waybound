@@ -6,10 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+png = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 waybound-core.workspace = true
+x11rb = { version = "0.13", features = ["xtest"] }
 
 [lints]
 workspace = true

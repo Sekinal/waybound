@@ -382,7 +382,7 @@ pub fn build_ydotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
 /// `xdotool type` dynamically remaps temporary X11 keycodes for non-ASCII / CJK characters
 /// and frees them before Chromium finishes processing the event, silently dropping characters.
 /// Returns `Ok(true)` if `xclip` succeeded, or `Ok(false)` if `xclip` is unavailable.
-fn try_paste_unicode_x11(ch: char, display: Option<&str>) -> Result<bool> {
+pub(crate) fn try_paste_unicode_x11(ch: char, display: Option<&str>) -> Result<bool> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     use std::thread;
