@@ -40,7 +40,8 @@ with launch(LaunchOptions(backend="android", serial="<device-ip>:5555")) as page
 
 ## Limitations of the `android` backend
 
-- Input goes through `adb shell input`, which cannot send modifier chords: modifiers are dropped, and `fill()` appends to the field instead of replacing its content.
+- Input goes through `adb shell input`, which cannot send modifier chords: modifiers are dropped, and `fill()` appends to the field instead of replacing its content. Browser shortcuts are affected too: `reload()`, `new_tab()`, `close_tab()`, `next_tab()` and `prev_tab()` send the bare key (`r`, `t`, `w`, Tab), and `go_back()`/`go_forward()` send a bare left/right arrow. `goto()` works (it opens the URL with `am start`).
 - Pointer motion is not simulated; taps land directly on the target.
 - Accessibility snapshots come from `uiautomator dump` and are capped at 2,000 nodes.
+- `timezone=` and `locale=` are ignored when connecting with `serial=`; `timezone=` is only applied by the experimental `launch_waydroid=True` path.
 - Passive response capture (`ssl_keylog`) does not apply: nothing configures a TLS key log inside Android.

@@ -62,7 +62,7 @@ podman run --rm \
 
 ## Compose
 
-[`compose.yaml`](../compose.yaml) builds the image and runs `waybound doctor` with the capture capabilities added. Each container runs its own Xvfb (always display `:99`), so run one browser session per container.
+[`compose.yaml`](../compose.yaml) builds the image and runs `waybound doctor` with the capture capabilities added. The entrypoint only starts a D-Bus session and the AT-SPI2 bus; Xvfb is started by the daemon for sessions with `headless_xvfb=True`, always on display `:99`, so run one such session per container.
 
 ```bash
 podman compose up --build

@@ -26,7 +26,7 @@
 
 ## Wire Protocol (JSON-lines over `AF_UNIX` or loopback TCP)
 
-Each request and response is a single newline-delimited JSON object defined in `crates/waybound-core/src/protocol.rs`. Requests are tagged by `method`, responses by `status`. A `query` is a `LocatorQuery`: `{"role": ..., "name": ..., "exact": false, "nth": 0, "within": {...}}`.
+Each request and response is a single newline-delimited JSON object defined in `crates/waybound-core/src/protocol.rs`. Requests are tagged by `method`, responses by `status`. A `query` is a `LocatorQuery`: `{"role": ..., "name": ..., "exact": false, "nth": 0, "within": {...}}`. `exact` is required on the wire; `role` and `name` may be `null` or omitted, `nth` defaults to 0, and `within` may be omitted.
 
 | Request (`method`) | Fields | Response (`status`) |
 |---|---|---|
@@ -40,20 +40,20 @@ Each request and response is a single newline-delimited JSON object defined in `
 | `dbl_click` | `query` | `ok` |
 | `select_option` | `query`, `label?`, `index?` | `ok` |
 | `fill` | `query`, `text` | `ok` |
-| `navigate` | `url` (`http://` or `https://`) | `ok` |
+| `navigate` | `url` (`http://` or `https://`; other schemes return `io_error`) | `ok` |
 | `reload` / `go_back` / `go_forward` | | `ok` |
 | `new_tab` | `url?` | `ok` |
 | `close_tab` / `next_tab` / `prev_tab` | | `ok` |
 | `scroll` | `delta_x`, `delta_y` | `ok` |
-| `press` | `key`, `modifiers` | `ok` |
+| `press` | `key`, `modifiers?` | `ok` |
 | `captured_responses` | `url_contains?` | `http_responses` (`responses`) |
 | `wait_for_response` | `url_contains`, `timeout_ms` (capped at 120 s) | `http_response` (`response`) |
-| `wait_for_network_idle` | `idle_ms`, `timeout_ms` | `ok` |
+| `wait_for_network_idle` | `idle_ms` (clamped to 50–10,000 ms), `timeout_ms` (capped at 60 s) | `ok` |
 | `screenshot` | `path` | `ok` |
 | `shutdown` | | `ok` |
 | *(any error)* | | `error` (`code`, `message`) |
 
-Error codes: `element_not_found`, `backend_unavailable`, `timeout`, `io_error`, `invalid_request` (unparseable request or non-finite scroll deltas), and `frame_too_large`.
+Error codes: `element_not_found`, `backend_unavailable`, `timeout`, `io_error`, `invalid_request` (unparseable request or non-finite scroll deltas), `frame_too_large`, and `serialization_error` (the daemon failed to encode its response).
 
 `hover`, `click`, `dbl_click`, `select_option` and `fill` wait up to 5 s for the element to appear before acting.
 

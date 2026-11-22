@@ -14,13 +14,13 @@ Instead of forking Chromium/Firefox, patching C++ getters, and fighting CDP/Jugg
 
 ```bash
 pip install waybound
-waybound fetch       # Downloads the prebuilt waybound-daemon from GitHub Releases
-waybound doctor      # Reports whether the daemon, Chrome, tshark, and adb/waydroid can be found
+waybound fetch v0.4.0   # Downloads that release's prebuilt waybound-daemon
+waybound doctor         # Reports whether the daemon, Chrome, tshark, and adb/waydroid can be found
 ```
 
-The wheel is pure Python and does not contain the daemon. `waybound fetch [version]` downloads it into `~/.cache/waybound/<version>/` (prebuilt for macOS arm64, Linux x86_64/arm64, and Windows x86_64) and checks it against the `.sha256` file published in the same release. Elsewhere, build it with `cargo build --release -p waybound-daemon` and put it on `PATH` or set `WAYBOUND_DAEMON_BIN`.
+The wheel is pure Python and does not contain the daemon. `waybound fetch <version>` downloads it from the GitHub release tagged `<version>` (with the `v` prefix, e.g. `v0.4.0`) into `~/.cache/waybound/<version>/` (prebuilt for macOS arm64, Linux x86_64/arm64, and Windows x86_64) and checks it against the `.sha256` file published in the same release. Without an argument it fetches the release pinned in `waybound/binary.py`, which can lag behind the installed package, so pass the version explicitly to match your SDK. Elsewhere, build it with `cargo build --release -p waybound-daemon` and put it on `PATH` or set `WAYBOUND_DAEMON_BIN`.
 
-`waybound doctor` only checks that files and commands exist. It does not check macOS Accessibility or Screen Recording permissions, packet-capture (BPF) permissions, or the Linux AT-SPI2/X11 tools.
+`waybound doctor` only checks that files and commands exist. For Chrome it looks only at `/Applications/Google Chrome.app` and `/Applications/Google Chrome Canary.app` on macOS, and at `/usr/bin/google-chrome`, `/usr/bin/google-chrome-stable` and `/usr/bin/chromium` everywhere else (including Windows, where it therefore reports Chrome as missing); it does not read `WAYBOUND_CHROME_BIN` or check `/usr/bin/chromium-browser`, both of which the daemon uses. It does not check macOS Accessibility or Screen Recording permissions, packet-capture (BPF) permissions, or the Linux AT-SPI2/X11 tools.
 
 ### MCP Server (Antigravity, Claude Code, Cursor, Codex)
 
@@ -84,6 +84,7 @@ async def main() -> None:
             ssl_keylog=Path("/tmp/my-chrome-profile/sslkeys.log"),
             proxy="socks5://user:pass@proxy.example.com:1080",
             timezone="America/New_York",
+            locale="en_US.UTF-8",  # sets LANG/LC_ALL only; see Limitations
         )
     ) as page:
         search = page.get_by_role(Role.TEXTBOX, name="Search Wikipedia")
@@ -108,7 +109,7 @@ asyncio.run(main())
 | Backend | Accessibility tree | Input | Screenshot | Status |
 |---|---|---|---|---|
 | `macos` | `AXUIElement`, scoped to `AXWebArea` | `CGEvent` posted to the HID event tap; Chrome is brought to the front before clicks and key presses | Browser window (`screencapture`) | Main development platform; unit tests only in CI |
-| `linux` | AT-SPI2 over D-Bus (`zbus`), falling back to a `python3` `gi.repository.Atspi` helper | X11 `XTEST` (`x11rb`), falling back to `xdotool`; `ydotool` on Wayland | Whole display (X11 `GetImage`, `import`/`scrot`, or `grim` on Wayland) | Used by the container image; unit tests only in CI |
+| `linux` | AT-SPI2 over D-Bus (`zbus`), falling back to a `python3` `gi.repository.Atspi` helper (PyGObject + `gir1.2-atspi-2.0`) | X11 `XTEST` (`x11rb`), falling back to `xdotool`; `ydotool` on Wayland | Whole display (X11 `GetImage`, `import`/`scrot`, or `grim` on Wayland) | Used by the container image; unit tests only in CI |
 | `windows` | UI Automation, queried through a PowerShell helper | Win32 `SendInput` | Primary screen (PowerShell `System.Drawing`) | Live smoke test against real Chrome in CI |
 | `android` | `uiautomator dump` over ADB | `adb shell input` (key modifiers are dropped) | `screencap` | Works against an existing device via `serial=`; `launch_waydroid` is experimental (see [docs/waydroid-linux.md](docs/waydroid-linux.md)) |
 
@@ -117,12 +118,12 @@ The SDK talks to the daemon over a Unix socket, or loopback TCP on Windows (`use
 ## Limitations
 
 - **One visible desktop session at a time on macOS and Windows.** Input moves the real cursor and goes to the foreground window. On macOS the driver activates Chrome first; on Windows it does not, so Chrome must already be in front. On Linux, `headless_xvfb=True` gives each session its own Xvfb, but always on display `:99`, so run one such session per host or container (or start your own Xvfb and pass `display=`).
-- **What a session owns.** Each `launch()` starts its own daemon, its own Chrome process with a fresh temporary profile (unless `profile_dir` is set), its own proxy forwarder, and its own store of captured responses. Connections to the same daemon share all of these.
-- **Locators are Playwright-style in API, not in strictness.** Names match as a case-insensitive substring, or with `exact=True` as a case-sensitive exact string; whitespace is not normalised. When several elements match, the `nth` one (default the first) is used silently; there is no strict-mode error. `hover`, `click`, `fill`, `dblclick` and `select_option` wait up to 5 s for the element to appear in the accessibility tree and scroll it into view when the viewport is known, but do not wait for it to be visible, enabled, or stable. A locator chained from another (`page.get_by_role(...).get_by_role(...)`) is scoped by screen position (the child's centre must lie inside the parent's bounds), not by tree ancestry.
-- **Accessibility snapshots are capped** at 2,000 nodes on macOS and Android and 4,000 on Linux and Windows; larger pages are truncated without an error.
+- **What a session owns.** Each `launch()` starts its own daemon and its own store of captured responses. With `launch_chrome=True` it also starts its own Chrome process, with a fresh temporary profile unless `profile_dir` is set. It gets its own loopback proxy forwarder only when one is needed: `ssl_keylog`, `block_hosts`, or a `proxy` with credentials. Connections to the same daemon share all of these.
+- **Locators are Playwright-style in API, not in strictness.** Names match as a case-insensitive substring, or with `exact=True` as a case-sensitive exact string; whitespace is not normalised. When several elements match, the `nth` one (default the first) is used silently; there is no strict-mode error. `hover`, `click`, `fill`, `dblclick` (broken on 0.4.0: the SDK sends `dblclick` but the daemon expects `dbl_click`; fixed in #46) and `select_option` wait up to 5 s for the element to appear in the accessibility tree and scroll it into view when the viewport is known, but do not wait for it to be visible, enabled, or stable. A locator chained from another (`page.get_by_role(...).get_by_role(...)`) is scoped by screen position (the child's centre must lie inside the parent's bounds), not by tree ancestry.
+- **Accessibility snapshots are capped** at 2,000 nodes on macOS and Android and 4,000 on Linux and Windows; on macOS traversal also stops at depth 40 or after visiting 10,000 nodes. Larger pages are truncated without an error.
 - **Passive capture** has two paths:
-  - With `launch_chrome=True` and `ssl_keylog=...`, Chrome is pointed at the built-in loopback forwarder, which decrypts the TCP connections it relays in-process. It handles TLS 1.3 (AES-GCM and ChaCha20-Poly1305), HTTP/1.1 and HTTP/2, and `gzip`/`deflate`/`br` bodies. It does not see QUIC/HTTP/3, TLS 1.2, or `zstd` bodies, and it does not work when chaining through an upstream `http://` proxy (direct and `socks5://` upstreams work). `wait_for_network_idle` only counts requests on this path.
-  - When attaching to an existing Chrome (`pid=...`) with `ssl_keylog=...`, the daemon runs `tshark` instead, capturing TCP/UDP port 443 on `en0` (macOS) or `any` (Linux); override with `WAYBOUND_NET_IFACE`. It needs packet-capture permissions and `tshark` in `/opt/homebrew/bin`, `/usr/local/bin`, or `/usr/bin`. HTTP/3 support depends on tshark's QUIC dissector and is not tested.
+  - With `launch_chrome=True` and `ssl_keylog=...`, Chrome is pointed at the built-in loopback forwarder, which decrypts the HTTPS (`CONNECT`) tunnels it relays, in-process. Plain `http://` requests are not captured. It handles TLS 1.3 (AES-GCM and ChaCha20-Poly1305), HTTP/1.1 and HTTP/2, and `gzip`/`deflate`/`br` bodies. It does not see QUIC/HTTP/3, TLS 1.2, or `zstd` bodies, and it does not work when chaining through an upstream `http://` proxy (direct and `socks5://` upstreams work). `wait_for_network_idle` only counts requests on this path.
+  - Whenever the daemon did not launch Chrome itself and `ssl_keylog=...` is set (for example when attaching with `pid=...`), it runs `tshark` instead. The running Chrome must have been started with `SSLKEYLOGFILE` pointing at that same file. The tap captures TCP/UDP port 443 on `en0` (macOS) or `any` (Linux); override with `WAYBOUND_NET_IFACE`. It needs packet-capture permissions and `tshark` in `/opt/homebrew/bin`, `/usr/local/bin`, or `/usr/bin`. HTTP/3 support depends on tshark's QUIC dissector and is not tested.
   - Nothing sets up a key log inside Android, so passive capture does not apply to the `android` backend.
 - **Fingerprint.** `waybound` reports whatever the stock browser reports. On a macOS or Windows desktop that is the real OS, GPU and fonts; in the Linux container it is Chrome on Xvfb with no GPU; on Waydroid it is whatever the Android container image reports, which is not the same as a physical phone.
 - **`timezone=` and `locale=`** set `TZ`, and `LANG`/`LC_ALL`, in Chrome's environment (on Waydroid, `timezone=` sets `persist.sys.timezone`). Nothing passes `--lang` or changes `Accept-Language`. Whether `navigator.language` follows `LANG` depends on the platform and has not been verified on macOS.
@@ -134,7 +135,7 @@ The SDK talks to the daemon over a Unix socket, or loopback TCP on Windows (`use
 
 - **`crates/waybound-core`** (`unsafe_code = "forbid"`) — Platform-agnostic `Driver` trait, semantic `LocatorQuery`/`Role` (including chained `within` scopes), Flash & Hogan minimum-jerk behavioral motion planner (`motion.rs`), and JSON-lines wire protocol.
 - **`crates/waybound-driver-macos`** — Official macOS Chrome via `AXUIElement` (`AXWebArea`-scoped), `CGEvent` posted to the HID event tap with Carbon keycodes, and browser-window screenshots (`CGWindowListCopyWindowInfo` + `screencapture`).
-- **`crates/waybound-driver-linux`** (`#![forbid(unsafe_code)]`) — Linux desktop Chrome/Chromium via AT-SPI2 (`zbus`, with a `pyatspi` fallback), X11 `XTEST` via `x11rb` (with `xdotool` fallback) / Wayland (`ydotool`), X11 `GetImage` / `import` / `scrot` / `grim` screenshots, and RAII headless `Xvfb` (`--headless-xvfb`).
+- **`crates/waybound-driver-linux`** (`#![forbid(unsafe_code)]`) — Linux desktop Chrome/Chromium via AT-SPI2 (`zbus`, with a `python3` `gi.repository.Atspi` helper (PyGObject + `gir1.2-atspi-2.0`) as fallback), X11 `XTEST` via `x11rb` (with `xdotool` fallback) / Wayland (`ydotool`), X11 `GetImage` / `import` / `scrot` / `grim` screenshots, and RAII headless `Xvfb` (`--headless-xvfb`).
 - **`crates/waybound-driver-windows`** — Windows Chrome via `UIAutomation` (PowerShell helper), audited Win32 `SendInput`, and `System.Drawing` PNG screenshots.
 - **`crates/waybound-driver-android`** (`unsafe_code = "forbid"`) — Pure-Rust ADB + `uiautomator` XML parser + experimental headless **Waydroid** launcher (see [docs/waydroid-linux.md](docs/waydroid-linux.md)).
 - **`crates/waybound-net`** (`#![forbid(unsafe_code)]`) — Pure-Rust passive TLS 1.3 record decryptor, `SSLKEYLOGFILE` reader, HTTP/1.1 and HTTP/2 (HPACK) response correlator with `gzip`/`deflate`/`br` decompression, and L4 hostname blocker.
