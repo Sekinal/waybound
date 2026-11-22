@@ -102,6 +102,16 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+> **Proxy credentials and local users.** The upstream proxy URL reaches the daemon via its
+> environment, not argv, and is stripped from every process the daemon spawns (Chrome
+> included). Chrome talks to a loopback forwarder that adds the credentials. On Linux the
+> forwarder only accepts connections from processes running as the same user, with two
+> caveats: if it cannot read its own socket in `/proc/net/tcp` at startup it warns and
+> accepts everyone, and when the daemon runs as root (or as the unmapped UID 65534) the
+> check does not separate users, which it also warns about. On macOS and Windows it cannot
+> check, so any local user can relay traffic through your upstream proxy while a session
+> runs. See [ARCHITECTURE.md](ARCHITECTURE.md#upstream-proxy-forwarder).
+
 ---
 
 ## Platform Support

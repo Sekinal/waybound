@@ -1,6 +1,6 @@
 //! Headless Xvfb virtual framebuffer configuration and RAII session guard.
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -117,7 +117,7 @@ impl HeadlessDisplaySession {
         let args = build_xvfb_args(&config)?;
         debug!(?args, "starting headless Xvfb display");
 
-        let mut cmd = Command::new("Xvfb");
+        let mut cmd = waybound_core::process::command("Xvfb");
         let _ = cmd
             .args(&args)
             .stdin(Stdio::null())

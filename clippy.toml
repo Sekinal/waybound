@@ -1,0 +1,5 @@
+# Every child process must be created through `waybound_core::process::command`, which strips
+# secrets (the upstream proxy URL in `WAYBOUND_PROXY`) from the child's environment.
+disallowed-methods = [
+  { path = "std::process::Command::new", reason = "use waybound_core::process::command so WAYBOUND_PROXY is scrubbed" },
+]

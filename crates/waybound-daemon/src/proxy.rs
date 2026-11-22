@@ -6,6 +6,25 @@
 //! This module binds a loopback-only unauthenticated listener (`127.0.0.1:0`) and
 //! handles upstream authentication transparently — without extensions, auth prompts,
 //! or TLS MITM.
+//!
+//! # Local exposure
+//!
+//! Because the listener needs no credentials, anything that can connect to it can relay
+//! traffic through the user's authenticated upstream proxy. Every accepted connection is
+//! therefore checked by a [`PeerVerifier`] before a single byte is read: refused clients get
+//! `403 Forbidden`, no upstream connection is opened and no credentials are sent.
+//!
+//! - **Linux:** only sockets owned by the daemon's effective UID are admitted (looked up in
+//!   `/proc/net/tcp{,6}`). Other users are locked out; other processes of the *same* user
+//!   are not, as they could read the credentials from the daemon's environment anyway.
+//!   Caveats, each logged as a startup warning: if the daemon cannot see its own listener
+//!   in `/proc/net/tcp` it runs unrestricted, and as root (UID 0) or the overflow UID 65534
+//!   the UID check does not separate users.
+//! - **macOS / Windows:** no check is possible without FFI or a per-connection subprocess,
+//!   so any local process, under any user, can use the forwarder while a session runs.
+//!
+//! See [`crate::peer`] for the details and rationale. Child processes never inherit the
+//! `WAYBOUND_PROXY` variable (see [`waybound_core::process`]).
 
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -15,6 +34,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use waybound_core::Result;
+
+use crate::peer::{PeerDecision, PeerVerifier, platform_verifier};
 use waybound_net::{
     Direction, HostBlocker, InflightCounter, KeyLogStore, PassiveConnectionTap, ResponseCallback,
 };
@@ -29,6 +50,11 @@ const MAX_HEADER_LINES: usize = 128;
 const MAX_CONCURRENT_TUNNELS: usize = 128;
 const MAX_REASON_PHRASE_CHARS: usize = 64;
 const CONNECT_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+/// How long a refused client gets to finish sending its request before the socket closes
+/// (closing with unread data would reset the connection and could discard the `403`).
+const REJECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// Minimum spacing of refusal warnings, so another local user cannot flood the log.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Read-only observer of the bytes relayed through a `CONNECT` tunnel.
 ///
@@ -168,6 +194,9 @@ struct ForwarderConfig {
     /// Test seam: when set, replaces the passive tap for every `CONNECT` tunnel.
     #[cfg(test)]
     test_observer: Option<Arc<dyn TunnelObserver>>,
+    /// Test seam: when set, replaces the platform's peer verifier.
+    #[cfg(test)]
+    test_peer_verifier: Option<Arc<dyn PeerVerifier>>,
 }
 
 impl ForwarderConfig {
@@ -206,7 +235,22 @@ impl ProxyForwarder {
     /// the listener thread cannot be spawned.
     #[cfg(test)]
     pub fn start(upstream: UpstreamProxy) -> Result<Self> {
-        Self::start_with_options(Some(upstream), HostBlocker::default(), None)
+        Self::start_with_verifier(upstream, Arc::new(crate::peer::AllowAll))
+    }
+
+    /// Starts a forwarder that admits clients according to `verifier`.
+    #[cfg(test)]
+    fn start_with_verifier(
+        upstream: UpstreamProxy,
+        verifier: Arc<dyn PeerVerifier>,
+    ) -> Result<Self> {
+        Self::spawn(ForwarderConfig {
+            upstream: Some(upstream),
+            blocker: HostBlocker::default(),
+            tap: None,
+            test_observer: None,
+            test_peer_verifier: Some(verifier),
+        })
     }
 
     /// Starts a forwarder whose `CONNECT` tunnels report relayed bytes to `observer`.
@@ -220,6 +264,7 @@ impl ProxyForwarder {
             blocker: HostBlocker::default(),
             tap: None,
             test_observer: Some(observer),
+            test_peer_verifier: Some(Arc::new(crate::peer::AllowAll)),
         })
     }
 
@@ -241,6 +286,8 @@ impl ProxyForwarder {
             tap,
             #[cfg(test)]
             test_observer: None,
+            #[cfg(test)]
+            test_peer_verifier: None,
         })
     }
 
@@ -248,6 +295,15 @@ impl ProxyForwarder {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let local_addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
+
+        #[cfg(test)]
+        let verifier = cfg
+            .test_peer_verifier
+            .clone()
+            .unwrap_or_else(|| platform_verifier(local_addr));
+        #[cfg(not(test))]
+        let verifier = platform_verifier(local_addr);
+        let refusals = Arc::new(RefusalLog::default());
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_ref = Arc::clone(&shutdown);
@@ -274,6 +330,8 @@ impl ProxyForwarder {
                                 continue;
                             }
                             let c = Arc::clone(&cfg_thread);
+                            let v = Arc::clone(&verifier);
+                            let r = Arc::clone(&refusals);
                             let guard = TunnelGuard {
                                 counter: Arc::clone(&active_tunnels),
                             };
@@ -281,7 +339,7 @@ impl ProxyForwarder {
                                 .name("waybound-proxy-conn".to_owned())
                                 .spawn(move || {
                                     let _guard = guard;
-                                    if let Err(err) = handle_client(client, &c) {
+                                    if let Err(err) = serve_client(client, &c, v.as_ref(), &r) {
                                         tracing::debug!(error = %err, "proxy client tunnel closed");
                                     }
                                 });
@@ -345,6 +403,103 @@ fn connect_upstream(host_port: &str) -> io::Result<TcpStream> {
             format!("no resolved addresses for upstream proxy {host_port}"),
         )
     }))
+}
+
+/// Checks the local process behind `client` before anything is read from it, so a refused
+/// client never causes an upstream connection or sees credentials being used.
+/// Rate limiter for refusal warnings: the first refusal is logged at `warn`, later ones at
+/// most once per [`REFUSAL_LOG_INTERVAL`] with a count of those logged only at `debug`.
+#[derive(Default)]
+struct RefusalLog {
+    state: std::sync::Mutex<RefusalLogState>,
+}
+
+#[derive(Default)]
+struct RefusalLogState {
+    last_warn: Option<Instant>,
+    suppressed: u64,
+}
+
+impl RefusalLog {
+    /// Records a refusal at `now`. Returns `Some(suppressed since the last warning)` when
+    /// this one should be logged at `warn`.
+    fn record(&self, now: Instant) -> Option<u64> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        match state.last_warn {
+            Some(last) if now.saturating_duration_since(last) < REFUSAL_LOG_INTERVAL => {
+                state.suppressed += 1;
+                None
+            }
+            _ => {
+                state.last_warn = Some(now);
+                Some(std::mem::take(&mut state.suppressed))
+            }
+        }
+    }
+}
+
+fn admit_client(
+    client: &TcpStream,
+    verifier: &dyn PeerVerifier,
+    refusals: &RefusalLog,
+) -> PeerDecision {
+    match (client.peer_addr(), client.local_addr()) {
+        (Ok(peer), Ok(local)) => match verifier.verify(peer, local) {
+            PeerDecision::Allow => PeerDecision::Allow,
+            PeerDecision::Deny(reason) => {
+                if let Some(suppressed) = refusals.record(Instant::now()) {
+                    tracing::warn!(
+                        %peer,
+                        %reason,
+                        suppressed_since_last_warning = suppressed,
+                        "refused local proxy client"
+                    );
+                } else {
+                    tracing::debug!(%peer, %reason, "refused local proxy client");
+                }
+                PeerDecision::Deny(reason)
+            }
+        },
+        (Err(err), _) | (_, Err(err)) => {
+            tracing::debug!(error = %err, "proxy client vanished before verification");
+            PeerDecision::Deny(err.to_string())
+        }
+    }
+}
+
+/// Replies `403 Forbidden` and closes, draining briefly so the reply is not lost to a reset.
+fn reject_client(mut client: TcpStream) {
+    let _ = write_proxy_error(&mut client, 403, "Forbidden");
+    let _ = client.shutdown(std::net::Shutdown::Write);
+    let _ = client.set_read_timeout(Some(REJECT_DRAIN_TIMEOUT));
+    let deadline = Instant::now() + REJECT_DRAIN_TIMEOUT;
+    let mut sink = [0u8; 4096];
+    let mut drained = 0usize;
+    while drained <= MAX_HEADER_BYTES && Instant::now() < deadline {
+        match client.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => drained += n,
+        }
+    }
+}
+
+/// Verifies the client's process, then relays its request or refuses it.
+fn serve_client(
+    client: TcpStream,
+    cfg: &ForwarderConfig,
+    verifier: &dyn PeerVerifier,
+    refusals: &RefusalLog,
+) -> io::Result<()> {
+    // Accepted sockets inherit the listener's non-blocking mode on BSD-derived systems.
+    client.set_nonblocking(false)?;
+    client.set_write_timeout(Some(HEADER_IO_TIMEOUT))?;
+    if admit_client(&client, verifier, refusals) != PeerDecision::Allow {
+        reject_client(client);
+        return Ok(());
+    }
+    handle_client(client, cfg)
 }
 
 fn handle_client(mut client: TcpStream, cfg: &ForwarderConfig) -> io::Result<()> {
@@ -1130,6 +1285,109 @@ mod tests {
 
         let received = server_thread.join().unwrap_or_default();
         assert!(received.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+    }
+
+    #[test]
+    fn refusal_warnings_are_rate_limited() {
+        let log = RefusalLog::default();
+        let t0 = Instant::now();
+        assert_eq!(log.record(t0), Some(0));
+        assert_eq!(log.record(t0 + Duration::from_secs(1)), None);
+        assert_eq!(log.record(t0 + Duration::from_secs(59)), None);
+        assert_eq!(log.record(t0 + REFUSAL_LOG_INTERVAL), Some(2));
+        assert_eq!(log.record(t0 + REFUSAL_LOG_INTERVAL), None);
+        assert_eq!(log.record(t0 + 3 * REFUSAL_LOG_INTERVAL), Some(1));
+    }
+
+    /// Fake verifier that refuses everyone and records the addresses it was asked about.
+    #[derive(Default)]
+    struct DenyingVerifier {
+        seen: std::sync::Mutex<Vec<(SocketAddr, SocketAddr)>>,
+    }
+
+    impl PeerVerifier for DenyingVerifier {
+        fn verify(&self, peer: SocketAddr, local: SocketAddr) -> PeerDecision {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push((peer, local));
+            }
+            PeerDecision::Deny("test: client owned by another user".to_owned())
+        }
+    }
+
+    #[test]
+    fn refused_peer_gets_403_and_no_upstream_connection() {
+        let Ok(upstream_listener) = TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let Ok(upstream_addr) = upstream_listener.local_addr() else {
+            return;
+        };
+        let Ok(upstream) = UpstreamProxy::parse(&format!("http://user:pass@{upstream_addr}"))
+        else {
+            return;
+        };
+        let verifier = Arc::new(DenyingVerifier::default());
+        let Ok(forwarder) = ProxyForwarder::start_with_verifier(upstream, verifier.clone()) else {
+            return;
+        };
+        let Some(mut client) = connect_client(&forwarder) else {
+            return;
+        };
+        let _ =
+            client.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
+        let reply = String::from_utf8_lossy(&read_to_close(&mut client)).into_owned();
+        assert!(reply.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{reply:?}");
+
+        let seen = verifier.seen.lock().map(|g| g.clone()).unwrap_or_default();
+        assert_eq!(
+            seen,
+            vec![(
+                client.local_addr().unwrap_or(forwarder.local_addr),
+                forwarder.local_addr
+            )]
+        );
+
+        // No upstream connection was ever attempted, so no credentials left the daemon.
+        let _ = upstream_listener.set_nonblocking(true);
+        assert!(matches!(
+            upstream_listener.accept(),
+            Err(err) if err.kind() == ErrorKind::WouldBlock
+        ));
+    }
+
+    /// With the real platform policy, connections from this (same-user) process still work.
+    #[test]
+    fn platform_policy_admits_own_process() {
+        let Ok(upstream_listener) = TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let Ok(upstream_addr) = upstream_listener.local_addr() else {
+            return;
+        };
+        let server_thread = thread::spawn(move || {
+            if let Ok((mut stream, _)) = upstream_listener.accept() {
+                let _ = read_request_head(&mut stream);
+                let _ = stream.write_all(CONNECT_ESTABLISHED);
+            }
+        });
+        let Ok(upstream) = UpstreamProxy::parse(&format!("http://user:pass@{upstream_addr}"))
+        else {
+            return;
+        };
+        let Ok(forwarder) =
+            ProxyForwarder::start_with_options(Some(upstream), HostBlocker::default(), None)
+        else {
+            return;
+        };
+        let Some(mut client) = connect_client(&forwarder) else {
+            return;
+        };
+        let _ =
+            client.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
+        let reply = read_up_to(&mut client, CONNECT_ESTABLISHED.len());
+        assert_eq!(reply, CONNECT_ESTABLISHED);
+        drop(client);
+        let _ = server_thread.join();
     }
 
     #[test]
