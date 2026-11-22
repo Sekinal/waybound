@@ -37,8 +37,8 @@ pub const K_CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
 
 /// `kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements`.
 pub const K_CG_WINDOW_LIST_ON_SCREEN_EXCLUDE_DESKTOP: u32 = (1 << 0) | (1 << 4);
-/// `kCFNumberSInt64Type`.
-pub const K_CF_NUMBER_SINT64_TYPE: i32 = 4;
+/// `kCFNumberSInt64Type` (`CFNumberType` is `CFIndex` / `isize` on macOS).
+pub const K_CF_NUMBER_SINT64_TYPE: isize = 4;
 
 /// CoreGraphics modifier flags (`CGEventFlags`).
 pub const K_CG_EVENT_FLAG_MASK_SHIFT: u64 = 0x0002_0000;
@@ -113,7 +113,7 @@ unsafe extern "C" {
     pub fn CFDictionaryGetTypeID() -> usize;
     pub fn CFDictionaryGetValue(the_dict: CfTypeRef, key: CfTypeRef) -> CfTypeRef;
     pub fn CFNumberGetTypeID() -> usize;
-    pub fn CFNumberGetValue(number: CfTypeRef, the_type: i32, value_ptr: *mut c_void) -> u8;
+    pub fn CFNumberGetValue(number: CfTypeRef, the_type: isize, value_ptr: *mut c_void) -> u8;
     pub fn CFURLGetTypeID() -> usize;
     pub fn CFURLGetString(an_url: CfTypeRef) -> CfStringRef;
     pub fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CfArrayRef;

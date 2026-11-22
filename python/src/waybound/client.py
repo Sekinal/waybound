@@ -91,7 +91,7 @@ class Page:
     def screenshot(self, path: Path | str | None = None) -> bytes:
         """Capture a native OS PNG screenshot of the browser window and return PNG bytes."""
         if path is not None:
-            out_path = Path(path)
+            out_path = Path(path).resolve()
             self._transport.screenshot(str(out_path))
             return out_path.read_bytes()
 

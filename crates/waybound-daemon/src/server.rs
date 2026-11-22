@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use waybound_core::{
     BackendKind, Driver, InputEvent, KeyCode, KeyModifier, LocatorQuery, MotionConfig, MouseButton,
-    Point, Request, Response, Result, WayboundError, plan_pointer_path,
+    Point, Request, Response, Result, SplitMix64, WayboundError, hover_pause_before_click,
+    key_delay, mouse_hold_ms, pick_click_point, plan_human_pointer_path, plan_scroll_burst,
 };
 
 use crate::net_tap::ResponseStore;
@@ -114,7 +115,7 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
                     message: "scroll deltas must be finite numbers".to_owned(),
                 };
             }
-            match driver.dispatch_input(&InputEvent::Scroll { delta_x, delta_y }) {
+            match scroll_viewport(driver, state, delta_x, delta_y) {
                 Ok(()) => Response::Ok,
                 Err(err) => Response::from(&err),
             }
@@ -171,14 +172,19 @@ fn wait_for_element(
     }
 }
 
-fn move_pointer(driver: &dyn Driver, state: &SessionState, target: Point) -> Result<()> {
+fn move_pointer(
+    driver: &dyn Driver,
+    state: &SessionState,
+    target: Point,
+    rng: &mut SplitMix64,
+) -> Result<()> {
     let start = state
         .last_cursor
         .lock()
         .map_or(Point { x: 0.0, y: 0.0 }, |g| *g);
 
     if state.options.use_motion {
-        let path = plan_pointer_path(start, target, 1.0, MotionConfig::default());
+        let path = plan_human_pointer_path(start, target, MotionConfig::default(), rng);
         for step in path {
             if !step.delay.is_zero() {
                 thread::sleep(step.delay);
@@ -191,6 +197,28 @@ fn move_pointer(driver: &dyn Driver, state: &SessionState, target: Point) -> Res
 
     if let Ok(mut guard) = state.last_cursor.lock() {
         *guard = target;
+    }
+    Ok(())
+}
+
+fn scroll_viewport(
+    driver: &dyn Driver,
+    state: &SessionState,
+    delta_x: f64,
+    delta_y: f64,
+) -> Result<()> {
+    if !state.options.use_motion {
+        return driver.dispatch_input(&InputEvent::Scroll { delta_x, delta_y });
+    }
+    let mut rng = SplitMix64::from_entropy();
+    for step in plan_scroll_burst(delta_x, delta_y, &mut rng) {
+        if !step.delay.is_zero() {
+            thread::sleep(step.delay);
+        }
+        driver.dispatch_input(&InputEvent::Scroll {
+            delta_x: step.delta_x,
+            delta_y: step.delta_y,
+        })?;
     }
     Ok(())
 }
@@ -210,10 +238,25 @@ fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery
         });
     }
 
-    let (x, y) = b.center();
-    move_pointer(driver, state, Point { x, y })?;
+    let mut rng = SplitMix64::from_entropy();
+    let target = if state.options.use_motion {
+        pick_click_point(b, &mut rng)
+    } else {
+        let (x, y) = b.center();
+        Point { x, y }
+    };
+
+    move_pointer(driver, state, target, &mut rng)?;
+    let hold_ms = if state.options.use_motion {
+        thread::sleep(hover_pause_before_click(&mut rng));
+        mouse_hold_ms(&mut rng)
+    } else {
+        0
+    };
+
     driver.dispatch_input(&InputEvent::MouseClick {
         button: MouseButton::Left,
+        hold_ms,
     })
 }
 
@@ -228,6 +271,7 @@ fn fill_element(
 }
 
 fn type_text(driver: &dyn Driver, text: &str, pace: bool) -> Result<()> {
+    let mut rng = SplitMix64::from_entropy();
     for ch in text.chars() {
         let key = match ch {
             '\n' | '\r' => KeyCode::Enter,
@@ -239,7 +283,7 @@ fn type_text(driver: &dyn Driver, text: &str, pace: bool) -> Result<()> {
             modifiers: Vec::new(),
         })?;
         if pace {
-            thread::sleep(Duration::from_millis(28));
+            thread::sleep(key_delay(ch, &mut rng));
         }
     }
     Ok(())

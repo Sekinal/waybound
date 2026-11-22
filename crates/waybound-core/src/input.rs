@@ -66,6 +66,9 @@ pub enum InputEvent {
     MouseClick {
         /// Button to click.
         button: MouseButton,
+        /// Optional hold duration in milliseconds between mouse-down and mouse-up.
+        #[serde(default)]
+        hold_ms: u64,
     },
     /// Scroll by a logical delta.
     Scroll {

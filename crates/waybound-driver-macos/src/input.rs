@@ -3,6 +3,8 @@
 #![cfg(target_os = "macos")]
 
 use std::ptr;
+use std::thread;
+use std::time::Duration;
 
 use waybound_core::{InputEvent, KeyCode, KeyModifier, MouseButton, Point, Result, WayboundError};
 
@@ -25,7 +27,7 @@ pub fn dispatch_cg_event(event: &InputEvent, last_cursor: &mut Point) -> Result<
             *last_cursor = *to;
             post_mouse(CgEventType::MouseMoved, *to, CgMouseButton::Left)
         }
-        InputEvent::MouseClick { button } => {
+        InputEvent::MouseClick { button, hold_ms } => {
             let (down, up, cg_button) = match button {
                 MouseButton::Left => (
                     CgEventType::LeftMouseDown,
@@ -44,6 +46,9 @@ pub fn dispatch_cg_event(event: &InputEvent, last_cursor: &mut Point) -> Result<
                 ),
             };
             post_mouse(down, *last_cursor, cg_button)?;
+            if *hold_ms > 0 {
+                thread::sleep(Duration::from_millis((*hold_ms).min(1_000)));
+            }
             post_mouse(up, *last_cursor, cg_button)
         }
         InputEvent::Scroll { delta_x, delta_y } => post_scroll(*delta_x, *delta_y),

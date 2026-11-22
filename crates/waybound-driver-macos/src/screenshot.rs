@@ -89,26 +89,50 @@ unsafe fn dict_i64(dict: crate::ffi::CfTypeRef, key: &OwnedCf) -> Option<i64> {
 /// Returns [`WayboundError::BackendUnavailable`] if no on-screen window is found for `pid`
 /// or if `/usr/sbin/screencapture` fails (e.g., missing Screen Recording permission).
 pub fn capture_window_png(pid: i32, output_path: &Path) -> Result<()> {
+    if output_path.as_os_str().is_empty() || output_path.is_dir() {
+        return Err(WayboundError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "screenshot output path must be a non-empty file path",
+        )));
+    }
+
+    // Ensure absolute path so `/usr/sbin/screencapture` never treats a leading `-` as a flag.
+    let abs_path = if output_path.is_absolute() {
+        output_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(output_path)
+    };
+
+    // Remove any pre-existing file so a denied capture (which exits 0 without writing)
+    // can never masquerade as success with stale bytes.
+    if abs_path.exists() {
+        std::fs::remove_file(&abs_path)?;
+    }
+
     let win_id = find_window_id(pid).ok_or_else(|| WayboundError::BackendUnavailable {
         backend: "macos_native".to_owned(),
         reason: format!("no on-screen browser window found for pid {pid}"),
     })?;
 
-    let status = Command::new("/usr/sbin/screencapture")
+    let output = Command::new("/usr/sbin/screencapture")
         .args(["-x", "-o", "-l", &win_id.to_string()])
-        .arg(output_path)
+        .arg(&abs_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .map_err(WayboundError::Io)?;
 
-    if !status.success() || !output_path.exists() {
+    let non_empty = std::fs::metadata(&abs_path).is_ok_and(|m| m.len() > 0);
+    if !output.status.success() || !non_empty {
+        let stderr_msg = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let detail = if stderr_msg.is_empty() {
+            "ensure Screen Recording permission is granted in System Settings > Privacy & Security > Screen & System Audio Recording".to_owned()
+        } else {
+            stderr_msg
+        };
         return Err(WayboundError::BackendUnavailable {
             backend: "macos_native".to_owned(),
-            reason: format!(
-                "screencapture failed for window {win_id} (ensure Screen Recording permission is granted in System Settings > Privacy & Security > Screen & System Audio Recording)"
-            ),
+            reason: format!("screencapture failed for window {win_id} ({detail})"),
         });
     }
 
