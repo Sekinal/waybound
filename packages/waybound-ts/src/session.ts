@@ -10,7 +10,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { resolveDaemonBinary } from "./binary.js";
 import { Page } from "./client.js";
 import { WayboundDaemonError, WayboundLaunchError } from "./errors.js";
-import { DEFAULT_TIMEOUT_MS, type Endpoint, Transport } from "./transport.js";
+import { checkMs, DEFAULT_TIMEOUT_MS, type Endpoint, Transport } from "./transport.js";
 
 export type BackendName = "mock" | "macos" | "linux" | "windows" | "android";
 
@@ -93,21 +93,79 @@ export function buildDaemonArgs(options: LaunchOptions, endpoint: Endpoint): str
   return args;
 }
 
-// Daemons still running when the Node process exits are sent SIGTERM (which the daemon handles
-// like a `shutdown` request), so a forgotten `close()` never leaves an orphaned daemon behind.
-const liveSessions = new Set<Session>();
-let exitHookInstalled = false;
+/** How long `close()` waits for the `shutdown` reply before falling back to signals. */
+const SHUTDOWN_REPLY_TIMEOUT_MS = 2_000;
+/** How long `launch()` waits for the identifying `ping` reply. */
+const PING_TIMEOUT_MS = 2_000;
+const VERSION_RE = /^\d+\.\d+\.\d+\S*$/;
 
-function installExitHook(): void {
-  if (exitHookInstalled) {
+// Every spawned daemon is tracked from the moment it is spawned until it has been stopped.
+// If the Node process exits (or is terminated by SIGTERM/SIGHUP/SIGINT) while any are live,
+// they are sent SIGTERM, which the daemon handles like a `shutdown` request, so a forgotten
+// `close()` or a crash never leaves an orphaned daemon behind.
+const liveDaemons = new Map<ChildProcess, string>();
+const FORWARDED_SIGNALS: readonly NodeJS.Signals[] =
+  process.platform === "win32" ? [] : ["SIGTERM", "SIGHUP", "SIGINT"];
+const signalHandlers = new Map<NodeJS.Signals, () => void>();
+
+function killAllSync(): void {
+  for (const [child, tmpDir] of liveDaemons) {
+    if (!hasExited(child)) {
+      child.kill("SIGTERM");
+    }
+    try {
+      rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+  }
+  liveDaemons.clear();
+}
+
+function removeProcessHooks(): void {
+  process.off("exit", killAllSync);
+  for (const [signal, handler] of signalHandlers) {
+    process.off(signal, handler);
+  }
+  signalHandlers.clear();
+}
+
+function installProcessHooks(): void {
+  if (signalHandlers.size > 0 || process.listeners("exit").includes(killAllSync)) {
     return;
   }
-  exitHookInstalled = true;
-  process.on("exit", () => {
-    for (const session of liveSessions) {
-      session._killSync();
-    }
-  });
+  process.on("exit", killAllSync);
+  for (const signal of FORWARDED_SIGNALS) {
+    const handler = (): void => {
+      killAllSync();
+      removeProcessHooks();
+      // Never swallow the signal: if nobody else handles it, re-raise it so the default
+      // action (terminating this process) applies. If the application installed its own
+      // handler, that handler received this signal too and decides what happens next.
+      if (process.listenerCount(signal) === 0) {
+        process.kill(process.pid, signal);
+      }
+    };
+    signalHandlers.set(signal, handler);
+    process.on(signal, handler);
+  }
+}
+
+function trackDaemon(child: ChildProcess, tmpDir: string): void {
+  liveDaemons.set(child, tmpDir);
+  installProcessHooks();
+}
+
+function untrackDaemon(child: ChildProcess): void {
+  liveDaemons.delete(child);
+  if (liveDaemons.size === 0) {
+    removeProcessHooks();
+  }
+}
+
+/** @internal Number of daemons currently tracked (for tests). */
+export function _liveDaemonCount(): number {
+  return liveDaemons.size;
 }
 
 function hasExited(child: ChildProcess): boolean {
@@ -171,12 +229,16 @@ export class Session {
   readonly #tmpDir: string;
   #closing: Promise<void> | null = null;
 
-  /** @internal Use `launch()`. */
-  constructor(child: ChildProcess, transport: Transport, tmpDir: string) {
+  private constructor(child: ChildProcess, transport: Transport, tmpDir: string) {
     this.#child = child;
     this.#transport = transport;
     this.#tmpDir = tmpDir;
     this.page = new Page(transport);
+  }
+
+  /** @internal Use `launch()`. */
+  static _create(child: ChildProcess, transport: Transport, tmpDir: string): Session {
+    return new Session(child, transport, tmpDir);
   }
 
   /** PID of the daemon process. */
@@ -208,7 +270,8 @@ export class Session {
       let shutdownSent = false;
       if (!this.#transport.closed) {
         try {
-          await this.#transport.shutdown();
+          // A hung daemon must not delay close() by the full request timeout.
+          await this.#transport.shutdown(SHUTDOWN_REPLY_TIMEOUT_MS);
           shutdownSent = true;
         } catch {
           // fall through to signals
@@ -217,20 +280,8 @@ export class Session {
       this.#transport.close();
       await stopChild(this.#child, shutdownSent);
     } finally {
-      liveSessions.delete(this);
+      untrackDaemon(this.#child);
       await rm(this.#tmpDir, { recursive: true, force: true }).catch(() => undefined);
-    }
-  }
-
-  /** @internal Synchronous best-effort cleanup used by the process `exit` hook. */
-  _killSync(): void {
-    if (!hasExited(this.#child)) {
-      this.#child.kill("SIGTERM");
-    }
-    try {
-      rmSync(this.#tmpDir, { recursive: true, force: true });
-    } catch {
-      // best effort
     }
   }
 }
@@ -254,7 +305,7 @@ async function stopChild(child: ChildProcess, shutdownSent: boolean): Promise<vo
 export async function launch(options: LaunchOptions = {}): Promise<Session> {
   const binary = resolveDaemonBinary(options.daemonBinary ?? null);
   const useTcp = options.useTcp === true || process.platform === "win32";
-  const startupTimeoutMs = options.startupTimeoutMs ?? 5_000;
+  const startupTimeoutMs = checkMs(options.startupTimeoutMs ?? 5_000, "startupTimeoutMs");
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   // Keep the socket path short: macOS limits AF_UNIX paths to 104 bytes.
@@ -282,6 +333,7 @@ export async function launch(options: LaunchOptions = {}): Promise<Session> {
       closeSync(stderrFd);
     }
     const proc = child;
+    trackDaemon(proc, tmpDir);
     proc.on("error", (err) => {
       spawnError = err;
     });
@@ -297,13 +349,11 @@ export async function launch(options: LaunchOptions = {}): Promise<Session> {
       startupTimeoutMs,
       spawnError: () => spawnError,
     });
-    const session = new Session(proc, transport, tmpDir);
-    liveSessions.add(session);
-    installExitHook();
-    return session;
+    return Session._create(proc, transport, tmpDir);
   } catch (err) {
     if (child !== null) {
       await stopChild(child, false);
+      untrackDaemon(child);
     }
     await rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
     throw err;
@@ -335,17 +385,49 @@ async function connectWithRetry(args: {
       );
     }
     if (!("socketPath" in endpoint) || existsSync(endpoint.socketPath)) {
+      let transport: Transport | null = null;
       try {
-        return await Transport.connect(endpoint, { timeoutMs: args.timeoutMs });
+        transport = await Transport.connect(endpoint, { timeoutMs: args.timeoutMs });
       } catch (err) {
         if ("socketPath" in endpoint && !RETRYABLE_UNIX_CONNECT.has(causeCode(err) ?? "")) {
           throw err;
         }
       }
+      if (transport !== null) {
+        await verifyDaemon(transport, endpoint);
+        return transport;
+      }
     }
     await sleep(20);
   }
-  const target =
-    "socketPath" in endpoint ? endpoint.socketPath : `${endpoint.host}:${endpoint.port}`;
-  throw new WayboundLaunchError(`timed out waiting for waybound-daemon at ${target}`);
+  throw new WayboundLaunchError(
+    `timed out waiting for waybound-daemon at ${describeEndpoint(endpoint)}`,
+  );
+}
+
+/**
+ * Confirm the endpoint is our daemon before using it (and before ever sending it `shutdown`):
+ * another process could have taken the reserved loopback port.
+ */
+async function verifyDaemon(transport: Transport, endpoint: Endpoint): Promise<void> {
+  let version: string;
+  try {
+    version = await transport.ping(PING_TIMEOUT_MS);
+  } catch (err) {
+    transport.close();
+    throw new WayboundLaunchError(
+      `endpoint ${describeEndpoint(endpoint)} did not answer like waybound-daemon`,
+      { cause: err },
+    );
+  }
+  if (!VERSION_RE.test(version)) {
+    transport.close();
+    throw new WayboundLaunchError(
+      `endpoint ${describeEndpoint(endpoint)} reported an unexpected version ${JSON.stringify(version)}`,
+    );
+  }
+}
+
+function describeEndpoint(endpoint: Endpoint): string {
+  return "socketPath" in endpoint ? endpoint.socketPath : `${endpoint.host}:${endpoint.port}`;
 }

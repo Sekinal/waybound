@@ -2,8 +2,10 @@
 
 Typed, async Node.js client for `waybound-daemon`, which drives stock Chrome through OS
 accessibility APIs and native input (no CDP, no browser patches). It mirrors the Python SDK
-(`python/src/waybound`) with camelCase names. Zero runtime dependencies; ESM with type
-declarations; Node.js 22.12 or newer.
+(`python/src/waybound`) with camelCase names. Zero runtime dependencies; Node.js 22.12 or newer.
+
+The package is ESM-first (`import { launch } from "waybound"`), with type declarations.
+`require("waybound")` also works on Node.js 22.12+, which can `require()` ES modules.
 
 ## Usage
 
@@ -15,11 +17,10 @@ try {
   const { page } = session;
   await page.getByRole(Role.TEXTBOX, { name: "Search" }).fill("waybound");
 
-  // Start waiting for the API reply before the click that triggers it.
-  const [response] = await Promise.all([
-    page.waitForResponse("/api/search", { timeoutMs: 10_000 }),
-    page.getByRole(Role.BUTTON, { name: "Go" }).click(),
-  ]);
+  // Arm the wait first, then trigger the request, then await the response.
+  const waiter = await page.expectResponse("/api/search", { timeoutMs: 10_000 });
+  await page.getByRole(Role.BUTTON, { name: "Go" }).click();
+  const response = await waiter.response;
   console.log(response.status, response.json());
 
   await page.waitForNetworkIdle();
@@ -36,6 +37,26 @@ Locators are lazy and chainable (`getByRole`, `getByText`, `nth`, `first`); each
 them afresh on the daemon. Daemon errors reject with `WayboundDaemonError` (`err.code` is
 `timeout`, `element_not_found`, `io_error`, and so on); startup failures reject with
 `WayboundLaunchError`.
+
+### Waiting for network responses
+
+The daemon only matches responses captured _after_ it receives a `wait_for_response` request.
+`page.waitForResponse()` opens its own connection before sending that request, so in
+`Promise.all([page.waitForResponse(url), locator.click()])` the click is usually sent first,
+and a response that arrives very quickly can be missed. Use `page.expectResponse()` as in the
+example above: it resolves once the wait has been sent to the daemon, and `waiter.response`
+settles with the match (or rejects with code `timeout`).
+
+Wait budgets are capped by the daemon: `waitFor()` and `waitForResponse()` at 120 s,
+`waitForNetworkIdle()` at 60 s (with `idleMs` between 50 ms and 10 s). Larger values are
+clamped; negative or non-finite values throw `TypeError`.
+
+### Captured responses
+
+`page.capturedResponses()` returns what the daemon has captured so far: up to the 500 most
+recent responses, with bodies of up to 4 MiB each. The SDK refuses a single reply line larger
+than 256 MiB; the request runs on its own short-lived connection, so if that happens only this
+call fails (pass `urlContains` to narrow the result) and the session stays usable.
 
 ## Finding the daemon
 

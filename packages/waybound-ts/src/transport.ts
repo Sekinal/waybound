@@ -26,12 +26,27 @@ export interface TransportOptions {
 
 export type JsonObject = Record<string, unknown>;
 
+/** An armed `wait_for_response`; see `Transport.expectResponse()`. */
+export interface ResponseWaiter {
+  /** Settles with the matching response, or rejects (e.g. code `timeout`). */
+  readonly response: Promise<CapturedResponse>;
+}
+
 /** Default base per-request timeout, matching the Python SDK's `timeout_s=30.0`. */
 export const DEFAULT_TIMEOUT_MS = 30_000;
 /** The daemon paces typing at up to ~180 ms per key; allow headroom on top of the base timeout. */
 export const FILL_MS_PER_CHAR = 250;
 /** Extra client-side slack on top of a daemon-side wait budget. */
 const WAIT_SLACK_MS = 5_000;
+/** Daemon cap on `wait_for` and `wait_for_response` budgets (`MAX_WAIT_TIMEOUT_MS`). */
+export const MAX_WAIT_MS = 120_000;
+/** Daemon cap on the `wait_for_network_idle` budget. */
+export const MAX_NETWORK_IDLE_TIMEOUT_MS = 60_000;
+/** Daemon clamp range for `idle_ms`. */
+export const MIN_IDLE_MS = 50;
+export const MAX_IDLE_MS = 10_000;
+/** Largest delay `setTimeout` honours; anything above it fires after 1 ms. */
+export const MAX_TIMER_MS = 2 ** 31 - 1;
 
 const NAMED_KEY_SET: ReadonlySet<string> = new Set(NAMED_KEYS);
 
@@ -43,19 +58,25 @@ interface Pending {
 
 /** Compute the client-side timeout for a daemon-side wait of `waitMs`. */
 export function waitTimeoutMs(baseMs: number, waitMs: number): number {
-  return Math.max(baseMs, waitMs + WAIT_SLACK_MS);
+  return Math.min(MAX_TIMER_MS, Math.max(baseMs, waitMs + WAIT_SLACK_MS));
 }
 
 /** Compute the client-side timeout for typing `text`. */
 export function fillTimeoutMs(baseMs: number, text: string): number {
-  return baseMs + FILL_MS_PER_CHAR * [...text].length;
+  return Math.min(MAX_TIMER_MS, baseMs + FILL_MS_PER_CHAR * [...text].length);
 }
 
-function clampMs(value: number, what: string): number {
-  if (!Number.isFinite(value)) {
-    throw new RangeError(`${what} must be a finite number, got ${value}`);
+/**
+ * Validate a millisecond duration supplied by the caller and clamp it to `max`.
+ * Throws `TypeError` for anything that is not a finite, non-negative number.
+ */
+export function checkMs(value: unknown, what: string, max: number = MAX_TIMER_MS): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new TypeError(
+      `${what} must be a finite, non-negative number of milliseconds, got ${describe(value)}`,
+    );
   }
-  return Math.max(0, Math.trunc(value));
+  return Math.min(max, Math.trunc(value));
 }
 
 function describe(value: unknown): string {
@@ -106,9 +127,11 @@ export class Transport {
 
   /** Connect to the daemon. Rejects with `WayboundDaemonError("io_error")` on failure. */
   static connect(endpoint: Endpoint, options: TransportOptions = {}): Promise<Transport> {
-    const baseTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    if (!(baseTimeoutMs > 0) || !Number.isFinite(baseTimeoutMs)) {
-      return Promise.reject(new RangeError(`timeoutMs must be positive, got ${baseTimeoutMs}`));
+    let baseTimeoutMs: number;
+    try {
+      baseTimeoutMs = Math.max(1, checkMs(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, "timeoutMs"));
+    } catch (err) {
+      return Promise.reject(err);
     }
     return new Promise<Transport>((resolve, reject) => {
       const socket =
@@ -147,10 +170,15 @@ export class Transport {
    * Send one raw request object and return the daemon's reply object.
    *
    * Rejects with the daemon's structured error when the reply has `status: "error"`.
+   * `onWritten` is called once the request line has been handed to the OS.
    */
-  request(payload: JsonObject, timeoutOverrideMs?: number): Promise<JsonObject> {
-    const timeoutMs = timeoutOverrideMs ?? this.baseTimeoutMs;
-    const run = this.#tail.then(() => this.#send(payload, timeoutMs));
+  request(
+    payload: JsonObject,
+    timeoutOverrideMs?: number,
+    onWritten?: () => void,
+  ): Promise<JsonObject> {
+    const timeoutMs = Math.min(MAX_TIMER_MS, timeoutOverrideMs ?? this.baseTimeoutMs);
+    const run = this.#tail.then(() => this.#send(payload, timeoutMs, onWritten));
     this.#tail = run.then(
       () => undefined,
       () => undefined,
@@ -158,7 +186,7 @@ export class Transport {
     return run;
   }
 
-  #send(payload: JsonObject, timeoutMs: number): Promise<JsonObject> {
+  #send(payload: JsonObject, timeoutMs: number, onWritten?: () => void): Promise<JsonObject> {
     if (this.#closed) {
       return Promise.reject(new WayboundDaemonError("closed", "transport is closed"));
     }
@@ -173,6 +201,8 @@ export class Transport {
       this.#socket.write(encodeLine(payload), (err) => {
         if (err) {
           this.#fail(new WayboundDaemonError("io_error", err.message, { cause: err }));
+        } else {
+          onWritten?.();
         }
       });
     });
@@ -260,8 +290,11 @@ export class Transport {
   }
 
   /** Health check; returns the daemon version. */
-  async ping(): Promise<string> {
-    const response = await this.request({ method: "ping" });
+  async ping(timeoutMs?: number): Promise<string> {
+    const response = await this.request(
+      { method: "ping" },
+      timeoutMs === undefined ? undefined : Math.max(1, checkMs(timeoutMs, "timeoutMs")),
+    );
     if (typeof response.version !== "string") {
       throw new WayboundDaemonError(
         "protocol_error",
@@ -300,7 +333,7 @@ export class Transport {
 
   /** Poll on the daemon until `query` matches or `timeoutMs` elapses. */
   async waitFor(query: LocatorQuery, timeoutMs = 10_000): Promise<AccessibilityNode> {
-    const clamped = clampMs(timeoutMs, "timeoutMs");
+    const clamped = checkMs(timeoutMs, "timeoutMs", MAX_WAIT_MS);
     const response = await this.request(
       { method: "wait_for", query: encodeQuery(query), timeout_ms: clamped },
       waitTimeoutMs(this.baseTimeoutMs, clamped),
@@ -314,17 +347,50 @@ export class Transport {
     return parseNode(response.node);
   }
 
-  /** Ask the daemon to shut down gracefully. */
-  async shutdown(): Promise<void> {
-    await this.#expectOk({ method: "shutdown" }, "shutdown");
+  /** Ask the daemon to shut down gracefully (optionally with a shorter reply timeout). */
+  async shutdown(timeoutMs?: number): Promise<void> {
+    await this.#expectOk(
+      { method: "shutdown" },
+      "shutdown",
+      timeoutMs === undefined ? undefined : Math.max(1, checkMs(timeoutMs, "timeoutMs")),
+    );
   }
 
-  /** Return captured HTTP responses, optionally filtered by URL substring. */
-  async capturedResponses(urlContains?: string | null): Promise<CapturedResponse[]> {
-    const response = await this.request({
-      method: "captured_responses",
-      url_contains: urlContains ?? null,
+  /**
+   * Run one request on a dedicated short-lived connection, so a slow or oversized reply only
+   * fails this call and never blocks or poisons the main connection.
+   */
+  async #oneShot(
+    payload: JsonObject,
+    timeoutMs: number,
+  ): Promise<{ written: Promise<void>; reply: Promise<JsonObject> }> {
+    if (this.#closed) {
+      throw new WayboundDaemonError("closed", "transport is closed");
+    }
+    const dedicated = await Transport.connect(this.endpoint, { timeoutMs });
+    let markWritten: () => void = () => undefined;
+    const written = new Promise<void>((resolve) => {
+      markWritten = resolve;
     });
+    const reply = dedicated.request(payload, timeoutMs, markWritten).finally(() => {
+      dedicated.close();
+      markWritten();
+    });
+    return { written, reply };
+  }
+
+  /**
+   * Return captured HTTP responses, optionally filtered by URL substring.
+   *
+   * Uses a dedicated connection: the daemon may hold up to 500 responses of up to 4 MiB each,
+   * and a reply over the client's 256 MiB line cap fails only this call.
+   */
+  async capturedResponses(urlContains?: string | null): Promise<CapturedResponse[]> {
+    const { reply } = await this.#oneShot(
+      { method: "captured_responses", url_contains: urlContains ?? null },
+      this.baseTimeoutMs,
+    );
+    const response = await reply;
     if (!Array.isArray(response.responses)) {
       throw new WayboundDaemonError(
         "protocol_error",
@@ -335,36 +401,40 @@ export class Transport {
   }
 
   /**
+   * Arm a wait for the first HTTP response captured *after* the daemon receives this request
+   * whose URL contains `urlContains`. Resolves once the request has been sent on a dedicated
+   * connection; trigger the navigation or click after that, then await `waiter.response`.
+   */
+  async expectResponse(urlContains: string, timeoutMs = 10_000): Promise<ResponseWaiter> {
+    const clamped = checkMs(timeoutMs, "timeoutMs", MAX_WAIT_MS);
+    const { written, reply } = await this.#oneShot(
+      { method: "wait_for_response", url_contains: urlContains, timeout_ms: clamped },
+      waitTimeoutMs(this.baseTimeoutMs, clamped),
+    );
+    const response = reply.then((r) => {
+      if (!isObject(r.response)) {
+        throw new WayboundDaemonError(
+          "protocol_error",
+          `unexpected wait_for_response payload: ${describe(r)}`,
+        );
+      }
+      return parseHttpResponse(r.response);
+    });
+    // A waiter the caller never awaits must not surface as an unhandled rejection.
+    response.catch(() => undefined);
+    await written;
+    return { response };
+  }
+
+  /**
    * Wait until a captured HTTP response matches `urlContains`.
    *
    * Uses a dedicated short-lived connection so it can run concurrently with other calls on
-   * this transport (e.g. `Promise.all([page.waitForResponse("/api"), button.click()])`).
+   * this transport. Only responses captured after the daemon receives the request count; see
+   * `expectResponse()` to arm the wait before triggering the request.
    */
   async waitForResponse(urlContains: string, timeoutMs = 10_000): Promise<CapturedResponse> {
-    if (this.#closed) {
-      throw new WayboundDaemonError("closed", "transport is closed");
-    }
-    const clamped = clampMs(timeoutMs, "timeoutMs");
-    const dedicated = await Transport.connect(this.endpoint, {
-      timeoutMs: waitTimeoutMs(this.baseTimeoutMs, clamped),
-    });
-    let response: JsonObject;
-    try {
-      response = await dedicated.request({
-        method: "wait_for_response",
-        url_contains: urlContains,
-        timeout_ms: clamped,
-      });
-    } finally {
-      dedicated.close();
-    }
-    if (!isObject(response.response)) {
-      throw new WayboundDaemonError(
-        "protocol_error",
-        `unexpected wait_for_response payload: ${describe(response)}`,
-      );
-    }
-    return parseHttpResponse(response.response);
+    return (await this.expectResponse(urlContains, timeoutMs)).response;
   }
 
   /** Move the pointer over the element without clicking. */
@@ -405,11 +475,11 @@ export class Transport {
 
   /** Wait until no HTTP/1.1–2 request is in flight for `idleMs`. */
   async waitForNetworkIdle(idleMs = 500, timeoutMs = 15_000): Promise<void> {
-    const clamped = clampMs(timeoutMs, "timeoutMs");
+    const clamped = checkMs(timeoutMs, "timeoutMs", MAX_NETWORK_IDLE_TIMEOUT_MS);
     await this.#expectOk(
       {
         method: "wait_for_network_idle",
-        idle_ms: Math.max(50, clampMs(idleMs, "idleMs")),
+        idle_ms: Math.max(MIN_IDLE_MS, checkMs(idleMs, "idleMs", MAX_IDLE_MS)),
         timeout_ms: clamped,
       },
       "wait_for_network_idle",

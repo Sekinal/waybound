@@ -198,47 +198,91 @@ export function resolveDaemonBinary(
 }
 
 /** Minimal `fetch` signature used by the downloader (injectable for tests). */
-export type FetchLike = (url: string, init: { signal: AbortSignal }) => Promise<Response>;
+export type FetchLike = (
+  url: string,
+  init: { signal: AbortSignal; redirect: "manual" },
+) => Promise<Response>;
+
+/** Maximum number of redirects followed per download (GitHub uses one). */
+export const MAX_REDIRECTS = 5;
 
 async function downloadBounded(
   url: string,
   maxBytes: number,
   fetchImpl: FetchLike,
+  inactivityTimeoutMs: number = DOWNLOAD_TIMEOUT_MS,
 ): Promise<{ data: Buffer; sha256: string }> {
-  if (!url.startsWith("https://")) {
-    throw new Error(`refusing non-HTTPS download URL: ${JSON.stringify(url)}`);
-  }
-  const response = await fetchImpl(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
-  if (response.url !== "" && !response.url.startsWith("https://")) {
-    throw new Error(`refusing download redirected to non-HTTPS URL: ${response.url}`);
-  }
-  if (!response.ok) {
-    throw new Error(`download failed with HTTP ${response.status}: ${url}`);
-  }
-  if (response.body === null) {
-    throw new Error(`download returned no body: ${url}`);
-  }
-  const hash = createHash("sha256");
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  const reader = response.body.getReader();
+  // The timeout is an inactivity timeout: it is re-armed whenever headers or body bytes
+  // arrive, so a slow but progressing download is not cut off.
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const arm = (): void => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      controller.abort(new Error(`download stalled for ${inactivityTimeoutMs}ms: ${url}`));
+    }, inactivityTimeoutMs);
+  };
   try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
+    let current = url;
+    let response: Response | null = null;
+    // Redirects are followed by hand so every hop can be required to use HTTPS.
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
+      if (!current.startsWith("https://")) {
+        throw new Error(`refusing non-HTTPS download URL: ${JSON.stringify(current)}`);
       }
-      total += value.byteLength;
-      if (total > maxBytes) {
-        throw new Error(`download exceeded maximum allowed size (${maxBytes} bytes): ${url}`);
+      arm();
+      const res = await fetchImpl(current, { signal: controller.signal, redirect: "manual" });
+      if (res.status >= 300 && res.status < 400) {
+        await res.body?.cancel().catch(() => undefined);
+        const location = res.headers.get("location");
+        if (location === null) {
+          throw new Error(`redirect without a Location header: ${current}`);
+        }
+        current = new URL(location, current).href;
+        continue;
       }
-      hash.update(value);
-      chunks.push(value);
+      response = res;
+      break;
     }
+    if (response === null) {
+      throw new Error(`too many redirects (more than ${MAX_REDIRECTS}): ${url}`);
+    }
+    if (!response.ok) {
+      throw new Error(`download failed with HTTP ${response.status}: ${current}`);
+    }
+    if (response.body === null) {
+      throw new Error(`download returned no body: ${current}`);
+    }
+    const hash = createHash("sha256");
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    const reader = response.body.getReader();
+    try {
+      for (;;) {
+        arm();
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        total += value.byteLength;
+        if (total > maxBytes) {
+          throw new Error(`download exceeded maximum allowed size (${maxBytes} bytes): ${url}`);
+        }
+        hash.update(value);
+        chunks.push(value);
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+    }
+    return { data: Buffer.concat(chunks), sha256: hash.digest("hex") };
+  } catch (err) {
+    if (controller.signal.aborted && controller.signal.reason instanceof Error) {
+      throw controller.signal.reason;
+    }
+    throw err;
   } finally {
-    await reader.cancel().catch(() => undefined);
+    clearTimeout(timer);
   }
-  return { data: Buffer.concat(chunks), sha256: hash.digest("hex") };
 }
 
 function readCString(block: Buffer, start: number, length: number): string {
@@ -368,6 +412,8 @@ export interface DownloadOptions extends HostInfo {
   readonly cacheDir?: string;
   /** `fetch` implementation. Default `globalThis.fetch`. */
   readonly fetch?: FetchLike;
+  /** Abort a download after this long without progress. Default 60 000 ms. */
+  readonly inactivityTimeoutMs?: number;
 }
 
 /**
@@ -402,8 +448,9 @@ export async function downloadDaemonBinary(options: DownloadOptions = {}): Promi
   const shaUrl = `${baseUrl}/${artifact}.tar.gz.sha256`;
   const fetchImpl: FetchLike = options.fetch ?? ((url, init) => fetch(url, init));
 
-  const tarball = await downloadBounded(tarUrl, MAX_TARBALL_BYTES, fetchImpl);
-  const shaFile = await downloadBounded(shaUrl, MAX_SHA_BYTES, fetchImpl);
+  const idleMs = options.inactivityTimeoutMs ?? DOWNLOAD_TIMEOUT_MS;
+  const tarball = await downloadBounded(tarUrl, MAX_TARBALL_BYTES, fetchImpl, idleMs);
+  const shaFile = await downloadBounded(shaUrl, MAX_SHA_BYTES, fetchImpl, idleMs);
   const expected = parseChecksumFile(shaFile.data.toString("utf8"), artifact);
   if (tarball.sha256 !== expected) {
     throw new Error(

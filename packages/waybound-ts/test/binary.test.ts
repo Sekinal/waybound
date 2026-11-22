@@ -16,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import {
   cachedDaemonPath,
@@ -25,6 +26,7 @@ import {
   extractDaemonFromTar,
   type FetchLike,
   findCachedDaemon,
+  MAX_REDIRECTS,
   parseChecksumFile,
   platformArtifactName,
   resolveDaemonBinary,
@@ -374,14 +376,89 @@ describe("downloadDaemonBinary (no network)", () => {
     );
   });
 
-  it("refuses a redirect to plain HTTP", async () => {
-    const cacheDir = freshDir();
-    const fetch: FetchLike = async () => {
-      const res = new Response(new Uint8Array(tarball), { status: 200 });
-      Object.defineProperty(res, "url", { value: "http://evil.test/x" });
-      return res;
+  /** A fetch stand-in that answers each URL with a redirect or a final body. */
+  function redirectingFetch(
+    routes: Record<string, string | Buffer>,
+  ): FetchLike & { urls: string[]; inits: { redirect: string }[] } {
+    const urls: string[] = [];
+    const inits: { redirect: string }[] = [];
+    const impl: FetchLike = async (url, init) => {
+      urls.push(url);
+      inits.push({ redirect: init.redirect });
+      const route = routes[url];
+      if (typeof route === "string") {
+        return new Response(null, { status: 302, headers: { location: route } });
+      }
+      if (route === undefined) {
+        return new Response("nope", { status: 404 });
+      }
+      return new Response(new Uint8Array(route), { status: 200 });
     };
+    return Object.assign(impl, { urls, inits });
+  }
+
+  it("follows HTTPS redirects by hand, including relative ones", async () => {
+    const cacheDir = freshDir();
+    const fetch = redirectingFetch({
+      [BASE]: "https://objects.example.test/a/tarball",
+      "https://objects.example.test/a/tarball": "../b/tarball",
+      "https://objects.example.test/b/tarball": tarball,
+      [`${BASE}.sha256`]: "https://objects.example.test/sha",
+      "https://objects.example.test/sha": Buffer.from(`${sha256(tarball)}  x\n`),
+    });
+    const dest = await downloadDaemonBinary({ ...HOST, cacheDir, fetch });
+    assert.deepEqual(readFileSync(dest), binary);
+    assert.ok(fetch.inits.every((i) => i.redirect === "manual"));
+    assert.equal(fetch.urls.length, 5);
+  });
+
+  it("refuses a redirect to plain HTTP on any hop", async () => {
+    const cacheDir = freshDir();
+    const fetch = redirectingFetch({
+      [BASE]: "https://objects.example.test/a",
+      "https://objects.example.test/a": "http://objects.example.test/b",
+      "http://objects.example.test/b": tarball,
+    });
     await assert.rejects(downloadDaemonBinary({ ...HOST, cacheDir, fetch }), /non-HTTPS/);
+    assert.equal(fetch.urls.includes("http://objects.example.test/b"), false, "never requested");
+  });
+
+  it("caps the number of redirects and requires a Location header", async () => {
+    const cacheDir = freshDir();
+    const loop = redirectingFetch({
+      [BASE]: "https://r.test/1",
+      "https://r.test/1": "https://r.test/2",
+      "https://r.test/2": "https://r.test/1",
+    });
+    await assert.rejects(
+      downloadDaemonBinary({ ...HOST, cacheDir, fetch: loop }),
+      /too many redirects/,
+    );
+    assert.equal(loop.urls.length, MAX_REDIRECTS + 1);
+    const noLocation: FetchLike = async () => new Response(null, { status: 301 });
+    await assert.rejects(
+      downloadDaemonBinary({ ...HOST, cacheDir, fetch: noLocation }),
+      /without a Location header/,
+    );
+  });
+
+  it("aborts a download that stops making progress", async () => {
+    const cacheDir = freshDir();
+    const stalled: FetchLike = async (_url, init) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+          init.signal.addEventListener("abort", () => controller.error(init.signal.reason));
+        },
+      });
+      return new Response(body, { status: 200 });
+    };
+    const started = performance.now();
+    await assert.rejects(
+      downloadDaemonBinary({ ...HOST, cacheDir, fetch: stalled, inactivityTimeoutMs: 100 }),
+      /download stalled for 100ms/,
+    );
+    assert.ok(performance.now() - started < 5_000);
   });
 
   it("validates the repository slug and version before any request", async () => {
@@ -408,5 +485,41 @@ describe("packaging", () => {
       assert.equal(pkg.scripts?.[hook], undefined, `${hook} script must not exist`);
     }
     assert.equal(pkg.dependencies, undefined, "zero runtime dependencies");
+    assert.equal(pkg.scripts?.prepublishOnly, "npm run build");
+  });
+
+  const pkgDir = fileURLToPath(new URL("../../", import.meta.url));
+  const built = existsSync(path.join(pkgDir, "dist", "index.js"));
+
+  it("can be imported and required through its exports map", {
+    skip: !built && "dist/ not built",
+  }, () => {
+    for (const code of [
+      'const m = require("waybound"); process.stdout.write(typeof m.launch);',
+      'import("waybound").then((m) => process.stdout.write(typeof m.launch));',
+    ]) {
+      const out = execFileSync(process.execPath, ["-e", code], { cwd: pkgDir, encoding: "utf8" });
+      assert.equal(out, "function", code);
+    }
+  });
+
+  it("keeps internals out of the published declarations", {
+    skip: !built && "dist/ not built",
+  }, () => {
+    const dts = readFileSync(path.join(pkgDir, "dist", "session.d.ts"), "utf8");
+    assert.doesNotMatch(dts, /_create|_killSync|_liveDaemonCount/);
+    assert.match(dts, /private constructor/);
+  });
+
+  it("ships both licence texts", () => {
+    const pkg = JSON.parse(readFileSync(path.join(pkgDir, "package.json"), "utf8")) as {
+      files: string[];
+      license: string;
+    };
+    assert.equal(pkg.license, "MIT OR Apache-2.0");
+    for (const file of ["LICENSE-MIT", "LICENSE-APACHE"]) {
+      assert.ok(pkg.files.includes(file));
+      assert.ok(readFileSync(path.join(pkgDir, file), "utf8").length > 500);
+    }
   });
 });

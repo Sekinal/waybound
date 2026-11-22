@@ -6,11 +6,11 @@
  */
 
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import {
@@ -22,6 +22,7 @@ import {
   WayboundDaemonError,
   WayboundLaunchError,
 } from "../src/index.js";
+import { _liveDaemonCount } from "../src/session.js";
 
 const REPO_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 const DAEMON_BIN =
@@ -267,5 +268,163 @@ describe("integration: waybound-daemon --backend mock", { skip }, () => {
     });
     assert.ok(performance.now() - started < 10_000, "child exited without close()");
     await assertGone(Number(stdout));
+  });
+  for (const withUserHandler of [false, true]) {
+    it(`stops the daemon on SIGTERM ${withUserHandler ? "and leaves a user SIGTERM handler in charge" : "and re-raises the signal"}`, {
+      skip: process.platform === "win32",
+    }, async () => {
+      const indexUrl = new URL("../src/index.js", import.meta.url).href;
+      const script = `
+          import { launch } from ${JSON.stringify(indexUrl)};
+          ${withUserHandler ? 'process.on("SIGTERM", () => process.exit(7));' : ""}
+          const session = await launch({ backend: "mock", daemonBinary: ${JSON.stringify(DAEMON_BIN)} });
+          await session.page.url();
+          process.stdout.write(String(session.pid) + "\\n");
+          setInterval(() => {}, 1000);
+        `;
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+        stdio: ["ignore", "pipe", "inherit"],
+      });
+      const daemonPid = await new Promise<number>((resolve, reject) => {
+        let out = "";
+        child.stdout.on("data", (d: Buffer) => {
+          out += d.toString();
+          if (out.includes("\n")) {
+            resolve(Number(out.trim()));
+          }
+        });
+        child.once("exit", () => reject(new Error("child exited before launching")));
+      });
+      const exited = new Promise<[number | null, NodeJS.Signals | null]>((resolve) =>
+        child.once("exit", (code, signal) => resolve([code, signal])),
+      );
+      child.kill("SIGTERM");
+      const [code, signal] = await exited;
+      if (withUserHandler) {
+        assert.equal(code, 7);
+      } else {
+        assert.equal(signal, "SIGTERM", "signal was re-raised with its default action");
+      }
+      await assertGone(daemonPid);
+    });
+  }
+
+  it("untracks daemons once sessions close", async () => {
+    const session = await launch({ backend: "mock", daemonBinary: DAEMON_BIN });
+    assert.equal(_liveDaemonCount(), 1);
+    assert.ok(process.listeners("SIGTERM").length >= 1);
+    await session.close();
+    assert.equal(_liveDaemonCount(), 0);
+    assert.equal(process.listenerCount("SIGHUP"), 0, "signal handlers removed");
+  });
+});
+
+/** Write an executable stand-in for the daemon. `mode` picks how it misbehaves. */
+function fakeDaemonBinary(
+  dir: string,
+  mode: "badversion" | "silent" | "hang",
+): { bin: string; log: string } {
+  const log = path.join(dir, `${mode}.log`);
+  const js = path.join(dir, `${mode}.mjs`);
+  writeFileSync(
+    js,
+    `
+import net from "node:net";
+import fs from "node:fs";
+const mode = ${JSON.stringify(mode)};
+const log = ${JSON.stringify(log)};
+const args = process.argv.slice(2);
+process.on("SIGTERM", () => { fs.appendFileSync(log, "SIGTERM\\n"); if (mode !== "hang") process.exit(0); });
+const server = net.createServer((sock) => {
+  sock.on("error", () => {});
+  let buf = "";
+  sock.on("data", (d) => {
+    buf += d;
+    for (let k = buf.indexOf("\\n"); k >= 0; k = buf.indexOf("\\n")) {
+      const req = JSON.parse(buf.slice(0, k));
+      buf = buf.slice(k + 1);
+      fs.appendFileSync(log, req.method + "\\n");
+      if (req.method === "ping") {
+        if (mode === "silent") continue;
+        sock.write(JSON.stringify({ status: "pong", version: mode === "badversion" ? "hello" : "0.4.0" }) + "\\n");
+      } else if (req.method === "shutdown") {
+        if (mode === "hang") continue;
+        sock.write('{"status":"ok"}\\n');
+        process.exit(0);
+      } else {
+        sock.write('{"status":"ok"}\\n');
+      }
+    }
+  });
+});
+const s = args.indexOf("--socket");
+if (s >= 0) server.listen(args[s + 1]);
+else { const [h, p] = args[args.indexOf("--tcp") + 1].split(":"); server.listen(Number(p), h); }
+`,
+  );
+  const bin = path.join(dir, `${mode}.sh`);
+  writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" "${js}" "$@"\n`);
+  chmodSync(bin, 0o755);
+  return { bin, log };
+}
+
+describe("launch() against misbehaving endpoints", { skip: process.platform === "win32" }, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "wb-fake-"));
+  after(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("refuses an endpoint whose ping reply is not a daemon version, and never sends shutdown", async () => {
+    const { bin, log } = fakeDaemonBinary(dir, "badversion");
+    await assert.rejects(
+      launch({ daemonBinary: bin, useTcp: true }),
+      (err: unknown) =>
+        err instanceof WayboundLaunchError && /unexpected version/.test(err.message),
+    );
+    const methods = readFileSync(log, "utf8").trim().split("\n");
+    assert.deepEqual(
+      methods.filter((m) => m !== "SIGTERM"),
+      ["ping"],
+    );
+    assert.equal(_liveDaemonCount(), 0);
+  });
+
+  it("refuses an endpoint that never answers the ping", async () => {
+    const { bin } = fakeDaemonBinary(dir, "silent");
+    await assert.rejects(
+      launch({ daemonBinary: bin, useTcp: true }),
+      (err: unknown) => err instanceof WayboundLaunchError && /did not answer/.test(err.message),
+    );
+  });
+
+  it("does not wait the full request timeout for a hung daemon on close()", async () => {
+    const { bin, log } = fakeDaemonBinary(dir, "hang");
+    const session = await launch({ daemonBinary: bin });
+    const started = performance.now();
+    await session.close();
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 8_000, `close took ${elapsed}ms`);
+    await assertGone(session.pid);
+    assert.match(readFileSync(log, "utf8"), /shutdown\nSIGTERM/);
+  });
+
+  it("kills a daemon spawned by a process that exits before it connects", async () => {
+    const pidFile = path.join(dir, "slow.pid");
+    const bin = path.join(dir, "slow.sh");
+    writeFileSync(bin, `#!/bin/sh\necho $$ > "${pidFile}"\nexec sleep 30\n`);
+    chmodSync(bin, 0o755);
+    const indexUrl = new URL("../src/index.js", import.meta.url).href;
+    const script = `
+      import { launch } from ${JSON.stringify(indexUrl)};
+      launch({ daemonBinary: ${JSON.stringify(bin)}, startupTimeoutMs: 20000 }).catch(() => {});
+      setTimeout(() => process.exit(0), 500);
+    `;
+    await new Promise<void>((resolve, reject) => {
+      execFile(
+        process.execPath,
+        ["--input-type=module", "-e", script],
+        { timeout: 15_000 },
+        (err) => (err ? reject(err) : resolve()),
+      );
+    });
+    await assertGone(Number(readFileSync(pidFile, "utf8").trim()));
   });
 });

@@ -12,6 +12,8 @@ import {
   encodeKey,
   encodeQuery,
   fillTimeoutMs,
+  MAX_TIMER_MS,
+  MAX_WAIT_MS,
   parseHttpResponse,
   parseNode,
   Transport,
@@ -391,6 +393,114 @@ describe("Transport against a scripted daemon", () => {
     const page = new Page(transport);
     assert.equal(await page.waitForUrl("A.TEST"), "https://a.test/");
     await expectCode(page.waitForUrl("nope", { timeoutMs: 100 }), "timeout");
+  });
+  it("clamps huge waits to the daemon caps and never arms an overflowing timer", async () => {
+    daemon = await fakeDaemon((req, socket) => {
+      setTimeout(() => {
+        if (req.method === "wait_for") {
+          reply(socket, {
+            status: "node",
+            node: { id: "n", role: "button", bounds: { x: 0, y: 0, width: 1, height: 1 } },
+          });
+        } else if (req.method === "wait_for_response") {
+          reply(socket, { status: "http_response", response: { url: "u", status: 204 } });
+        } else {
+          reply(socket, { status: "ok" });
+        }
+      }, 50);
+    });
+    // 3e9 ms is above setTimeout's 2^31-1 limit; unclamped, the timer would fire after 1 ms.
+    transport = await Transport.connect(daemon.endpoint, { timeoutMs: 3_000_000_000 });
+    const query = { role: Role.BUTTON, name: null, exact: false, nth: 0, within: null };
+    assert.equal((await transport.waitFor(query, 3_000_000_000)).id, "n");
+    assert.equal((await transport.waitForResponse("u", 2 ** 60)).status, 204);
+    await transport.waitForNetworkIdle(Number.MAX_VALUE, 1e20);
+    await transport.reload();
+    assert.equal(transport.closed, false);
+    const sent = daemon.requests;
+    assert.equal(sent[0]?.timeout_ms, MAX_WAIT_MS);
+    assert.equal(sent[1]?.timeout_ms, MAX_WAIT_MS);
+    assert.equal(sent[2]?.idle_ms, 10_000);
+    assert.equal(sent[2]?.timeout_ms, 60_000);
+    assert.ok(waitTimeoutMs(MAX_TIMER_MS * 10, 1) <= MAX_TIMER_MS);
+    assert.ok(fillTimeoutMs(MAX_TIMER_MS, "x".repeat(10)) <= MAX_TIMER_MS);
+  });
+
+  it("rejects negative and non-finite durations with TypeError", async () => {
+    daemon = await fakeDaemon((_req, socket) => reply(socket, { status: "ok" }));
+    transport = await Transport.connect(daemon.endpoint);
+    const query = { role: null, name: "x", exact: false, nth: 0, within: null };
+    const page = new Page(transport);
+    for (const bad of [-1, Number.NaN, Number.POSITIVE_INFINITY, "5" as unknown as number]) {
+      await assert.rejects(transport.waitFor(query, bad), TypeError);
+      await assert.rejects(page.waitForResponse("x", { timeoutMs: bad }), TypeError);
+      await assert.rejects(page.waitForNetworkIdle({ idleMs: bad }), TypeError);
+      await assert.rejects(page.waitForUrl("x", { timeoutMs: bad }), TypeError);
+    }
+    await assert.rejects(Transport.connect(daemon.endpoint, { timeoutMs: -5 }), TypeError);
+    assert.equal(daemon.requests.length, 0, "nothing was sent");
+    assert.equal(transport.closed, false);
+  });
+
+  it("fetches captured responses on a dedicated connection that cannot poison the session", async () => {
+    daemon = await fakeDaemon((req, socket) => {
+      if (req.method === "captured_responses") {
+        socket.write(
+          req.url_contains === "bad"
+            ? "{not json\n"
+            : '{"status":"http_responses","responses":[{"url":"a","status":200}]}\n',
+        );
+      } else {
+        reply(socket, { status: "pong", version: "1" });
+      }
+    });
+    transport = await Transport.connect(daemon.endpoint);
+    const page = new Page(transport);
+    assert.equal((await page.capturedResponses())[0]?.url, "a");
+    await expectCode(page.capturedResponses({ urlContains: "bad" }), "protocol_error");
+    assert.equal(await transport.ping(), "1");
+    assert.equal(daemon.connections, 3, "one main + one per captured_responses call");
+  });
+
+  it("arms expectResponse before the triggering action is sent", async () => {
+    daemon = await fakeDaemon((req, socket) => {
+      if (req.method === "wait_for_response") {
+        setTimeout(
+          () => reply(socket, { status: "http_response", response: { url: "x/api", status: 201 } }),
+          30,
+        );
+      } else {
+        reply(socket, { status: "ok" });
+      }
+    });
+    transport = await Transport.connect(daemon.endpoint);
+    const page = new Page(transport);
+    const waiter = await page.expectResponse("/api");
+    // The wait request is on the wire before the click is issued.
+    await sleep(10);
+    assert.deepEqual(
+      daemon.requests.map((r) => r.method),
+      ["wait_for_response"],
+    );
+    await page.getByRole(Role.BUTTON).click();
+    assert.equal((await waiter.response).status, 201);
+  });
+
+  it("does not raise unhandled rejections for a waiter that is never awaited", async () => {
+    daemon = await fakeDaemon((_req, socket) =>
+      reply(socket, { status: "error", code: "timeout", message: "nothing" }),
+    );
+    transport = await Transport.connect(daemon.endpoint);
+    await new Page(transport).expectResponse("/never");
+    await sleep(30);
+  });
+
+  it("bounds the shutdown reply wait when asked", async () => {
+    daemon = await fakeDaemon(() => undefined);
+    transport = await Transport.connect(daemon.endpoint);
+    const started = performance.now();
+    await expectCode(transport.shutdown(100), "io_error");
+    assert.ok(performance.now() - started < 2_000);
   });
 });
 

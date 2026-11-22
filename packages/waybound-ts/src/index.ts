@@ -31,6 +31,7 @@ export { type BackendName, type LaunchOptions, launch, Session } from "./session
 export {
   DEFAULT_TIMEOUT_MS,
   type Endpoint,
+  type ResponseWaiter,
   Transport,
   type TransportOptions,
 } from "./transport.js";

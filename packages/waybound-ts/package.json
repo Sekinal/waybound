@@ -14,13 +14,16 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     },
     "./package.json": "./package.json"
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
   ],
   "sideEffects": false,
   "engines": {
@@ -31,7 +34,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "biome check --error-on-warnings .",
     "format": "biome check --write .",
-    "pretest": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build",
+    "pretest": "tsc -p tsconfig.build.json && tsc -p tsconfig.json",
     "test": "node --test --test-timeout=60000 \"build-test/test/**/*.test.js\""
   },
   "devDependencies": {

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { WayboundDaemonError } from "./errors.js";
-import type { Transport } from "./transport.js";
+import { checkMs, type ResponseWaiter, type Transport } from "./transport.js";
 import type {
   AccessibilityNode,
   CapturedResponse,
@@ -191,9 +191,9 @@ export class Page {
 
   /** Poll until the active tab URL contains `urlContains` (case-insensitive). */
   async waitForUrl(urlContains: string, options: TimeoutOptions = {}): Promise<string> {
-    const timeoutMs = options.timeoutMs ?? 10_000;
+    const timeoutMs = checkMs(options.timeoutMs ?? 10_000, "timeoutMs");
     const needle = urlContains.toLowerCase();
-    const deadline = performance.now() + Math.max(0, timeoutMs);
+    const deadline = performance.now() + timeoutMs;
     for (;;) {
       const current = await this.#transport.currentUrl();
       if (typeof current === "string" && current.toLowerCase().includes(needle)) {
@@ -273,7 +273,25 @@ export class Page {
     return this.#transport.capturedResponses(options.urlContains ?? null);
   }
 
-  /** Wait for a captured HTTP response whose URL contains `urlContains`. */
+  /**
+   * Arm a wait for the next captured HTTP response whose URL contains `urlContains`, before
+   * triggering it:
+   *
+   * ```ts
+   * const waiter = await page.expectResponse("/api/search");
+   * await page.getByRole(Role.BUTTON, { name: "Search" }).click();
+   * const response = await waiter.response;
+   * ```
+   */
+  expectResponse(urlContains: string, options: TimeoutOptions = {}): Promise<ResponseWaiter> {
+    return this.#transport.expectResponse(urlContains, options.timeoutMs ?? 10_000);
+  }
+
+  /**
+   * Wait for a captured HTTP response whose URL contains `urlContains`. Only responses captured
+   * after the daemon receives this request count; prefer `expectResponse()` when the response
+   * is triggered by an action of your own.
+   */
   waitForResponse(urlContains: string, options: TimeoutOptions = {}): Promise<CapturedResponse> {
     return this.#transport.waitForResponse(urlContains, options.timeoutMs ?? 10_000);
   }
