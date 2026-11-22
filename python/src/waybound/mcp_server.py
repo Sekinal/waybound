@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from waybound.client import Page
+    from waybound.session import Session
 
 PROTOCOL_VERSION = "2024-11-05"
 
@@ -105,7 +106,11 @@ def _parse_role(raw: object) -> Role | None:
     try:
         return Role(raw)
     except ValueError:
-        return None
+        # Fail loudly: silently dropping an unknown role would turn the call into a
+        # different, broader locator than the one the caller asked for.
+        valid = ", ".join(sorted(r.value for r in Role))
+        msg = f"unknown role {raw!r} (expected one of: {valid})"
+        raise ValueError(msg) from None
 
 
 def _as_int(raw: object, default: int) -> int:
@@ -216,7 +221,9 @@ _TOOL_HANDLERS: dict[str, Callable[[Page, dict[str, object]], dict[str, object]]
 }
 
 
-def _handle_tools_call(page: Page, req_id: object, params: object) -> dict[str, object]:
+def _handle_tools_call(
+    page_provider: Callable[[], Page], req_id: object, params: object
+) -> dict[str, object]:
     if not isinstance(params, dict):
         return _rpc_error(req_id, -32602, "missing params object")
     tool_name = params.get("name")
@@ -229,7 +236,10 @@ def _handle_tools_call(page: Page, req_id: object, params: object) -> dict[str, 
     raw_args = params.get("arguments")
     args = raw_args if isinstance(raw_args, dict) else {}
     try:
-        result = handler(page, args)
+        # The provider launches the browser on first use. A launch failure (daemon binary or
+        # Chrome missing, Accessibility not granted) is reported as a tool error, like any
+        # other tool failure, instead of taking the whole server down.
+        result = handler(page_provider(), args)
     except Exception as exc:
         return {
             "jsonrpc": "2.0",
@@ -244,10 +254,12 @@ def handle_rpc_message(
     msg: dict[str, object],
 ) -> dict[str, object] | None:
     """Process one JSON-RPC 2.0 MCP message; returns None for any notification."""
-    if "id" not in msg:
+    method = msg.get("method")
+    if "id" not in msg or method is None:
+        # Notifications carry no id; a message with an id but no method is the client's
+        # response to a server-initiated request. Neither is ever answered.
         return None
     req_id = msg.get("id")
-    method = msg.get("method")
 
     if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
@@ -264,7 +276,7 @@ def handle_rpc_message(
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
     if method == "tools/call":
-        return _handle_tools_call(page_provider(), req_id, msg.get("params"))
+        return _handle_tools_call(page_provider, req_id, msg.get("params"))
     return _rpc_error(req_id, -32601, f"method not found: {method!r}")
 
 
@@ -288,13 +300,21 @@ def _options_from_env() -> LaunchOptions:
 
 def main() -> None:
     """Run the `waybound-mcp` stdio server, lazily launching the browser on first tool call."""
-    session = launch(_options_from_env())
+    session: Session | None = None
     active_page: Page | None = None
 
     def get_page() -> Page:
-        nonlocal active_page
+        nonlocal session, active_page
         if active_page is None:
-            active_page = session.__enter__()
+            # Created lazily so a missing daemon binary surfaces as a tool error on the
+            # first call rather than killing the server before `initialize`.
+            candidate = launch(_options_from_env())
+            try:
+                active_page = candidate.__enter__()
+            except BaseException:
+                candidate.close()
+                raise
+            session = candidate
         return active_page
 
     try:
@@ -315,7 +335,8 @@ def main() -> None:
                 sys.stdout.write(json.dumps(response) + "\n")
                 sys.stdout.flush()
     finally:
-        session.close()
+        if session is not None:
+            session.close()
 
 
 if __name__ == "__main__":
