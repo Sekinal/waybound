@@ -1297,27 +1297,49 @@ mod tests {
         }
     }
 
+    const SERVER_FIRST: &[u8] = b"\x16\x03\x03server-first-flight";
+    const CLIENT_HELLO: &[u8] = b"\x16\x03\x01client-hello-bytes";
+    const SERVER_REPLY: &[u8] = b"\x17\x03\x03server-app-data";
+    const UPSTREAM_200: &[u8] = b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: fake\r\n\r\n";
+
     #[test]
     fn http_upstream_connect_is_tapped_without_proxy_reply_bytes() {
-        const SERVER_FIRST: &[u8] = b"\x16\x03\x03server-first-flight";
-        const CLIENT_HELLO: &[u8] = b"\x16\x03\x01client-hello-bytes";
-        const SERVER_REPLY: &[u8] = b"\x17\x03\x03server-app-data";
+        // The 200 header and the first tunnelled bytes arrive in a single write.
+        let mut first = UPSTREAM_200.to_vec();
+        first.extend_from_slice(SERVER_FIRST);
+        assert_http_upstream_connect_is_tapped(vec![first]);
+    }
 
-        let Some((forwarder, recorder, server)) = forwarder_with_fake_http_upstream(|mut s| {
-            let request = read_request_head(&mut s);
-            // The 200 header and the first tunnelled bytes arrive in a single write.
-            let mut first =
-                b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: fake\r\n\r\n".to_vec();
-            first.extend_from_slice(SERVER_FIRST);
-            if s.write_all(&first).is_err() {
-                return request;
-            }
-            let hello = read_up_to(&mut s, CLIENT_HELLO.len());
-            if hello == CLIENT_HELLO {
-                let _ = s.write_all(SERVER_REPLY);
-            }
-            request
-        }) else {
+    #[test]
+    fn http_upstream_connect_reply_split_across_writes_is_tapped() {
+        // The reply header is cut mid status line; its tail shares a write with the payload.
+        let (head, tail) = UPSTREAM_200.split_at(16);
+        let mut second = tail.to_vec();
+        second.extend_from_slice(SERVER_FIRST);
+        assert_http_upstream_connect_is_tapped(vec![head.to_vec(), second]);
+    }
+
+    /// Runs a tapped `CONNECT` through a fake upstream that sends `reply_writes` (the 200
+    /// header followed by [`SERVER_FIRST`]) as separate writes with a short pause in between.
+    fn assert_http_upstream_connect_is_tapped(reply_writes: Vec<Vec<u8>>) {
+        let Some((forwarder, recorder, server)) =
+            forwarder_with_fake_http_upstream(move |mut s| {
+                let request = read_request_head(&mut s);
+                for (idx, chunk) in reply_writes.iter().enumerate() {
+                    if idx > 0 {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    if s.write_all(chunk).and_then(|()| s.flush()).is_err() {
+                        return request;
+                    }
+                }
+                let hello = read_up_to(&mut s, CLIENT_HELLO.len());
+                if hello == CLIENT_HELLO {
+                    let _ = s.write_all(SERVER_REPLY);
+                }
+                request
+            })
+        else {
             return;
         };
         let Some(mut client) = connect_client(&forwarder) else {
@@ -1436,5 +1458,24 @@ mod tests {
         );
         assert!(parse_status_line(b"HTTP/1.1 2000 nope\r\n").is_err());
         assert!(parse_status_line(b"ICY 200 OK\r\n").is_err());
+    }
+
+    #[test]
+    fn header_end_found_only_once_complete_when_fed_bytewise() {
+        let mut wire = UPSTREAM_200.to_vec();
+        wire.extend_from_slice(SERVER_FIRST);
+        let mut fed = Vec::new();
+        for (idx, &byte) in wire.iter().enumerate() {
+            fed.push(byte);
+            let expected = (idx + 1 >= UPSTREAM_200.len()).then_some(UPSTREAM_200.len());
+            assert_eq!(find_header_end(&fed), expected, "after {} bytes", idx + 1);
+        }
+
+        let mut fed = Vec::new();
+        for &byte in b"HTTP/1.0 200 OK\n\nX" {
+            fed.push(byte);
+            let expected = (fed.len() >= 17).then_some(17);
+            assert_eq!(find_header_end(&fed), expected, "after {} bytes", fed.len());
+        }
     }
 }
