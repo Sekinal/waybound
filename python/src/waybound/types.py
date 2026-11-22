@@ -121,6 +121,10 @@ class Transport(Protocol):
         """Poll until an element matching `query` appears or `timeout_ms` elapses."""
         ...
 
+    def hover(self, query: LocatorQuery) -> None:
+        """Locate the target element and move the pointer over it without clicking."""
+        ...
+
     def click(self, query: LocatorQuery) -> None:
         """Locate the target element and dispatch a native click."""
         ...
@@ -131,6 +135,18 @@ class Transport(Protocol):
 
     def navigate(self, url: str) -> None:
         """Navigate the active browser tab to `url`."""
+        ...
+
+    def reload(self) -> None:
+        """Reload the active browser tab."""
+        ...
+
+    def go_back(self) -> None:
+        """Navigate back in browser history."""
+        ...
+
+    def go_forward(self) -> None:
+        """Navigate forward in browser history."""
         ...
 
     def scroll(self, delta_x: float, delta_y: float) -> None:

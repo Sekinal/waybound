@@ -1,0 +1,17 @@
+# Standard OCI Compose Spec — works with both `podman compose` and `docker compose`.
+services:
+  waybound:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: waybound:latest
+    shm_size: "2gb"
+    security_opt:
+      - seccomp=unconfined
+    # Optional: enable passive `tshark` SSLKEYLOGFILE capture inside the container.
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    environment:
+      - ACCESSIBILITY_ENABLED=1
+    command: ["waybound", "doctor"]

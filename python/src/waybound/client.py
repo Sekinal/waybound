@@ -52,6 +52,22 @@ class Locator:
         """Return all accessibility nodes matching this locator."""
         return self._transport.locate_all(self.query)
 
+    def count(self) -> int:
+        """Return the number of accessibility nodes matching this locator."""
+        return len(self.all())
+
+    def is_visible(self) -> bool:
+        """Return `True` if the matched element exists with positive on-screen bounds."""
+        matches = self.all()
+        if self.query.nth >= len(matches):
+            return False
+        b = matches[self.query.nth].bounds
+        return b.width > 0.0 and b.height > 0.0
+
+    def hover(self) -> None:
+        """Move the pointer over the resolved element using native OS input without clicking."""
+        self._transport.hover(self.query)
+
     def wait_for(self, *, timeout_ms: int = 10_000) -> AccessibilityNode:
         """Wait until this element appears in the accessibility tree."""
         return self._transport.wait_for(self.query, timeout_ms=timeout_ms)
@@ -101,6 +117,18 @@ class Page:
     def goto(self, url: str) -> None:
         """Navigate the active browser tab to `url` via native OS shortcut."""
         self._transport.navigate(url)
+
+    def reload(self) -> None:
+        """Reload the active browser tab via native OS shortcut."""
+        self._transport.reload()
+
+    def go_back(self) -> None:
+        """Navigate back in browser history via native OS shortcut."""
+        self._transport.go_back()
+
+    def go_forward(self) -> None:
+        """Navigate forward in browser history via native OS shortcut."""
+        self._transport.go_forward()
 
     def scroll(self, *, delta_x: float = 0.0, delta_y: float = -300.0) -> None:
         """Scroll the viewport by `(delta_x, delta_y)` pixels."""

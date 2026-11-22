@@ -29,6 +29,11 @@ pub enum Request {
         /// Maximum wait time in milliseconds.
         timeout_ms: u64,
     },
+    /// Locate an element matching `query` and move the pointer over it without clicking.
+    Hover {
+        /// Semantic locator query.
+        query: LocatorQuery,
+    },
     /// Locate an element matching `query` and click its center.
     Click {
         /// Semantic locator query.
@@ -46,6 +51,12 @@ pub enum Request {
         /// Destination URL (`http://` or `https://`).
         url: String,
     },
+    /// Reload the active browser tab via native OS shortcut (Cmd/Ctrl+R).
+    Reload,
+    /// Navigate back in browser history via native OS shortcut (Cmd+[ / Alt+Left).
+    GoBack,
+    /// Navigate forward in browser history via native OS shortcut (Cmd+] / Alt+Right).
+    GoForward,
     /// Emit a native scroll event.
     Scroll {
         /// Horizontal scroll delta in pixels.

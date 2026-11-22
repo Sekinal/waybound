@@ -20,6 +20,12 @@ def test_session_over_loopback_tcp_round_trips_requests() -> None:
             tree = page.snapshot_tree()
             assert len(tree) > 0
             btn = page.get_by_role(Role.BUTTON)
+            assert btn.count() >= 1
+            assert btn.is_visible()
+            btn.hover()
             btn.click()
+            page.reload()
+            page.go_back()
+            page.go_forward()
     except FileNotFoundError:
         pytest.skip("waybound-daemon binary not built in this environment")

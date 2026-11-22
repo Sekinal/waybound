@@ -113,6 +113,10 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
                 Err(err) => Response::from(&err),
             }
         }
+        Request::Hover { query } => match hover_element(driver, state, &query) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
         Request::Click { query } => match click_element(driver, state, &query) {
             Ok(()) => Response::Ok,
             Err(err) => Response::from(&err),
@@ -122,6 +126,18 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             Err(err) => Response::from(&err),
         },
         Request::Navigate { url } => match navigate_url(driver, &url) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
+        Request::Reload => match browser_shortcut(driver, BrowserAction::Reload) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
+        Request::GoBack => match browser_shortcut(driver, BrowserAction::GoBack) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
+        Request::GoForward => match browser_shortcut(driver, BrowserAction::GoForward) {
             Ok(()) => Response::Ok,
             Err(err) => Response::from(&err),
         },
@@ -271,7 +287,7 @@ fn validate_bounds(b: waybound_core::Bounds, query: &LocatorQuery) -> Result<()>
     Ok(())
 }
 
-fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery) -> Result<()> {
+fn hover_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery) -> Result<()> {
     let mut node = driver.locate(query)?;
     validate_bounds(node.bounds, query)?;
 
@@ -313,8 +329,13 @@ fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery
         Point { x, y }
     };
 
-    move_pointer(driver, state, target, &mut rng)?;
+    move_pointer(driver, state, target, &mut rng)
+}
+
+fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery) -> Result<()> {
+    hover_element(driver, state, query)?;
     let hold_ms = if state.options.use_motion {
+        let mut rng = SplitMix64::from_entropy();
         thread::sleep(hover_pause_before_click(&mut rng));
         mouse_hold_ms(&mut rng)
     } else {
@@ -324,6 +345,30 @@ fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery
     driver.dispatch_input(&InputEvent::MouseClick {
         button: MouseButton::Left,
         hold_ms,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum BrowserAction {
+    Reload,
+    GoBack,
+    GoForward,
+}
+
+fn browser_shortcut(driver: &dyn Driver, action: BrowserAction) -> Result<()> {
+    let is_macos = driver.backend_kind() == BackendKind::MacOsNative;
+    let (key, modifiers) = match (action, is_macos) {
+        (BrowserAction::Reload, true) => (KeyCode::Char('r'), vec![KeyModifier::Meta]),
+        (BrowserAction::Reload, false) => (KeyCode::Char('r'), vec![KeyModifier::Control]),
+        (BrowserAction::GoBack, true) => (KeyCode::Char('['), vec![KeyModifier::Meta]),
+        (BrowserAction::GoBack, false) => (KeyCode::ArrowLeft, vec![KeyModifier::Alt]),
+        (BrowserAction::GoForward, true) => (KeyCode::Char(']'), vec![KeyModifier::Meta]),
+        (BrowserAction::GoForward, false) => (KeyCode::ArrowRight, vec![KeyModifier::Alt]),
+    };
+    driver.dispatch_input(&InputEvent::KeyPress {
+        key,
+        modifiers,
+        hold_ms: 0,
     })
 }
 

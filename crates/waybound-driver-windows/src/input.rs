@@ -33,10 +33,12 @@ pub fn to_absolute_coord(pos: f64, screen_extent: i32) -> i32 {
 #[allow(clippy::needless_pass_by_value)]
 pub fn key_to_vk(key: KeyCode) -> Option<u16> {
     match key {
-        KeyCode::Enter => Some(0x0D),     // VK_RETURN
-        KeyCode::Tab => Some(0x09),       // VK_TAB
-        KeyCode::Escape => Some(0x1B),    // VK_ESCAPE
-        KeyCode::Backspace => Some(0x08), // VK_BACK
+        KeyCode::Enter => Some(0x0D),      // VK_RETURN
+        KeyCode::Tab => Some(0x09),        // VK_TAB
+        KeyCode::Escape => Some(0x1B),     // VK_ESCAPE
+        KeyCode::Backspace => Some(0x08),  // VK_BACK
+        KeyCode::ArrowLeft => Some(0x25),  // VK_LEFT
+        KeyCode::ArrowRight => Some(0x27), // VK_RIGHT
         KeyCode::Char(c) => match c {
             'a'..='z' => Some(u16::from(c.to_ascii_uppercase() as u8)),
             'A'..='Z' | '0'..='9' => Some(u16::from(c as u8)),

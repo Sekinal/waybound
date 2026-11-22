@@ -45,6 +45,18 @@ class AsyncLocator:
         """Return all accessibility nodes matching this locator."""
         return await asyncio.to_thread(self._inner.all)
 
+    async def count(self) -> int:
+        """Return the number of accessibility nodes matching this locator."""
+        return await asyncio.to_thread(self._inner.count)
+
+    async def is_visible(self) -> bool:
+        """Return `True` if the matched element exists with positive on-screen bounds."""
+        return await asyncio.to_thread(self._inner.is_visible)
+
+    async def hover(self) -> None:
+        """Move the pointer over the resolved element without clicking."""
+        await asyncio.to_thread(self._inner.hover)
+
     async def wait_for(self, *, timeout_ms: int = 10_000) -> AccessibilityNode:
         """Wait until this element appears in the accessibility tree."""
         return await asyncio.to_thread(self._inner.wait_for, timeout_ms=timeout_ms)
@@ -85,6 +97,18 @@ class AsyncPage:
     async def goto(self, url: str) -> None:
         """Navigate the active browser tab to `url` via native OS shortcut."""
         await asyncio.to_thread(self._inner.goto, url)
+
+    async def reload(self) -> None:
+        """Reload the active browser tab via native OS shortcut."""
+        await asyncio.to_thread(self._inner.reload)
+
+    async def go_back(self) -> None:
+        """Navigate back in browser history via native OS shortcut."""
+        await asyncio.to_thread(self._inner.go_back)
+
+    async def go_forward(self) -> None:
+        """Navigate forward in browser history via native OS shortcut."""
+        await asyncio.to_thread(self._inner.go_forward)
 
     async def scroll(self, *, delta_x: float = 0.0, delta_y: float = -300.0) -> None:
         """Scroll the viewport by `(delta_x, delta_y)` pixels."""

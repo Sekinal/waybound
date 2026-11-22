@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from io import TextIOWrapper
     from types import TracebackType
 
-_NAMED_KEYS = frozenset({"enter", "tab", "escape", "backspace"})
+_NAMED_KEYS = frozenset({"enter", "tab", "escape", "backspace", "arrow_left", "arrow_right"})
 # The daemon paces typing at up to ~180 ms per key; allow headroom on top of the base timeout.
 _FILL_SECONDS_PER_CHAR = 0.25
 
@@ -206,6 +206,10 @@ class UnixSocketTransport:
             raise WayboundDaemonError("protocol_error", msg)
         return _parse_http_response(raw_resp)
 
+    def hover(self, query: LocatorQuery) -> None:
+        """Locate the target element and move the pointer over it without clicking."""
+        self._expect_ok({"method": "hover", "query": _encode_query(query)}, "hover")
+
     def click(self, query: LocatorQuery) -> None:
         """Locate the target element and dispatch a native click."""
         self._expect_ok({"method": "click", "query": _encode_query(query)}, "click")
@@ -221,6 +225,18 @@ class UnixSocketTransport:
     def navigate(self, url: str) -> None:
         """Navigate the active browser tab to `url`."""
         self._expect_ok({"method": "navigate", "url": url}, "navigate")
+
+    def reload(self) -> None:
+        """Reload the active browser tab via native OS shortcut."""
+        self._expect_ok({"method": "reload"}, "reload")
+
+    def go_back(self) -> None:
+        """Navigate back in browser history via native OS shortcut."""
+        self._expect_ok({"method": "go_back"}, "go_back")
+
+    def go_forward(self) -> None:
+        """Navigate forward in browser history via native OS shortcut."""
+        self._expect_ok({"method": "go_forward"}, "go_forward")
 
     def screenshot(self, path: str) -> None:
         """Capture a native OS PNG screenshot of the browser window to `path`."""

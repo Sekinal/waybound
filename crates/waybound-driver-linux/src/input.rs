@@ -181,6 +181,8 @@ pub fn build_xdotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
                 KeyCode::Tab => "Tab".to_owned(),
                 KeyCode::Escape => "Escape".to_owned(),
                 KeyCode::Backspace => "BackSpace".to_owned(),
+                KeyCode::ArrowLeft => "Left".to_owned(),
+                KeyCode::ArrowRight => "Right".to_owned(),
                 KeyCode::Char(ch) => xdotool_keysym(*ch),
             };
             parts.push(key_part);
@@ -327,6 +329,8 @@ pub fn build_ydotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
                 KeyCode::Tab => Some(15),
                 KeyCode::Escape => Some(1),
                 KeyCode::Backspace => Some(14),
+                KeyCode::ArrowLeft => Some(105),
+                KeyCode::ArrowRight => Some(106),
                 KeyCode::Char(ch) => linux_char_keycode(*ch),
             };
 

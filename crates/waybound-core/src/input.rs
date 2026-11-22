@@ -49,6 +49,10 @@ pub enum KeyCode {
     Escape,
     /// Backspace key.
     Backspace,
+    /// Left arrow key.
+    ArrowLeft,
+    /// Right arrow key.
+    ArrowRight,
     /// Arbitrary Unicode character.
     Char(char),
 }

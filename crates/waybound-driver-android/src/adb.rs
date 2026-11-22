@@ -210,6 +210,8 @@ fn build_key_shell_args(key: &KeyCode) -> Vec<String> {
         KeyCode::Tab | KeyCode::Char('\t') => keyevent_args(KEYCODE_TAB),
         KeyCode::Escape => keyevent_args(KEYCODE_ESCAPE),
         KeyCode::Backspace => keyevent_args(KEYCODE_BACKSPACE),
+        KeyCode::ArrowLeft => keyevent_args(21),
+        KeyCode::ArrowRight => keyevent_args(22),
         KeyCode::Char(ch) => {
             let mut buf = [0u8; 4];
             let s = ch.encode_utf8(&mut buf);

@@ -40,6 +40,9 @@ class FakeTransport:
             focused=False,
         )
 
+    def hover(self, query: LocatorQuery) -> None:
+        self.events.append(("hover", query))
+
     def click(self, query: LocatorQuery) -> None:
         self.events.append(("click", query))
 
@@ -48,6 +51,15 @@ class FakeTransport:
 
     def navigate(self, url: str) -> None:
         self.events.append(("navigate", url))
+
+    def reload(self) -> None:
+        self.events.append(("reload", None))
+
+    def go_back(self) -> None:
+        self.events.append(("go_back", None))
+
+    def go_forward(self) -> None:
+        self.events.append(("go_forward", None))
 
     def scroll(self, delta_x: float, delta_y: float) -> None:
         self.events.append(("scroll", (delta_x, delta_y)))
