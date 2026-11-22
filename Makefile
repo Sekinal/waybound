@@ -23,5 +23,6 @@ lint-python:
 	cd python && uv run mypy src tests
 
 test:
+	cargo build --workspace
 	cargo test --workspace --all-features
 	cd python && uv run pytest
