@@ -265,7 +265,9 @@ impl WebSocketStream {
         match frame.opcode {
             OP_CLOSE | OP_PING | OP_PONG => {
                 self.control.clear();
-                frame.fin && frame.remaining <= MAX_CONTROL_PAYLOAD
+                // A close payload is empty or starts with a 2-byte status code (section 5.5.1).
+                let close_ok = frame.opcode != OP_CLOSE || frame.remaining != 1;
+                frame.fin && frame.remaining <= MAX_CONTROL_PAYLOAD && close_ok
             }
             OP_TEXT | OP_BINARY => {
                 if self.message.is_some() {
@@ -359,7 +361,8 @@ impl WebSocketStream {
                 inf.end_message();
             }
         }
-        let payload = if msg.undecodable {
+        // Binary payloads are not text: a UTF-8 prefix of them would be misleading.
+        let payload = if msg.undecodable || msg.opcode == WebSocketOpcode::Binary {
             None
         } else {
             decode_body_bytes(&msg.buf.data, None)
@@ -553,7 +556,8 @@ mod tests {
         assert_eq!(got[0].payload.as_deref(), Some(medium.as_str()));
         assert_eq!(got[1].opcode, WebSocketOpcode::Binary);
         assert_eq!(got[1].payload_len, 70_000);
-        assert_eq!(got[1].payload.as_deref(), Some(large.as_str()));
+        // Binary messages report their size but no text payload.
+        assert_eq!(got[1].payload, None);
 
         let mut masked = stream(WebSocketDirection::Sent, None);
         let got = feed_all(
@@ -701,6 +705,72 @@ mod tests {
         // Reserved opcode 0x3, then a valid frame that must be ignored.
         let mut bytes = frame(true, false, 0x3, None, b"x");
         bytes.extend(frame(true, false, OP_TEXT, None, b"ignored"));
-        assert!(feed_all(&mut s, &bytes).is_empty());
+        assert_eq!(feed_all(&mut s, &bytes), Vec::new());
+    }
+
+    #[test]
+    fn rejects_64_bit_length_with_high_bit_set() {
+        let mut bytes = vec![0x81, 0x7f];
+        bytes.extend_from_slice(&(1_u64 << 63).to_be_bytes());
+        bytes.extend(frame(true, false, OP_TEXT, None, b"ignored"));
+        let mut s = stream(WebSocketDirection::Received, None);
+        assert_eq!(feed_all(&mut s, &bytes), Vec::new());
+    }
+
+    #[test]
+    fn zero_length_data_frames() {
+        let mut s = stream(WebSocketDirection::Sent, None);
+        let mut bytes = frame(true, false, OP_TEXT, Some(MASK), b"");
+        bytes.extend(frame(false, false, OP_BINARY, Some(MASK), b""));
+        bytes.extend(frame(true, false, OP_CONTINUATION, Some(MASK), b""));
+        let got = feed_all(&mut s, &bytes);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].opcode, WebSocketOpcode::Text);
+        assert_eq!(got[0].payload, None);
+        assert_eq!(got[0].payload_len, 0);
+        assert_eq!(got[1].opcode, WebSocketOpcode::Binary);
+        assert_eq!(got[1].payload_len, 0);
+    }
+
+    #[test]
+    fn one_byte_close_payload_is_a_protocol_violation() {
+        let mut s = stream(WebSocketDirection::Received, None);
+        let mut bytes = frame(true, false, OP_CLOSE, None, &[0x03]);
+        bytes.extend(frame(true, false, OP_TEXT, None, b"ignored"));
+        assert_eq!(feed_all(&mut s, &bytes), Vec::new());
+    }
+
+    #[test]
+    fn inflates_with_server_no_context_takeover() {
+        let deflate = PerMessageDeflate::from_extension_headers([
+            "permessage-deflate; server_no_context_takeover",
+        ]);
+        assert_eq!(
+            deflate,
+            Some(PerMessageDeflate {
+                client_no_context_takeover: false,
+                server_no_context_takeover: true,
+            })
+        );
+        let mut s = stream(WebSocketDirection::Received, deflate);
+        let mut got = Vec::new();
+        for text in ["same text same text", "same text same text"] {
+            let mut c = Compress::new(Compression::default(), false);
+            s.feed(
+                &frame(
+                    true,
+                    true,
+                    OP_TEXT,
+                    None,
+                    &deflate_message(&mut c, text.as_bytes()),
+                ),
+                &mut got,
+            );
+        }
+        assert_eq!(got.len(), 2);
+        assert!(
+            got.iter()
+                .all(|f| f.payload.as_deref() == Some("same text same text"))
+        );
     }
 }

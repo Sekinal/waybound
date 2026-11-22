@@ -65,6 +65,8 @@ impl ResponseStore {
                 existing.response.body = resp.body;
                 existing.updated = now;
             }
+            // A final status replaces an earlier one for the same stream.
+            existing.response.status = resp.status;
             if existing.response.content_type.is_none() {
                 existing.response.content_type = resp.content_type;
             }
@@ -107,25 +109,31 @@ impl ResponseStore {
     }
 
     /// Returns captured WebSocket messages (oldest first), optionally filtered by
-    /// case-insensitive URL substring.
+    /// case-insensitive URL substring and limited to the most recent `limit` matches.
     #[must_use]
-    pub fn list_websocket_frames(&self, url_contains: Option<&str>) -> Vec<CapturedWebSocketFrame> {
+    pub fn list_websocket_frames(
+        &self,
+        url_contains: Option<&str>,
+        limit: Option<usize>,
+    ) -> Vec<CapturedWebSocketFrame> {
         let needle = url_contains.map(str::to_lowercase);
-        self.inner.lock().map_or_else(
-            |_| Vec::new(),
-            |guard| {
-                guard
-                    .websocket_frames
-                    .iter()
-                    .filter(|f| {
-                        needle
-                            .as_ref()
-                            .is_none_or(|n| f.url.to_lowercase().contains(n))
-                    })
-                    .cloned()
-                    .collect()
-            },
-        )
+        let Ok(guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut newest_first: Vec<CapturedWebSocketFrame> = guard
+            .websocket_frames
+            .iter()
+            .rev()
+            .filter(|f| {
+                needle
+                    .as_ref()
+                    .is_none_or(|n| f.url.to_lowercase().contains(n))
+            })
+            .take(limit.unwrap_or(usize::MAX))
+            .cloned()
+            .collect();
+        newest_first.reverse();
+        newest_first
     }
 
     /// Returns all captured responses, optionally filtered by case-insensitive URL substring.
@@ -808,8 +816,16 @@ mod tests {
                 ..sample("https://a.test/form", Some("ok"))
             },
         );
+        store.upsert(
+            7,
+            CapturedResponse {
+                status: 201,
+                ..sample("https://a.test/form", None)
+            },
+        );
         let got = store.list(None);
         assert_eq!(got.len(), 1);
+        assert_eq!(got[0].status, 201);
         assert_eq!(got[0].body.as_deref(), Some("ok"));
         assert_eq!(got[0].headers, vec![HttpHeader::new("set-cookie", "a=1")]);
         assert_eq!(got[0].request_method.as_deref(), Some("POST"));
@@ -834,13 +850,21 @@ mod tests {
                 close_code: None,
             });
         }
-        let all = store.list_websocket_frames(None);
+        let all = store.list_websocket_frames(None, None);
         assert_eq!(all.len(), MAX_CAPTURED_WS_FRAMES);
         assert_eq!(all[0].payload.as_deref(), Some("1"));
-        let odd = store.list_websocket_frames(Some("ODD.test"));
+        let odd = store.list_websocket_frames(Some("ODD.test"), None);
         assert_eq!(odd.len(), MAX_CAPTURED_WS_FRAMES / 2);
+        let recent = store.list_websocket_frames(Some("even"), Some(2));
+        let recent_payloads: Vec<_> = recent.iter().map(|f| f.payload.as_deref()).collect();
+        let last = MAX_CAPTURED_WS_FRAMES.to_string();
+        let before = (MAX_CAPTURED_WS_FRAMES - 2).to_string();
+        assert_eq!(
+            recent_payloads,
+            vec![Some(before.as_str()), Some(last.as_str())]
+        );
         // The legacy tshark path never produces WebSocket frames or the new response fields.
-        assert!(store.list(None).is_empty());
+        assert_eq!(store.list(None), Vec::new());
     }
 
     #[test]

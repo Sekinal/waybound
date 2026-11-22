@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod chunked;
 pub mod http;
 pub mod keylog;
 pub mod tls13;
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 
 pub use http::{
     HttpConnectionCorrelator, InflightCounter, ResponseCallback, WebSocketCallback,
-    decode_body_bytes,
+    decode_body_bytes, decode_body_bytes_limited,
 };
 pub use keylog::{KeyLogStore, TrafficSecrets};
 pub use tls13::{Direction, PassiveTls13Decoder, Tls13CipherSuite};

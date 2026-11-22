@@ -14,6 +14,7 @@ use flate2::read::{GzDecoder, ZlibDecoder};
 use fluke_hpack::Decoder as HpackDecoder;
 use waybound_core::{CapturedResponse, CapturedWebSocketFrame, HttpHeader, WebSocketDirection};
 
+use crate::chunked::{ChunkStatus, ChunkedDecoder};
 use crate::websocket::{PerMessageDeflate, WebSocketStream};
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -21,6 +22,7 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const H2_FRAME_DATA: u8 = 0x0;
 const H2_FRAME_HEADERS: u8 = 0x1;
 const H2_FRAME_RST_STREAM: u8 = 0x3;
+const H2_FRAME_GOAWAY: u8 = 0x7;
 const H2_FRAME_CONTINUATION: u8 = 0x9;
 
 const H2_FLAG_END_STREAM: u8 = 0x1;
@@ -34,12 +36,25 @@ const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
 /// Maximum buffered framing bytes per direction.
 const MAX_FRAME_BUFFER: usize = 4 * 1024 * 1024;
-/// Maximum raw request body bytes retained per request (1 MiB).
+/// Maximum request body bytes retained per request, both raw and after decompression (1 MiB).
 pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 /// Maximum header fields retained per request or response header list.
 pub const MAX_HEADERS_PER_MESSAGE: usize = 256;
+/// Maximum total name + value bytes retained per request or response header list (64 KiB).
+pub const MAX_HEADER_BYTES_PER_MESSAGE: usize = 64 * 1024;
+/// Maximum HTTP/1.1 requests awaiting a response per connection (oldest dropped first).
+pub const MAX_PENDING_H1_REQUESTS: usize = 64;
+/// Maximum HTTP/2 streams tracked per connection (lowest stream ID dropped first).
+pub const MAX_TRACKED_H2_STREAMS: usize = 256;
+/// Maximum size of an HTTP/2 header block assembled from `CONTINUATION` frames (1 MiB).
+const MAX_HEADER_BLOCK_BYTES: usize = 1024 * 1024;
 
 /// Callback invoked whenever a response is created or receives new streaming body bytes.
+///
+/// The first call for a sequence ID carries everything known so far. Later calls for the
+/// same ID always carry `url`, `status`, `content_type` and `body`, but `headers` and the
+/// `request_*` fields only when they changed since the previous call (they are empty
+/// otherwise), so consumers must merge updates rather than replace them.
 pub type ResponseCallback = Arc<dyn Fn(u64, CapturedResponse) + Send + Sync>;
 
 /// Callback invoked with every complete WebSocket message or control frame.
@@ -88,6 +103,8 @@ enum ProtoMode {
     WebSocket,
 }
 
+// Independent per-stream flags; grouping them would not make the state machine clearer.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 struct H2StreamState {
     seq: u64,
@@ -96,13 +113,18 @@ struct H2StreamState {
     content_type: Option<String>,
     content_encoding: Option<String>,
     headers: Vec<HttpHeader>,
+    /// `headers` changed since the last emit.
+    headers_dirty: bool,
     body: Vec<u8>,
     request_method: Option<String>,
     request_headers: Vec<HttpHeader>,
     request_content_encoding: Option<String>,
     request_body: Vec<u8>,
+    /// Request metadata or body changed since the last emit.
+    request_dirty: bool,
+    client_ended: bool,
+    server_ended: bool,
     inflight: bool,
-    emitted: bool,
 }
 
 /// HTTP/1.1 request awaiting its response on a keep-alive connection.
@@ -116,12 +138,14 @@ struct H1PendingRequest {
     body: Vec<u8>,
     /// Request carried `Upgrade: websocket`.
     websocket: bool,
+    /// Request carried `Expect: 100-continue`.
+    expect_continue: bool,
 }
 
 impl H1PendingRequest {
     /// Moves this request's URL and metadata onto the response it belongs to.
     fn attach_to(self, resp: &mut CapturedResponse) {
-        resp.request_body = decode_body_bytes(&self.body, self.content_encoding.as_deref());
+        resp.request_body = decode_request_body(&self.body, self.content_encoding.as_deref());
         resp.url = self.url;
         resp.request_method = Some(self.method);
         resp.request_headers = self.headers;
@@ -129,11 +153,28 @@ impl H1PendingRequest {
 }
 
 /// Progress through the body of the HTTP/1.1 request currently being sent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum H1ClientBody {
     None,
-    Length { id: u64, remaining: usize },
-    Chunked { id: u64 },
+    Length {
+        id: u64,
+        remaining: usize,
+        /// At least one body byte has been observed.
+        seen: bool,
+    },
+    Chunked {
+        id: u64,
+        decoder: ChunkedDecoder,
+    },
+}
+
+/// Chunked response body being decoded in place, resumed on every server feed.
+#[derive(Debug, Default)]
+struct H1ResponseChunks {
+    decoder: ChunkedDecoder,
+    body: Vec<u8>,
+    /// Bytes after the response head already fed to `decoder`.
+    consumed: usize,
 }
 
 #[derive(Debug)]
@@ -150,8 +191,9 @@ pub struct HttpConnectionCorrelator {
     s2c_buf: Vec<u8>,
     c2s_hpack: HpackDecoder<'static>,
     s2c_hpack: HpackDecoder<'static>,
-    c2s_pending_headers: HashMap<u32, Vec<u8>>,
-    s2c_pending_headers: HashMap<u32, Vec<u8>>,
+    /// Header blocks awaiting `CONTINUATION` frames, with the initial `HEADERS` flags.
+    c2s_pending_headers: HashMap<u32, (u8, Vec<u8>)>,
+    s2c_pending_headers: HashMap<u32, (u8, Vec<u8>)>,
     h2_streams: HashMap<u32, H2StreamState>,
     /// Queued HTTP/1.1 requests awaiting responses on this keep-alive connection.
     h1_pending: VecDeque<H1PendingRequest>,
@@ -159,12 +201,16 @@ pub struct HttpConnectionCorrelator {
     h1_client_body: H1ClientBody,
     /// Client bytes after a WebSocket upgrade request are held until the server answers.
     h1_client_paused: bool,
+    h1_response_chunks: Option<H1ResponseChunks>,
     h1_current_seq: u64,
     next_seq_base: u64,
     ws: Option<WebSocketSession>,
     inflight: InflightCounter,
     on_response: ResponseCallback,
     on_websocket: Option<WebSocketCallback>,
+    /// Number of request-body decodes performed (work bound checked by tests).
+    #[cfg(test)]
+    request_body_decodes: usize,
 }
 
 impl std::fmt::Debug for HttpConnectionCorrelator {
@@ -214,12 +260,15 @@ impl HttpConnectionCorrelator {
             h1_next_request_id: 0,
             h1_client_body: H1ClientBody::None,
             h1_client_paused: false,
+            h1_response_chunks: None,
             h1_current_seq: seq_base,
             next_seq_base: seq_base,
             ws: None,
             inflight,
             on_response,
             on_websocket: None,
+            #[cfg(test)]
+            request_body_decodes: 0,
         }
     }
 
@@ -307,13 +356,15 @@ impl HttpConnectionCorrelator {
             client: WebSocketStream::new(url.clone(), WebSocketDirection::Sent, deflate),
             server: WebSocketStream::new(url, WebSocketDirection::Received, deflate),
         });
-        let s2c = std::mem::take(&mut self.s2c_buf);
+        // Held client bytes were observed before the 101 completed, so they go first;
+        // this keeps cross-direction order independent of how reads were split.
         let c2s = std::mem::take(&mut self.c2s_buf);
-        if !s2c.is_empty() {
-            self.feed_websocket(WebSocketDirection::Received, &s2c);
-        }
+        let s2c = std::mem::take(&mut self.s2c_buf);
         if !c2s.is_empty() {
             self.feed_websocket(WebSocketDirection::Sent, &c2s);
+        }
+        if !s2c.is_empty() {
+            self.feed_websocket(WebSocketDirection::Received, &s2c);
         }
     }
 
@@ -338,9 +389,73 @@ impl HttpConnectionCorrelator {
         }
     }
 
+    // ---------------------------------------------------------------- HTTP/2
+
+    /// Ensures a state entry exists for `stream_id`, evicting the lowest stream ID when
+    /// [`MAX_TRACKED_H2_STREAMS`] are already tracked.
+    fn ensure_h2_stream(&mut self, stream_id: u32) {
+        if self.h2_streams.contains_key(&stream_id) {
+            return;
+        }
+        if self.h2_streams.len() >= MAX_TRACKED_H2_STREAMS
+            && let Some(&oldest) = self.h2_streams.keys().min()
+        {
+            self.remove_h2_stream(oldest);
+        }
+        let seq = self.alloc_seq();
+        let _ = self.h2_streams.insert(
+            stream_id,
+            H2StreamState {
+                seq,
+                ..H2StreamState::default()
+            },
+        );
+    }
+
+    fn remove_h2_stream(&mut self, stream_id: u32) {
+        if let Some(st) = self.h2_streams.remove(&stream_id)
+            && st.inflight
+        {
+            self.inflight.dec();
+        }
+        let _ = self.c2s_pending_headers.remove(&stream_id);
+        let _ = self.s2c_pending_headers.remove(&stream_id);
+    }
+
+    /// Frees a stream's state once both directions have ended (after its final emit).
+    fn finish_h2_stream_if_done(&mut self, stream_id: u32) {
+        if self
+            .h2_streams
+            .get(&stream_id)
+            .is_some_and(|st| st.client_ended && st.server_ended)
+        {
+            self.remove_h2_stream(stream_id);
+        }
+    }
+
+    /// Handles `GOAWAY`: streams above the last processed ID will never complete.
+    fn apply_h2_goaway(&mut self, payload: &[u8]) {
+        let Some(bytes) = payload.get(..4) else {
+            return;
+        };
+        let last = u32::from_be_bytes([bytes[0] & 0x7F, bytes[1], bytes[2], bytes[3]]);
+        let dead: Vec<u32> = self
+            .h2_streams
+            .keys()
+            .copied()
+            .filter(|&id| id > last)
+            .collect();
+        for id in dead {
+            self.remove_h2_stream(id);
+        }
+    }
+
     fn drain_h2_client(&mut self) {
         while let Some((ftype, flags, stream_id, payload)) = pop_h2_frame(&mut self.c2s_buf) {
             if stream_id == 0 {
+                if ftype == H2_FRAME_GOAWAY {
+                    self.apply_h2_goaway(&payload);
+                }
                 continue;
             }
             match ftype {
@@ -349,51 +464,54 @@ impl HttpConnectionCorrelator {
                         continue;
                     };
                     if (flags & H2_FLAG_END_HEADERS) != 0 {
-                        self.apply_h2_client_headers(stream_id, frag);
+                        self.apply_h2_client_headers(stream_id, frag, flags);
                     } else {
-                        let _ = self.c2s_pending_headers.insert(stream_id, frag.to_vec());
+                        let _ = self
+                            .c2s_pending_headers
+                            .insert(stream_id, (flags, frag.to_vec()));
                     }
                 }
                 H2_FRAME_CONTINUATION => {
-                    let Some(mut acc) = self.c2s_pending_headers.remove(&stream_id) else {
+                    let Some((first_flags, block)) = take_continued_block(
+                        &mut self.c2s_pending_headers,
+                        stream_id,
+                        flags,
+                        &payload,
+                    ) else {
                         continue;
                     };
-                    acc.extend_from_slice(&payload);
-                    if (flags & H2_FLAG_END_HEADERS) != 0 {
-                        self.apply_h2_client_headers(stream_id, &acc);
-                    } else {
-                        let _ = self.c2s_pending_headers.insert(stream_id, acc);
-                    }
+                    self.apply_h2_client_headers(stream_id, &block, first_flags);
                 }
-                H2_FRAME_DATA => {
-                    let data = strip_h2_padding(flags, &payload);
-                    let response_seen = self.h2_streams.get_mut(&stream_id).is_some_and(|st| {
-                        append_capped(&mut st.request_body, data, MAX_REQUEST_BODY_BYTES);
-                        st.status.is_some()
-                    });
-                    // Request bodies normally finish before the response starts; if not,
-                    // re-emit so the stored response picks up the rest of the body.
-                    if response_seen && !data.is_empty() {
-                        self.emit_h2_stream(stream_id);
-                    }
-                }
-                H2_FRAME_RST_STREAM => {
-                    if let Some(st) = self.h2_streams.get_mut(&stream_id)
-                        && st.inflight
-                    {
-                        st.inflight = false;
-                        self.inflight.dec();
-                    }
-                }
+                H2_FRAME_DATA => self.apply_h2_client_data(stream_id, flags, &payload),
+                H2_FRAME_RST_STREAM => self.remove_h2_stream(stream_id),
                 _ => {}
             }
         }
     }
 
-    fn apply_h2_client_headers(&mut self, stream_id: u32, block: &[u8]) {
+    fn apply_h2_client_data(&mut self, stream_id: u32, flags: u8, payload: &[u8]) {
+        let data = strip_h2_padding(flags, payload);
+        let response_seen = self.h2_streams.get_mut(&stream_id).is_some_and(|st| {
+            if !data.is_empty() && st.request_body.len() < MAX_REQUEST_BODY_BYTES {
+                append_capped(&mut st.request_body, data, MAX_REQUEST_BODY_BYTES);
+                st.request_dirty = true;
+            }
+            st.client_ended |= (flags & H2_FLAG_END_STREAM) != 0;
+            st.status.is_some() && st.request_dirty && st.client_ended
+        });
+        // Request bodies normally finish before the response starts; if not, re-emit once
+        // the request ends so the stored response picks up the full body (decoded once).
+        if response_seen {
+            self.emit_h2_stream(stream_id);
+        }
+        self.finish_h2_stream_if_done(stream_id);
+    }
+
+    fn apply_h2_client_headers(&mut self, stream_id: u32, block: &[u8], flags: u8) {
         let Ok(decoded) = self.c2s_hpack.decode(block) else {
             return;
         };
+        let end_stream = (flags & H2_FLAG_END_STREAM) != 0;
         let mut authority = String::new();
         let mut path = String::new();
         let mut method = None;
@@ -422,25 +540,27 @@ impl HttpConnectionCorrelator {
         if method.is_none() && path.is_empty() {
             // A header block without request pseudo-headers is a trailer section; the
             // request line was already applied by the initial HEADERS frame.
+            if let Some(st) = self.h2_streams.get_mut(&stream_id) {
+                st.client_ended |= end_stream;
+            }
+            self.finish_h2_stream_if_done(stream_id);
             return;
         }
         if authority.is_empty() {
             authority.clone_from(&self.host_fallback);
         }
         let url = build_https_url(&authority, &path);
-        let seq = self.alloc_seq();
-        let st = self
-            .h2_streams
-            .entry(stream_id)
-            .or_insert_with(|| H2StreamState {
-                seq,
-                ..H2StreamState::default()
-            });
+        self.ensure_h2_stream(stream_id);
+        let Some(st) = self.h2_streams.get_mut(&stream_id) else {
+            return;
+        };
         st.url = Some(url);
         st.request_method = method;
         st.request_headers = headers;
         st.request_content_encoding = content_encoding;
-        if !st.inflight {
+        st.request_dirty = true;
+        st.client_ended |= end_stream;
+        if !st.inflight && !st.server_ended {
             st.inflight = true;
             self.inflight.inc();
         }
@@ -449,6 +569,9 @@ impl HttpConnectionCorrelator {
     fn drain_h2_server(&mut self) {
         while let Some((ftype, flags, stream_id, payload)) = pop_h2_frame(&mut self.s2c_buf) {
             if stream_id == 0 {
+                if ftype == H2_FRAME_GOAWAY {
+                    self.apply_h2_goaway(&payload);
+                }
                 continue;
             }
             match ftype {
@@ -456,55 +579,43 @@ impl HttpConnectionCorrelator {
                     let Some(frag) = strip_h2_headers_payload(flags, &payload) else {
                         continue;
                     };
-                    let end_stream = (flags & H2_FLAG_END_STREAM) != 0;
                     if (flags & H2_FLAG_END_HEADERS) != 0 {
-                        self.apply_h2_server_headers(stream_id, frag, end_stream);
+                        self.apply_h2_server_headers(stream_id, frag, flags);
                     } else {
-                        let _ = self.s2c_pending_headers.insert(stream_id, frag.to_vec());
+                        let _ = self
+                            .s2c_pending_headers
+                            .insert(stream_id, (flags, frag.to_vec()));
                     }
                 }
                 H2_FRAME_CONTINUATION => {
-                    let Some(mut acc) = self.s2c_pending_headers.remove(&stream_id) else {
+                    let Some((first_flags, block)) = take_continued_block(
+                        &mut self.s2c_pending_headers,
+                        stream_id,
+                        flags,
+                        &payload,
+                    ) else {
                         continue;
                     };
-                    acc.extend_from_slice(&payload);
-                    if (flags & H2_FLAG_END_HEADERS) != 0 {
-                        self.apply_h2_server_headers(stream_id, &acc, false);
-                    } else {
-                        let _ = self.s2c_pending_headers.insert(stream_id, acc);
-                    }
+                    self.apply_h2_server_headers(stream_id, &block, first_flags);
                 }
                 H2_FRAME_DATA => {
-                    let end_stream = (flags & H2_FLAG_END_STREAM) != 0;
                     let data = strip_h2_padding(flags, &payload);
-                    self.apply_h2_server_data(stream_id, data, end_stream);
+                    self.apply_h2_server_data(stream_id, data, flags);
                 }
-                H2_FRAME_RST_STREAM => {
-                    if let Some(st) = self.h2_streams.get_mut(&stream_id)
-                        && st.inflight
-                    {
-                        st.inflight = false;
-                        self.inflight.dec();
-                    }
-                }
+                H2_FRAME_RST_STREAM => self.remove_h2_stream(stream_id),
                 _ => {}
             }
         }
     }
 
-    fn apply_h2_server_headers(&mut self, stream_id: u32, block: &[u8], end_stream: bool) {
+    fn apply_h2_server_headers(&mut self, stream_id: u32, block: &[u8], flags: u8) {
+        // Always decode so the HPACK dynamic table stays in sync, even for blocks we drop.
         let Ok(decoded) = self.s2c_hpack.decode(block) else {
             return;
         };
-        let seq = self.alloc_seq();
-        let st = self
-            .h2_streams
-            .entry(stream_id)
-            .or_insert_with(|| H2StreamState {
-                seq,
-                ..H2StreamState::default()
-            });
         let mut status = None;
+        let mut content_type = None;
+        let mut content_encoding = None;
         let mut headers = Vec::new();
         for (name, value) in decoded {
             let n = String::from_utf8_lossy(&name).to_ascii_lowercase();
@@ -512,16 +623,23 @@ impl HttpConnectionCorrelator {
             match n.as_str() {
                 ":status" => status = v.parse::<u16>().ok(),
                 _ if n.starts_with(':') => {}
-                "content-type" => st.content_type = Some(v.clone()),
-                "content-encoding" => st.content_encoding = Some(v.clone()),
+                "content-type" => content_type = Some(v.clone()),
+                "content-encoding" => content_encoding = Some(v.clone()),
                 _ => {}
             }
             if !n.starts_with(':') {
                 push_header(&mut headers, HttpHeader::new(n, v));
             }
         }
+        if status.is_some_and(|code| (100..200).contains(&code)) {
+            // Interim response (e.g. `103 Early Hints`); the final header block follows.
+            return;
+        }
+        self.ensure_h2_stream(stream_id);
+        let Some(st) = self.h2_streams.get_mut(&stream_id) else {
+            return;
+        };
         if let Some(code) = status {
-            // A new response header block (an interim 1xx is replaced by the final one).
             st.status = Some(code);
             st.headers = headers;
         } else {
@@ -530,26 +648,37 @@ impl HttpConnectionCorrelator {
                 push_header(&mut st.headers, header);
             }
         }
-        if end_stream && st.inflight {
-            st.inflight = false;
-            self.inflight.dec();
+        st.headers_dirty = true;
+        if content_type.is_some() {
+            st.content_type = content_type;
         }
-        self.emit_h2_stream(stream_id);
-    }
-
-    fn apply_h2_server_data(&mut self, stream_id: u32, data: &[u8], end_stream: bool) {
-        if let Some(st) = self.h2_streams.get_mut(&stream_id) {
-            let remaining = MAX_BODY_BYTES.saturating_sub(st.body.len());
-            if remaining > 0 && !data.is_empty() {
-                let take = remaining.min(data.len());
-                st.body.extend_from_slice(&data[..take]);
-            }
-            if end_stream && st.inflight {
+        if content_encoding.is_some() {
+            st.content_encoding = content_encoding;
+        }
+        if (flags & H2_FLAG_END_STREAM) != 0 {
+            st.server_ended = true;
+            if st.inflight {
                 st.inflight = false;
                 self.inflight.dec();
             }
         }
         self.emit_h2_stream(stream_id);
+        self.finish_h2_stream_if_done(stream_id);
+    }
+
+    fn apply_h2_server_data(&mut self, stream_id: u32, data: &[u8], flags: u8) {
+        if let Some(st) = self.h2_streams.get_mut(&stream_id) {
+            append_capped(&mut st.body, data, MAX_BODY_BYTES);
+            if (flags & H2_FLAG_END_STREAM) != 0 {
+                st.server_ended = true;
+                if st.inflight {
+                    st.inflight = false;
+                    self.inflight.dec();
+                }
+            }
+        }
+        self.emit_h2_stream(stream_id);
+        self.finish_h2_stream_if_done(stream_id);
     }
 
     fn emit_h2_stream(&mut self, stream_id: u32) {
@@ -559,62 +688,82 @@ impl HttpConnectionCorrelator {
         let (Some(url), Some(status)) = (&st.url, st.status) else {
             return;
         };
-        let body = decode_body_bytes(&st.body, st.content_encoding.as_deref());
-        let resp = CapturedResponse {
+        let mut resp = CapturedResponse {
             url: url.clone(),
             status,
             content_type: st.content_type.clone(),
-            body,
-            headers: st.headers.clone(),
-            request_method: st.request_method.clone(),
-            request_headers: st.request_headers.clone(),
-            request_body: decode_body_bytes(
-                &st.request_body,
-                st.request_content_encoding.as_deref(),
-            ),
+            body: decode_body_bytes(&st.body, st.content_encoding.as_deref()),
+            ..CapturedResponse::default()
         };
+        if st.headers_dirty {
+            resp.headers.clone_from(&st.headers);
+            st.headers_dirty = false;
+        }
+        if st.request_dirty {
+            resp.request_method.clone_from(&st.request_method);
+            resp.request_headers.clone_from(&st.request_headers);
+            resp.request_body =
+                decode_request_body(&st.request_body, st.request_content_encoding.as_deref());
+            st.request_dirty = false;
+            #[cfg(test)]
+            {
+                self.request_body_decodes += 1;
+            }
+        }
         let seq = st.seq;
-        st.emitted = true;
         (self.on_response)(seq, resp);
+    }
+
+    // ---------------------------------------------------------------- HTTP/1.1
+
+    /// Consumes bytes of the request body currently being sent. Returns `false` when more
+    /// input is needed before anything else can be parsed.
+    fn drain_h1_client_body(&mut self) -> bool {
+        match std::mem::replace(&mut self.h1_client_body, H1ClientBody::None) {
+            H1ClientBody::None => true,
+            H1ClientBody::Length {
+                id,
+                remaining,
+                seen,
+            } => {
+                let take = remaining.min(self.c2s_buf.len());
+                if take > 0
+                    && let Some(req) = self.h1_pending.iter_mut().find(|r| r.id == id)
+                {
+                    append_capped(&mut req.body, &self.c2s_buf[..take], MAX_REQUEST_BODY_BYTES);
+                }
+                let _ = self.c2s_buf.drain(..take);
+                if remaining > take {
+                    self.h1_client_body = H1ClientBody::Length {
+                        id,
+                        remaining: remaining - take,
+                        seen: seen || take > 0,
+                    };
+                    return false;
+                }
+                true
+            }
+            H1ClientBody::Chunked { id, mut decoder } => {
+                let mut discard = Vec::new();
+                let out = match self.h1_pending.iter_mut().find(|r| r.id == id) {
+                    Some(req) => &mut req.body,
+                    None => &mut discard,
+                };
+                let (used, status) = decoder.feed(&self.c2s_buf, out, MAX_REQUEST_BODY_BYTES);
+                let _ = self.c2s_buf.drain(..used);
+                if status == ChunkStatus::NeedMore {
+                    self.h1_client_body = H1ClientBody::Chunked { id, decoder };
+                    return false;
+                }
+                // Done, or malformed framing: resume request-head parsing either way.
+                true
+            }
+        }
     }
 
     fn drain_h1_client(&mut self) {
         loop {
-            match self.h1_client_body {
-                H1ClientBody::Length { id, remaining } => {
-                    if self.c2s_buf.is_empty() {
-                        return;
-                    }
-                    let take = remaining.min(self.c2s_buf.len());
-                    if let Some(req) = self.h1_pending.iter_mut().find(|r| r.id == id) {
-                        append_capped(&mut req.body, &self.c2s_buf[..take], MAX_REQUEST_BODY_BYTES);
-                    }
-                    let _ = self.c2s_buf.drain(..take);
-                    let left = remaining - take;
-                    self.h1_client_body = if left == 0 {
-                        H1ClientBody::None
-                    } else {
-                        H1ClientBody::Length {
-                            id,
-                            remaining: left,
-                        }
-                    };
-                    continue;
-                }
-                H1ClientBody::Chunked { id } => {
-                    let Some((decoded, consumed)) = decode_chunked(&self.c2s_buf) else {
-                        return;
-                    };
-                    if let Some(req) = self.h1_pending.iter_mut().find(|r| r.id == id) {
-                        append_capped(&mut req.body, &decoded, MAX_REQUEST_BODY_BYTES);
-                    }
-                    let _ = self.c2s_buf.drain(..consumed);
-                    self.h1_client_body = H1ClientBody::None;
-                    continue;
-                }
-                H1ClientBody::None => {}
-            }
-            if self.h1_client_paused {
+            if !self.drain_h1_client_body() || self.h1_client_paused {
                 return;
             }
             let Some(end) = find_double_crlf(&self.c2s_buf) else {
@@ -629,115 +778,132 @@ impl HttpConnectionCorrelator {
             let mut parts = req_line.split_whitespace();
             let method = parts.next().unwrap_or("GET").to_owned();
             let path = parts.next().unwrap_or("/");
-            let mut host = self.host_fallback.clone();
-            let mut headers = Vec::new();
-            let mut content_length: Option<usize> = None;
-            let mut chunked = false;
-            let mut content_encoding = None;
-            let mut websocket = false;
-            for line in lines {
-                let Some((k, v)) = line.split_once(':') else {
-                    continue;
-                };
-                let (key, val) = (k.trim(), v.trim());
-                match key.to_ascii_lowercase().as_str() {
-                    "host" => val.clone_into(&mut host),
-                    "content-length" => content_length = val.parse::<usize>().ok(),
-                    "transfer-encoding" if val.to_ascii_lowercase().contains("chunked") => {
-                        chunked = true;
-                    }
-                    "content-encoding" => content_encoding = Some(val.to_owned()),
-                    "upgrade" if val.to_ascii_lowercase().contains("websocket") => {
-                        websocket = true;
-                    }
-                    _ => {}
-                }
-                push_header(&mut headers, HttpHeader::new(key, val));
-            }
+            let head = parse_h1_head(lines);
+            let host = head
+                .headers
+                .iter()
+                .rev()
+                .find(|h| h.name.eq_ignore_ascii_case("host"))
+                .map_or_else(|| self.host_fallback.clone(), |h| h.value.clone());
             let id = self.h1_next_request_id;
             self.h1_next_request_id = self.h1_next_request_id.wrapping_add(1);
+            if self.h1_pending.len() >= MAX_PENDING_H1_REQUESTS
+                && self.h1_pending.pop_front().is_some()
+            {
+                self.inflight.dec();
+            }
             self.h1_pending.push_back(H1PendingRequest {
                 id,
                 url: build_https_url(&host, path),
                 method,
-                headers,
-                content_encoding,
+                headers: head.headers,
+                content_encoding: head.content_encoding,
                 body: Vec::new(),
-                websocket,
+                websocket: head.websocket,
+                expect_continue: head.expect_continue,
             });
             self.inflight.inc();
-            if chunked {
-                self.h1_client_body = H1ClientBody::Chunked { id };
-            } else if let Some(len) = content_length.filter(|&n| n > 0) {
-                self.h1_client_body = H1ClientBody::Length { id, remaining: len };
+            if head.chunked {
+                self.h1_client_body = H1ClientBody::Chunked {
+                    id,
+                    decoder: ChunkedDecoder::new(),
+                };
+            } else if let Some(len) = head.content_length.filter(|&n| n > 0) {
+                self.h1_client_body = H1ClientBody::Length {
+                    id,
+                    remaining: len,
+                    seen: false,
+                };
             }
-            if websocket {
+            if head.websocket {
                 // Whatever follows is WebSocket framing if the server accepts the upgrade.
                 self.h1_client_paused = true;
             }
         }
     }
 
+    /// Locates the body of the response whose head ends at `body_start`. Returns the raw
+    /// body and the total bytes (head included) it occupies, or `None` if incomplete.
+    fn h1_response_body(
+        &mut self,
+        head: &H1Head,
+        status: u16,
+        body_start: usize,
+    ) -> Option<(Vec<u8>, usize)> {
+        let head_request = self
+            .h1_pending
+            .front()
+            .is_some_and(|r| r.method.eq_ignore_ascii_case("HEAD"));
+        if head_request || matches!(status, 101 | 204 | 304) {
+            return Some((Vec::new(), body_start));
+        }
+        // RFC 9112 section 6.3: chunked framing wins over a conflicting Content-Length.
+        if head.chunked {
+            let mut chunks = self.h1_response_chunks.take().unwrap_or_default();
+            let input = self
+                .s2c_buf
+                .get(body_start + chunks.consumed..)
+                .unwrap_or(&[]);
+            let (used, state) = chunks.decoder.feed(input, &mut chunks.body, MAX_BODY_BYTES);
+            chunks.consumed += used;
+            if state == ChunkStatus::NeedMore {
+                self.h1_response_chunks = Some(chunks);
+                return None;
+            }
+            return Some((chunks.body, body_start + chunks.consumed));
+        }
+        if let Some(cl) = head.content_length {
+            if self.s2c_buf.len() < body_start + cl {
+                return None;
+            }
+            return Some((
+                self.s2c_buf[body_start..body_start + cl].to_vec(),
+                body_start + cl,
+            ));
+        }
+        Some((Vec::new(), body_start))
+    }
+
     fn drain_h1_server(&mut self) {
         let mut resume_client = false;
         while let Some(end) = find_double_crlf(&self.s2c_buf) {
-            let head = String::from_utf8_lossy(&self.s2c_buf[..end]).into_owned();
-            let mut lines = head.lines();
-            let Some(status_line) = lines.next() else {
-                let _ = self.s2c_buf.drain(..end + 4);
-                continue;
-            };
-            let Some(status) = status_line
-                .split_whitespace()
-                .nth(1)
+            let head_text = String::from_utf8_lossy(&self.s2c_buf[..end]).into_owned();
+            let mut lines = head_text.lines();
+            let body_start = end + 4;
+            let Some(status) = lines
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
                 .and_then(|s| s.parse::<u16>().ok())
             else {
-                let _ = self.s2c_buf.drain(..end + 4);
+                let _ = self.s2c_buf.drain(..body_start);
                 continue;
             };
-            let body_start = end + 4;
             if (100..200).contains(&status) && status != 101 {
                 // Interim response (e.g. `100 Continue`); the final response follows.
                 let _ = self.s2c_buf.drain(..body_start);
                 continue;
             }
-
-            let H1ResponseHead {
-                headers,
-                content_type,
-                content_encoding,
-                content_length,
-                chunked,
-            } = parse_h1_response_head(lines);
-
-            let head_request = self
-                .h1_pending
-                .front()
-                .is_some_and(|r| r.method.eq_ignore_ascii_case("HEAD"));
-            let (raw_body, consumed) = if head_request || matches!(status, 101 | 204 | 304) {
-                (Vec::new(), body_start)
-            } else if let Some(cl) = content_length {
-                if self.s2c_buf.len() < body_start + cl {
-                    break;
-                }
-                (
-                    self.s2c_buf[body_start..body_start + cl].to_vec(),
-                    body_start + cl,
-                )
-            } else if chunked {
-                let Some((decoded, chunk_consumed)) = decode_chunked(&self.s2c_buf[body_start..])
-                else {
-                    break;
-                };
-                (decoded, body_start + chunk_consumed)
-            } else {
-                (Vec::new(), body_start)
+            let head = parse_h1_head(lines);
+            let Some((raw_body, consumed)) = self.h1_response_body(&head, status, body_start)
+            else {
+                break;
             };
+            let _ = self.s2c_buf.drain(..consumed.min(self.s2c_buf.len()));
 
-            let _ = self.s2c_buf.drain(..consumed);
             let request = self.h1_pending.pop_front();
-            if request.is_some() {
+            if let Some(req) = &request {
                 self.inflight.dec();
+                // A final status answering `Expect: 100-continue` before any body byte was
+                // sent means the client will not send that body.
+                if req.expect_continue
+                    && let H1ClientBody::Length {
+                        id, seen: false, ..
+                    } = self.h1_client_body
+                    && id == req.id
+                {
+                    self.h1_client_body = H1ClientBody::None;
+                    resume_client = true;
+                }
             }
             let was_ws_request = request.as_ref().is_some_and(|r| r.websocket);
             let upgrade = was_ws_request && status == 101;
@@ -748,9 +914,9 @@ impl HttpConnectionCorrelator {
             let mut resp = CapturedResponse {
                 url: format!("https://{}/", self.host_fallback),
                 status,
-                content_type,
-                body: decode_body_bytes(&raw_body, content_encoding.as_deref()),
-                headers,
+                content_type: head.content_type,
+                body: decode_body_bytes(&raw_body, head.content_encoding.as_deref()),
+                headers: head.headers,
                 ..CapturedResponse::default()
             };
             if let Some(req) = request {
@@ -778,35 +944,61 @@ impl HttpConnectionCorrelator {
     }
 }
 
-/// Header fields of an HTTP/1.1 response that drive body framing and decoding.
-struct H1ResponseHead {
+/// Removes the pending header block for `stream_id`, appends a `CONTINUATION` fragment,
+/// and returns `(initial HEADERS flags, block)` once `END_HEADERS` is set.
+fn take_continued_block(
+    pending: &mut HashMap<u32, (u8, Vec<u8>)>,
+    stream_id: u32,
+    flags: u8,
+    fragment: &[u8],
+) -> Option<(u8, Vec<u8>)> {
+    let (first_flags, mut block) = pending.remove(&stream_id)?;
+    if block.len() + fragment.len() > MAX_HEADER_BLOCK_BYTES {
+        return None;
+    }
+    block.extend_from_slice(fragment);
+    if (flags & H2_FLAG_END_HEADERS) != 0 {
+        Some((first_flags, block))
+    } else {
+        let _ = pending.insert(stream_id, (first_flags, block));
+        None
+    }
+}
+
+/// Header fields of an HTTP/1.1 request or response that drive framing and decoding.
+struct H1Head {
     headers: Vec<HttpHeader>,
     content_type: Option<String>,
     content_encoding: Option<String>,
     content_length: Option<usize>,
     chunked: bool,
+    websocket: bool,
+    expect_continue: bool,
 }
 
-fn parse_h1_response_head<'a>(lines: impl Iterator<Item = &'a str>) -> H1ResponseHead {
-    let mut head = H1ResponseHead {
+fn parse_h1_head<'a>(lines: impl Iterator<Item = &'a str>) -> H1Head {
+    let mut head = H1Head {
         headers: Vec::new(),
         content_type: None,
         content_encoding: None,
         content_length: None,
         chunked: false,
+        websocket: false,
+        expect_continue: false,
     };
     for line in lines {
         let Some((k, v)) = line.split_once(':') else {
             continue;
         };
         let (key, val) = (k.trim(), v.trim());
+        let lower = val.to_ascii_lowercase();
         match key.to_ascii_lowercase().as_str() {
             "content-type" => head.content_type = Some(val.to_owned()),
             "content-encoding" => head.content_encoding = Some(val.to_owned()),
             "content-length" => head.content_length = val.parse::<usize>().ok(),
-            "transfer-encoding" if val.to_ascii_lowercase().contains("chunked") => {
-                head.chunked = true;
-            }
+            "transfer-encoding" if lower.contains("chunked") => head.chunked = true,
+            "upgrade" if lower.contains("websocket") => head.websocket = true,
+            "expect" if lower.contains("100-continue") => head.expect_continue = true,
             _ => {}
         }
         push_header(&mut head.headers, HttpHeader::new(key, val));
@@ -820,9 +1012,14 @@ fn append_capped(buf: &mut Vec<u8>, data: &[u8], cap: usize) {
     buf.extend_from_slice(&data[..room.min(data.len())]);
 }
 
-/// Pushes `header` unless the list already holds [`MAX_HEADERS_PER_MESSAGE`] fields.
+/// Pushes `header` unless the list already holds [`MAX_HEADERS_PER_MESSAGE`] fields or
+/// adding it would exceed [`MAX_HEADER_BYTES_PER_MESSAGE`].
 fn push_header(headers: &mut Vec<HttpHeader>, header: HttpHeader) {
-    if headers.len() < MAX_HEADERS_PER_MESSAGE {
+    if headers.len() >= MAX_HEADERS_PER_MESSAGE {
+        return;
+    }
+    let used: usize = headers.iter().map(|h| h.name.len() + h.value.len()).sum();
+    if used + header.name.len() + header.value.len() <= MAX_HEADER_BYTES_PER_MESSAGE {
         headers.push(header);
     }
 }
@@ -870,36 +1067,6 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn decode_chunked(mut data: &[u8]) -> Option<(Vec<u8>, usize)> {
-    let total = data.len();
-    let mut out = Vec::new();
-    loop {
-        let crlf = data.windows(2).position(|w| w == b"\r\n")?;
-        let size_str = std::str::from_utf8(&data[..crlf])
-            .ok()?
-            .split(';')
-            .next()?
-            .trim();
-        let size = usize::from_str_radix(size_str, 16).ok()?;
-        data = &data[crlf + 2..];
-        if size == 0 {
-            if data.len() < 2 {
-                return None;
-            }
-            data = &data[2..];
-            return Some((out, total - data.len()));
-        }
-        if data.len() < size + 2 {
-            return None;
-        }
-        if out.len() < MAX_BODY_BYTES {
-            let take = size.min(MAX_BODY_BYTES - out.len());
-            out.extend_from_slice(&data[..take]);
-        }
-        data = &data[size + 2..];
-    }
-}
-
 fn build_https_url(authority: &str, path: &str) -> String {
     if path.starts_with("http://") || path.starts_with("https://") || authority.is_empty() {
         path.to_owned()
@@ -908,6 +1075,56 @@ fn build_https_url(authority: &str, path: &str) -> String {
     } else {
         format!("https://{authority}/{path}")
     }
+}
+
+/// Decodes a captured request body with [`MAX_REQUEST_BODY_BYTES`] as the decoded cap.
+fn decode_request_body(raw: &[u8], encoding: Option<&str>) -> Option<String> {
+    decode_body_bytes_limited(raw, encoding, MAX_REQUEST_BODY_BYTES)
+}
+
+/// Like [`decode_body_bytes`], but never produces (or, for `gzip`/`deflate`/`br`, never
+/// inflates) more than `limit` bytes. The result is cut on a UTF-8 character boundary.
+#[must_use]
+pub fn decode_body_bytes_limited(
+    raw: &[u8],
+    encoding: Option<&str>,
+    limit: usize,
+) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    let limit64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    let enc = encoding.map(|e| e.trim().to_ascii_lowercase());
+    let inflated = match enc.as_deref() {
+        None | Some("" | "identity") => None,
+        Some("gzip" | "x-gzip") => Some(read_limited(GzDecoder::new(raw), limit64)),
+        Some("deflate") => Some(read_limited(ZlibDecoder::new(raw), limit64)),
+        Some("br") => Some(read_limited(brotli::Decompressor::new(raw, 4096), limit64)),
+        // Other codings are only understood by `decode_body_bytes`; cap its output.
+        Some(_) => return decode_body_bytes(raw, encoding).map(|s| truncate_utf8(s, limit)),
+    };
+    let bytes = match inflated {
+        Some(out) if !out.is_empty() => out,
+        _ => raw[..limit.min(raw.len())].to_vec(),
+    };
+    decode_body_bytes(&bytes, None).map(|s| truncate_utf8(s, limit))
+}
+
+fn read_limited(reader: impl Read, limit: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    let _ = reader.take(limit).read_to_end(&mut out);
+    out
+}
+
+fn truncate_utf8(mut text: String, limit: usize) -> String {
+    if text.len() > limit {
+        let mut cut = limit;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    text
 }
 
 /// Decodes raw response bytes into UTF-8 text, transparently decompressing
@@ -957,6 +1174,7 @@ pub fn decode_body_bytes(raw: &[u8], encoding: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     use super::*;
 
@@ -1082,13 +1300,19 @@ mod tests {
         let captured: Captured = Arc::new(Mutex::new(Vec::new()));
         let frames: CapturedFrames = Arc::new(Mutex::new(Vec::new()));
         let (cap, fr) = (Arc::clone(&captured), Arc::clone(&frames));
+        let seqs: Mutex<Vec<u64>> = Mutex::new(Vec::new());
         let corr = HttpConnectionCorrelator::new(
             host.to_owned(),
             1,
             InflightCounter::default(),
-            Arc::new(move |_, resp| {
-                if let Ok(mut g) = cap.lock() {
-                    g.push(resp);
+            Arc::new(move |seq, resp| {
+                if let (Ok(mut g), Ok(mut seen)) = (cap.lock(), seqs.lock()) {
+                    if let Some(i) = seen.iter().position(|&x| x == seq) {
+                        merge_update(&mut g[i], resp);
+                    } else {
+                        seen.push(seq);
+                        g.push(resp);
+                    }
                 }
             }),
         )
@@ -1098,6 +1322,29 @@ mod tests {
             }
         }));
         (corr, captured, frames)
+    }
+
+    /// Merges a later emit for the same sequence ID, as `ResponseStore::upsert` does.
+    fn merge_update(existing: &mut CapturedResponse, update: CapturedResponse) {
+        existing.status = update.status;
+        if update.body.is_some() {
+            existing.body = update.body;
+        }
+        if existing.content_type.is_none() {
+            existing.content_type = update.content_type;
+        }
+        if !update.headers.is_empty() {
+            existing.headers = update.headers;
+        }
+        if update.request_method.is_some() {
+            existing.request_method = update.request_method;
+        }
+        if !update.request_headers.is_empty() {
+            existing.request_headers = update.request_headers;
+        }
+        if update.request_body.is_some() {
+            existing.request_body = update.request_body;
+        }
     }
 
     fn snapshot<T: Clone>(items: &Arc<Mutex<Vec<T>>>) -> Vec<T> {
@@ -1303,10 +1550,11 @@ mod tests {
             got.iter()
                 .all(|f| f.url == "wss://chat.example.com/socket?v=2")
         );
-        assert_eq!(got[0].direction, WebSocketDirection::Received);
-        assert_eq!(got[0].payload.as_deref(), Some("hey"));
-        assert_eq!(got[1].direction, WebSocketDirection::Sent);
-        assert_eq!(got[1].payload.as_deref(), Some("hello"));
+        // The client frame held before the 101 is delivered before the server's frame.
+        assert_eq!(got[0].direction, WebSocketDirection::Sent);
+        assert_eq!(got[0].payload.as_deref(), Some("hello"));
+        assert_eq!(got[1].direction, WebSocketDirection::Received);
+        assert_eq!(got[1].payload.as_deref(), Some("hey"));
         assert_eq!(got[2].opcode, waybound_core::WebSocketOpcode::Close);
         assert_eq!(got[2].close_code, Some(1000));
     }
@@ -1355,6 +1603,443 @@ mod tests {
         assert_eq!(list[0].status, 403);
         assert_eq!(list[1].url, "https://chat.example.com/fallback");
         assert_eq!(list[1].body.as_deref(), Some("ok"));
-        assert!(snapshot(&frames).is_empty());
+        assert_eq!(snapshot(&frames), Vec::new());
+    }
+
+    fn h2_request_block(enc: &mut fluke_hpack::Encoder<'_>, method: &str, path: &str) -> Vec<u8> {
+        enc.encode([
+            (&b":method"[..], method.as_bytes()),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"h2.example.com"[..]),
+            (&b":path"[..], path.as_bytes()),
+        ])
+    }
+
+    fn h2_preface_with(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = H2_PREFACE.to_vec();
+        for f in frames {
+            out.extend_from_slice(f);
+        }
+        out
+    }
+
+    #[test]
+    fn http2_request_body_is_decoded_once_across_many_response_frames() {
+        let emits_with_request: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&emits_with_request);
+        let mut corr = HttpConnectionCorrelator::new(
+            "h2.example.com".to_owned(),
+            1,
+            InflightCounter::default(),
+            Arc::new(move |_, resp| {
+                if resp.request_body.is_some() || !resp.request_headers.is_empty() {
+                    let _ = counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }),
+        );
+        let mut c_enc = fluke_hpack::Encoder::new();
+        let mut req = c_enc.encode([
+            (&b":method"[..], &b"POST"[..]),
+            (&b":authority"[..], &b"h2.example.com"[..]),
+            (&b":path"[..], &b"/upload"[..]),
+            (&b"content-type"[..], &b"text/plain"[..]),
+        ]);
+        let mut c2s = h2_preface_with(&[h2_frame(H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, 1, &req)]);
+        let chunk = vec![b'p'; 16 * 1024];
+        for i in 0..64 {
+            let flags = if i == 63 { H2_FLAG_END_STREAM } else { 0 };
+            c2s.extend(h2_frame(H2_FRAME_DATA, flags, 1, &chunk));
+        }
+        corr.feed_client(&c2s);
+        req.clear();
+
+        let mut s_enc = fluke_hpack::Encoder::new();
+        let block = s_enc.encode([(&b":status"[..], &b"200"[..])]);
+        corr.feed_server(&h2_frame(H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, 1, &block));
+        for i in 0..2000 {
+            let flags = if i == 1999 { H2_FLAG_END_STREAM } else { 0 };
+            corr.feed_server(&h2_frame(H2_FRAME_DATA, flags, 1, b"data: x\n\n"));
+        }
+        assert_eq!(corr.request_body_decodes, 1);
+        assert_eq!(emits_with_request.load(Ordering::Relaxed), 1);
+        // Both directions ended: the stream state (and its 1 MiB request body) is freed.
+        assert_eq!(corr.h2_streams.len(), 0);
+    }
+
+    #[test]
+    fn http2_streams_are_freed_on_completion_reset_goaway_and_cap() {
+        let (mut corr, captured, _) = correlator("h2.example.com");
+        let mut c_enc = fluke_hpack::Encoder::new();
+        let mut s_enc = fluke_hpack::Encoder::new();
+        let mut frames = Vec::new();
+        for id in [1_u32, 3, 5, 7] {
+            let block = h2_request_block(&mut c_enc, "GET", &format!("/s{id}"));
+            frames.push(h2_frame(
+                H2_FRAME_HEADERS,
+                H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+                id,
+                &block,
+            ));
+        }
+        corr.feed_client(&h2_preface_with(&frames));
+        assert_eq!(corr.inflight.get(), 4);
+
+        // Stream 1 completes normally.
+        let ok = s_enc.encode([(&b":status"[..], &b"204"[..])]);
+        corr.feed_server(&h2_frame(
+            H2_FRAME_HEADERS,
+            H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+            1,
+            &ok,
+        ));
+        // Stream 3 is reset by the client.
+        corr.feed_client(&h2_frame(H2_FRAME_RST_STREAM, 0, 3, &[0, 0, 0, 8]));
+        // The server only processed up to stream 5.
+        corr.feed_server(&h2_frame(H2_FRAME_GOAWAY, 0, 0, &[0, 0, 0, 5, 0, 0, 0, 0]));
+        assert_eq!(corr.h2_streams.keys().copied().collect::<Vec<_>>(), vec![5]);
+        assert_eq!(corr.inflight.get(), 1);
+        assert_eq!(responses_urls(&captured), vec!["https://h2.example.com/s1"]);
+
+        // Many concurrent streams never exceed the tracking cap.
+        let mut frames = Vec::new();
+        for n in 0..300_u32 {
+            let block = h2_request_block(&mut c_enc, "GET", "/many");
+            frames.push(h2_frame(
+                H2_FRAME_HEADERS,
+                H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+                9 + 2 * n,
+                &block,
+            ));
+        }
+        corr.feed_client(&frames.concat());
+        assert_eq!(corr.h2_streams.len(), MAX_TRACKED_H2_STREAMS);
+        assert_eq!(corr.inflight.get(), MAX_TRACKED_H2_STREAMS);
+    }
+
+    fn responses_urls(captured: &Captured) -> Vec<String> {
+        snapshot(captured).into_iter().map(|r| r.url).collect()
+    }
+
+    #[test]
+    fn http1_pending_requests_are_capped() {
+        let (mut corr, _, _) = correlator("api.example.com");
+        for i in 0..100 {
+            corr.feed_client(
+                format!("GET /{i} HTTP/1.1\r\nHost: api.example.com\r\n\r\n").as_bytes(),
+            );
+        }
+        assert_eq!(corr.h1_pending.len(), MAX_PENDING_H1_REQUESTS);
+        assert_eq!(corr.inflight.get(), MAX_PENDING_H1_REQUESTS);
+        drop(corr);
+    }
+
+    #[test]
+    fn request_body_decoded_size_and_header_bytes_are_capped() {
+        use std::fmt::Write as _;
+        use std::io::Write;
+
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        assert!(gz.write_all(&vec![b'z'; 8 * 1024 * 1024]).is_ok());
+        let body = gz.finish().unwrap_or_default();
+        let (mut corr, captured, _) = correlator("api.example.com");
+        let mut req = format!(
+            "POST /bulk HTTP/1.1\r\nHost: api.example.com\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        for i in 0..100 {
+            let _ = write!(req, "X-Big-{i}: {}\r\n", "v".repeat(1024));
+        }
+        req.push_str("\r\n");
+        let mut bytes = req.into_bytes();
+        bytes.extend_from_slice(&body);
+        corr.feed_client(&bytes);
+        corr.feed_server(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let got = snapshot(&captured);
+        assert_eq!(
+            got[0].request_body.as_ref().map(String::len),
+            Some(MAX_REQUEST_BODY_BYTES)
+        );
+        let header_bytes: usize = got[0]
+            .request_headers
+            .iter()
+            .map(|h| h.name.len() + h.value.len())
+            .sum();
+        assert!(header_bytes <= MAX_HEADER_BYTES_PER_MESSAGE);
+        assert!(got[0].request_headers.len() < 100);
+        assert_eq!(
+            decode_body_bytes_limited("héllo".as_bytes(), None, 2).as_deref(),
+            Some("h")
+        );
+    }
+
+    #[test]
+    fn http1_chunked_request_with_extensions_and_trailers_keeps_sync() {
+        let (mut corr, captured, _) = correlator("api.example.com");
+        corr.feed_client(
+            b"POST /a HTTP/1.1\r\nHost: api.example.com\r\nTransfer-Encoding: chunked\r\n\r\n3;ext=1\r\nabc\r\n",
+        );
+        corr.feed_client(b"0\r\nX-Sum: 1\r\n\r\nGET /b HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
+        corr.feed_server(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2;x\r\nok\r\n0\r\nT: 2\r\n\r\n",
+        );
+        corr.feed_server(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb");
+        let got = snapshot(&captured);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].request_body.as_deref(), Some("abc"));
+        assert_eq!(got[0].body.as_deref(), Some("ok"));
+        assert_eq!(got[1].url, "https://api.example.com/b");
+        assert_eq!(got[1].body.as_deref(), Some("b"));
+        assert_eq!(corr.inflight.get(), 0);
+    }
+
+    #[test]
+    fn chunked_response_wins_over_content_length() {
+        let (mut corr, captured, _) = correlator("api.example.com");
+        corr.feed_client(b"GET /x HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
+        corr.feed_client(b"GET /y HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
+        corr.feed_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        );
+        corr.feed_server(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\ny");
+        let got = snapshot(&captured);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].body.as_deref(), Some("hello"));
+        assert_eq!(got[1].body.as_deref(), Some("y"));
+    }
+
+    #[test]
+    fn expect_continue_answered_with_final_status_does_not_swallow_next_request() {
+        let (mut corr, captured, _) = correlator("api.example.com");
+        corr.feed_client(
+            b"PUT /big HTTP/1.1\r\nHost: api.example.com\r\nExpect: 100-continue\r\nContent-Length: 50\r\n\r\n",
+        );
+        corr.feed_server(b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n");
+        corr.feed_client(b"GET /next HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
+        corr.feed_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let got = snapshot(&captured);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].status, 417);
+        assert_eq!(got[1].url, "https://api.example.com/next");
+        assert_eq!(corr.inflight.get(), 0);
+    }
+
+    #[test]
+    fn head_response_with_content_length_has_no_body() {
+        let (mut corr, captured, _) = correlator("api.example.com");
+        corr.feed_client(b"HEAD /f HTTP/1.1\r\nHost: api.example.com\r\n\r\nGET /g HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
+        corr.feed_server(b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\ng");
+        let got = snapshot(&captured);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].request_method.as_deref(), Some("HEAD"));
+        assert_eq!(got[0].body, None);
+        assert_eq!(got[1].body.as_deref(), Some("g"));
+    }
+
+    #[test]
+    fn http2_interim_103_is_not_emitted_and_final_status_wins() {
+        let (mut corr, captured, _) = correlator("h2.example.com");
+        let mut c_enc = fluke_hpack::Encoder::new();
+        let block = h2_request_block(&mut c_enc, "GET", "/page");
+        corr.feed_client(&h2_preface_with(&[h2_frame(
+            H2_FRAME_HEADERS,
+            H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+            1,
+            &block,
+        )]));
+        let mut s_enc = fluke_hpack::Encoder::new();
+        let hints = s_enc.encode([
+            (&b":status"[..], &b"103"[..]),
+            (&b"link"[..], &b"</a.css>; rel=preload"[..]),
+        ]);
+        corr.feed_server(&h2_frame(H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, 1, &hints));
+        assert_eq!(snapshot(&captured), Vec::new());
+        // The final block references the dynamic table entry added by the 103 block.
+        let final_block = s_enc.encode([
+            (&b":status"[..], &b"200"[..]),
+            (&b"link"[..], &b"</a.css>; rel=preload"[..]),
+        ]);
+        corr.feed_server(&h2_frame(
+            H2_FRAME_HEADERS,
+            H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+            1,
+            &final_block,
+        ));
+        let got = snapshot(&captured);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].status, 200);
+        assert_eq!(
+            header_values(&got[0].headers, "link"),
+            vec!["</a.css>; rel=preload"]
+        );
+    }
+
+    #[test]
+    fn http2_continuation_keeps_end_stream_from_headers() {
+        let (mut corr, captured, _) = correlator("h2.example.com");
+        let mut c_enc = fluke_hpack::Encoder::new();
+        let block = h2_request_block(&mut c_enc, "DELETE", "/item/1");
+        let (a, b) = block.split_at(block.len() / 2);
+        corr.feed_client(&h2_preface_with(&[
+            h2_frame(H2_FRAME_HEADERS, H2_FLAG_END_STREAM, 1, a),
+            h2_frame(H2_FRAME_CONTINUATION, H2_FLAG_END_HEADERS, 1, b),
+        ]));
+        assert_eq!(corr.inflight.get(), 1);
+        let mut s_enc = fluke_hpack::Encoder::new();
+        let resp = s_enc.encode([
+            (&b":status"[..], &b"204"[..]),
+            (&b"x-request-id"[..], &b"abc123"[..]),
+        ]);
+        let (a, b) = resp.split_at(resp.len() / 2);
+        let mut s2c = h2_frame(H2_FRAME_HEADERS, H2_FLAG_END_STREAM, 1, a);
+        s2c.extend(h2_frame(H2_FRAME_CONTINUATION, H2_FLAG_END_HEADERS, 1, b));
+        corr.feed_server(&s2c);
+        assert_eq!(corr.inflight.get(), 0);
+        assert_eq!(corr.h2_streams.len(), 0);
+        let got = snapshot(&captured);
+        assert_eq!(got[0].status, 204);
+        assert_eq!(got[0].request_method.as_deref(), Some("DELETE"));
+    }
+
+    #[test]
+    fn http2_padded_and_priority_frames() {
+        let (mut corr, captured, _) = correlator("h2.example.com");
+        let mut c_enc = fluke_hpack::Encoder::new();
+        let block = h2_request_block(&mut c_enc, "POST", "/p");
+        let mut headers_payload = vec![3_u8];
+        headers_payload.extend_from_slice(&[0x80, 0, 0, 0, 15]);
+        headers_payload.extend_from_slice(&block);
+        headers_payload.extend_from_slice(&[0, 0, 0]);
+        let mut data_payload = vec![2_u8];
+        data_payload.extend_from_slice(b"body");
+        data_payload.extend_from_slice(&[0, 0]);
+        corr.feed_client(&h2_preface_with(&[
+            h2_frame(
+                H2_FRAME_HEADERS,
+                H2_FLAG_END_HEADERS | H2_FLAG_PADDED | H2_FLAG_PRIORITY,
+                1,
+                &headers_payload,
+            ),
+            h2_frame(
+                H2_FRAME_DATA,
+                H2_FLAG_PADDED | H2_FLAG_END_STREAM,
+                1,
+                &data_payload,
+            ),
+        ]));
+        let mut s_enc = fluke_hpack::Encoder::new();
+        let resp = s_enc.encode([(&b":status"[..], &b"200"[..])]);
+        let mut resp_payload = vec![1_u8];
+        resp_payload.extend_from_slice(&resp);
+        resp_payload.push(0);
+        let mut s2c = h2_frame(
+            H2_FRAME_HEADERS,
+            H2_FLAG_END_HEADERS | H2_FLAG_PADDED,
+            1,
+            &resp_payload,
+        );
+        s2c.extend(h2_frame(
+            H2_FRAME_DATA,
+            H2_FLAG_PADDED | H2_FLAG_END_STREAM,
+            1,
+            &[4, b'o', b'k', 0, 0, 0, 0],
+        ));
+        corr.feed_server(&s2c);
+        let got = snapshot(&captured);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].url, "https://h2.example.com/p");
+        assert_eq!(got[0].request_body.as_deref(), Some("body"));
+        assert_eq!(got[0].body.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn header_cap_keeps_hpack_dynamic_table_in_sync() {
+        let (mut corr, captured, _) = correlator("h2.example.com");
+        let mut c_enc = fluke_hpack::Encoder::new();
+        let names: Vec<(Vec<u8>, Vec<u8>)> = (0..300)
+            .map(|i| {
+                (
+                    format!("x-h-{i}").into_bytes(),
+                    format!("v{i}").into_bytes(),
+                )
+            })
+            .collect();
+        let mut fields: Vec<(&[u8], &[u8])> = vec![
+            (b":method", b"GET"),
+            (b":authority", b"h2.example.com"),
+            (b":path", b"/one"),
+        ];
+        fields.extend(names.iter().map(|(n, v)| (n.as_slice(), v.as_slice())));
+        let first = c_enc.encode(fields);
+        // The second request repeats the last header, which the encoder sends as an
+        // index into the dynamic table filled by the first block.
+        let second_fields = [
+            (&b":method"[..], &b"GET"[..]),
+            (&b":authority"[..], &b"h2.example.com"[..]),
+            (&b":path"[..], &b"/two"[..]),
+            (&b"x-h-299"[..], &b"v299"[..]),
+        ];
+        let second = c_enc.encode(second_fields);
+        // Shorter than a context-free encoding: it references dynamic-table entries that
+        // only exist if every field of the first block (beyond the cap) was decoded.
+        let fresh = fluke_hpack::Encoder::new().encode(second_fields);
+        assert!(second.len() < fresh.len());
+        corr.feed_client(&h2_preface_with(&[
+            h2_frame(
+                H2_FRAME_HEADERS,
+                H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+                1,
+                &first,
+            ),
+            h2_frame(
+                H2_FRAME_HEADERS,
+                H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+                3,
+                &second,
+            ),
+        ]));
+        let mut s_enc = fluke_hpack::Encoder::new();
+        for id in [1_u32, 3] {
+            let resp = s_enc.encode([(&b":status"[..], &b"200"[..])]);
+            corr.feed_server(&h2_frame(
+                H2_FRAME_HEADERS,
+                H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+                id,
+                &resp,
+            ));
+        }
+        let got = snapshot(&captured);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].request_headers.len(), MAX_HEADERS_PER_MESSAGE);
+        assert_eq!(got[1].url, "https://h2.example.com/two");
+        assert_eq!(
+            header_values(&got[1].request_headers, "x-h-299"),
+            vec!["v299"]
+        );
+    }
+
+    #[test]
+    fn http1_results_do_not_depend_on_read_split_points() {
+        let client: &[u8] = b"POST /a HTTP/1.1\r\nHost: s.test\r\nContent-Length: 5\r\n\r\nhelloPUT /b HTTP/1.1\r\nHost: s.test\r\nTransfer-Encoding: chunked\r\n\r\n2;e\r\nhi\r\n0\r\nT: x\r\n\r\nHEAD /c HTTP/1.1\r\nHost: s.test\r\n\r\nGET /d HTTP/1.1\r\nHost: s.test\r\n\r\n";
+        let server: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nnew\r\n0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\nHTTP/1.1 304 Not Modified\r\nETag: \"e\"\r\n\r\n";
+        let run = |client_cut: usize, server_cut: usize| {
+            let (mut corr, captured, _) = correlator("s.test");
+            corr.feed_client(&client[..client_cut]);
+            corr.feed_client(&client[client_cut..]);
+            corr.feed_server(&server[..server_cut]);
+            corr.feed_server(&server[server_cut..]);
+            (snapshot(&captured), corr.inflight.get())
+        };
+        let (baseline, inflight) = run(client.len(), server.len());
+        assert_eq!(baseline.len(), 4);
+        assert_eq!(inflight, 0);
+        assert_eq!(baseline[1].request_body.as_deref(), Some("hi"));
+        assert_eq!(baseline[1].body.as_deref(), Some("new"));
+        assert_eq!(baseline[3].status, 304);
+        for cut in 0..=client.len() {
+            assert_eq!(run(cut, server.len()).0, baseline, "client cut {cut}");
+        }
+        for cut in 0..=server.len() {
+            assert_eq!(run(client.len(), cut).0, baseline, "server cut {cut}");
+        }
     }
 }

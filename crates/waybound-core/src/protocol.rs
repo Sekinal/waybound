@@ -117,6 +117,9 @@ pub enum Request {
         /// Optional case-insensitive URL substring filter.
         #[serde(default)]
         url_contains: Option<String>,
+        /// Return only the most recent `limit` matching messages (all when absent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
     },
     /// Wait until zero HTTP/1.1–2 requests are inflight for at least `idle_ms` (or until `timeout_ms`).
     WaitForNetworkIdle {
@@ -226,7 +229,20 @@ mod tests {
             serde_json::from_str(r#"{"method":"captured_websocket_frames"}"#);
         assert_eq!(
             req.ok(),
-            Some(Request::CapturedWebsocketFrames { url_contains: None })
+            Some(Request::CapturedWebsocketFrames {
+                url_contains: None,
+                limit: None
+            })
+        );
+        let limited: Result<Request, _> = serde_json::from_str(
+            r#"{"method":"captured_websocket_frames","url_contains":"chat","limit":2}"#,
+        );
+        assert_eq!(
+            limited.ok(),
+            Some(Request::CapturedWebsocketFrames {
+                url_contains: Some("chat".to_owned()),
+                limit: Some(2)
+            })
         );
         let resp = Response::WebsocketFrames { frames: Vec::new() };
         assert_eq!(

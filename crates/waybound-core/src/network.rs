@@ -102,8 +102,9 @@ pub struct CapturedWebSocketFrame {
     pub opcode: WebSocketOpcode,
     /// Payload decoded as UTF-8 (longest valid prefix, as for HTTP bodies).
     ///
-    /// For `close` frames this is the close reason. `None` when the payload is empty,
-    /// not valid UTF-8, or compressed data that could not be inflated.
+    /// For `close` frames this is the close reason. Always `None` for `binary` messages
+    /// (see `payload_len` for their size), and `None` when the payload is empty, not
+    /// valid UTF-8, or compressed data that could not be inflated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<String>,
     /// Full payload length in bytes after unmasking and `permessage-deflate`
@@ -139,9 +140,9 @@ mod tests {
         if let Ok(resp) = parsed {
             assert_eq!(resp.url, "https://a.test/x");
             assert_eq!(resp.body.as_deref(), Some("hi"));
-            assert!(resp.headers.is_empty());
+            assert_eq!(resp.headers, Vec::new());
             assert!(resp.request_method.is_none());
-            assert!(resp.request_headers.is_empty());
+            assert_eq!(resp.request_headers, Vec::new());
             assert!(resp.request_body.is_none());
         }
     }
