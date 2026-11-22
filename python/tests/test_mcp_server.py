@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from waybound import LaunchOptions, launch
-from waybound.mcp_server import handle_rpc_message
+from waybound.mcp_server import _parse_role, handle_rpc_message
+
+if TYPE_CHECKING:
+    from waybound.client import Page
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DAEMON_BIN = REPO_ROOT / "target" / "debug" / "waybound-daemon"
@@ -95,3 +99,48 @@ def test_mcp_server_initialize_list_and_tool_calls() -> None:
         assert isinstance(shot_content, list)
         assert shot_content[0]["type"] == "image"
         assert shot_content[0]["mimeType"] == "image/png"
+
+
+def _failing_provider() -> Page:
+    msg = "waybound-daemon binary not found"
+    raise FileNotFoundError(msg)
+
+
+def test_launch_failure_is_reported_as_tool_error() -> None:
+    resp = handle_rpc_message(
+        _failing_provider,
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": "waybound_url", "arguments": {}},
+        },
+    )
+    assert resp is not None
+    assert "error" not in resp
+    result = resp["result"]
+    assert isinstance(result, dict)
+    assert result["isError"] is True
+    content = result["content"]
+    assert isinstance(content, list)
+    assert "waybound-daemon binary not found" in content[0]["text"]
+
+
+def test_non_tool_methods_never_launch_the_browser() -> None:
+    for request_id, method in enumerate(("initialize", "tools/list", "ping")):
+        resp = handle_rpc_message(
+            _failing_provider, {"jsonrpc": "2.0", "id": request_id, "method": method}
+        )
+        assert resp is not None
+        assert "result" in resp
+
+
+def test_client_responses_are_not_answered() -> None:
+    assert handle_rpc_message(_failing_provider, {"jsonrpc": "2.0", "id": 3, "result": {}}) is None
+
+
+def test_unknown_role_is_rejected() -> None:
+    assert _parse_role(None) is None
+    assert _parse_role("button") is not None
+    with pytest.raises(ValueError, match="unknown role 'buton'"):
+        _parse_role("buton")
