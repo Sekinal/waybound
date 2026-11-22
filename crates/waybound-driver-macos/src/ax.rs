@@ -340,6 +340,18 @@ fn map_ax_role(ax_role: &str, ax_subrole: Option<&str>) -> Role {
     }
 }
 
+/// Picks the accessible name used by locators.
+///
+/// Chrome exposes the text of `AXStaticText` in `AXValue`, not in `AXTitle` or
+/// `AXDescription`, so without this fallback plain page text has no name and can never
+/// be matched by `get_by_text` / `get_by_role(StaticText, name=...)`.
+fn accessible_name(role: Role, name: Option<String>, value: Option<&str>) -> Option<String> {
+    if name.is_none() && role == Role::StaticText {
+        return value.map(str::to_owned);
+    }
+    name
+}
+
 fn walk_node(
     element: &OwnedCf,
     depth: usize,
@@ -364,6 +376,7 @@ fn walk_node(
         .or_else(|| read_string_attr(element, "AXDescription").filter(|s| !s.is_empty()))
         .or_else(|| read_string_attr(element, "AXPlaceholderValue").filter(|s| !s.is_empty()));
     let value = read_string_attr(element, "AXValue").filter(|s| !s.is_empty());
+    let name = accessible_name(role, name, value.as_deref());
     let focused = copy_attr(element, "AXFocused")
         .and_then(|v| cf_to_bool(&v))
         .unwrap_or(false);
@@ -414,5 +427,25 @@ fn walk_node(
             break;
         }
         walk_node(child, depth + 1, visited, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_text_falls_back_to_value_for_its_name() {
+        assert_eq!(
+            accessible_name(Role::StaticText, None, Some("Total: $419")).as_deref(),
+            Some("Total: $419")
+        );
+        // An explicit title wins.
+        assert_eq!(
+            accessible_name(Role::StaticText, Some("Label".to_owned()), Some("x")).as_deref(),
+            Some("Label")
+        );
+        // Other roles keep value and name separate (a text box's value is user input).
+        assert_eq!(accessible_name(Role::TextBox, None, Some("typed")), None);
     }
 }
