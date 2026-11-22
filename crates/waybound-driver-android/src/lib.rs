@@ -58,6 +58,16 @@ impl Driver for AndroidDriver {
         Ok(xml::parse_uiautomator_xml(&raw_xml))
     }
 
+    fn current_url(&self) -> Result<Option<String>> {
+        let raw_xml = adb::dump_ui_xml(self.serial.as_deref())?;
+        Ok(xml::extract_chrome_url(&raw_xml))
+    }
+
+    fn navigate(&self, url: &str) -> Result<bool> {
+        self.open_url(url)?;
+        Ok(true)
+    }
+
     fn screenshot(&self, output_path: &Path) -> Result<()> {
         adb::capture_png(self.serial.as_deref(), output_path)
     }

@@ -1,13 +1,18 @@
 //! Pure-Rust ADB (`adb [-s <serial>] ...`) command runner for Android / Waydroid.
 
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tracing::debug;
 use waybound_core::{InputEvent, KeyCode, Point, Result, WayboundError};
 
 const BACKEND_NAME: &str = "android_waydroid";
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+const ADB_TIMEOUT: Duration = Duration::from_secs(15);
+const ADB_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Default swipe origin used when scrolling before any `PointerMove` has been dispatched.
 const DEFAULT_SCROLL_ORIGIN: Point = Point { x: 540.0, y: 960.0 };
@@ -27,22 +32,33 @@ const KEYCODE_BACKSPACE: u32 = 67;
 /// Returns [`WayboundError::BackendUnavailable`] if `adb` fails to execute,
 /// exits non-zero, or does not return a `uiautomator` XML hierarchy.
 pub fn dump_ui_xml(serial: Option<&str>) -> Result<String> {
-    let args = build_adb_args(serial, &["exec-out", "uiautomator", "dump", "/dev/tty"]);
-    let output = run_adb(&args)?;
-    ensure_success(&output, "uiautomator dump")?;
-
-    let xml = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !xml.contains("<hierarchy") && !xml.contains("<node") {
-        return Err(WayboundError::BackendUnavailable {
-            backend: BACKEND_NAME.to_owned(),
-            reason: format!(
-                "adb uiautomator dump did not contain XML hierarchy (stdout: {})",
-                truncate_for_log(&xml)
-            ),
-        });
+    let mut last_err = None;
+    for target in ["/dev/stdout", "/dev/tty"] {
+        let args = build_adb_args(serial, &["exec-out", "uiautomator", "dump", target]);
+        let output = run_adb(&args)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            last_err = Some(format!(
+                "adb uiautomator dump {target} failed ({}): {}",
+                output.status,
+                truncate_for_log(stderr.trim())
+            ));
+            continue;
+        }
+        let xml = String::from_utf8_lossy(&output.stdout).into_owned();
+        if xml.contains("<hierarchy") || xml.contains("<node") {
+            return Ok(xml);
+        }
+        last_err = Some(format!(
+            "adb uiautomator dump {target} did not contain XML hierarchy (stdout: {})",
+            truncate_for_log(&xml)
+        ));
     }
 
-    Ok(xml)
+    Err(WayboundError::BackendUnavailable {
+        backend: BACKEND_NAME.to_owned(),
+        reason: last_err.unwrap_or_else(|| "adb uiautomator dump failed".to_owned()),
+    })
 }
 
 /// Dispatches a platform-agnostic [`InputEvent`] to an Android device via `adb shell input`.
@@ -306,12 +322,65 @@ fn coord_to_i32(value: f64) -> i32 {
 fn run_adb(args: &[String]) -> Result<Output> {
     debug!(?args, "executing adb command");
     let mut cmd = Command::new("adb");
-    let _ = cmd.args(args);
-    cmd.output()
+    let _ = cmd
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
         .map_err(|err| WayboundError::BackendUnavailable {
             backend: BACKEND_NAME.to_owned(),
             reason: format!("failed to execute adb: {err}"),
+        })?;
+
+    let stdout_handle = child.stdout.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
         })
+    });
+    let stderr_handle = child.stderr.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = Instant::now() + ADB_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(WayboundError::Timeout {
+                        timeout_ms: u64::try_from(ADB_TIMEOUT.as_millis()).unwrap_or(15_000),
+                        context: format!("adb command timed out: {args:?}"),
+                    });
+                }
+                thread::sleep(ADB_POLL_INTERVAL);
+            }
+            Err(err) => return Err(WayboundError::Io(err)),
+        }
+    };
+
+    let stdout = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn ensure_success(output: &Output, context: &str) -> Result<()> {

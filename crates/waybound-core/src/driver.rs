@@ -102,6 +102,19 @@ pub trait Driver: Send + Sync {
         Ok(None)
     }
 
+    /// Navigates the active browser tab directly via a backend-native mechanism
+    /// (for example Android `am start` intents).
+    ///
+    /// Returns `Ok(true)` if the backend handled navigation directly, or `Ok(false)`
+    /// to let the daemon fall back to OS keyboard shortcut navigation (`Cmd/Ctrl+L`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if native navigation fails.
+    fn navigate(&self, _url: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Captures a native OS screenshot of the active browser window as PNG to `output_path`.
     ///
     /// # Errors

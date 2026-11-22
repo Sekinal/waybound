@@ -118,6 +118,10 @@ fn parse_node_attributes(attrs: &str, index: usize) -> Option<AccessibilityNode>
         (name, None)
     };
 
+    if role == Role::Unknown && name.is_none() && value.is_none() {
+        return None;
+    }
+
     Some(AccessibilityNode {
         id: format!("android-node-{index}"),
         role,
@@ -126,6 +130,40 @@ fn parse_node_attributes(attrs: &str, index: usize) -> Option<AccessibilityNode>
         bounds,
         focused: raw.focused,
     })
+}
+
+/// Extracts the active URL text from Chrome's `:id/url_bar` node in `uiautomator` XML, if present.
+#[must_use]
+pub fn extract_chrome_url(xml: &str) -> Option<String> {
+    let bytes = xml.as_bytes();
+    let mut pos = 0;
+
+    while pos < bytes.len() {
+        let rel_open = xml.get(pos..)?.find('<')?;
+        let tag_start = pos + rel_open;
+        if xml.get(tag_start..)?.starts_with("<!--") {
+            let rel_end = xml.get(tag_start + 4..)?.find("-->")?;
+            pos = tag_start + 4 + rel_end + 3;
+            continue;
+        }
+        let tag_end = find_tag_end(xml, tag_start)?;
+        if let Some(rest) = xml
+            .get(tag_start..tag_end)
+            .and_then(|s| s.strip_prefix("<node"))
+            && rest.as_bytes().first().is_some_and(u8::is_ascii_whitespace)
+        {
+            let raw = scan_attributes(rest.trim_end_matches('/'));
+            if raw.resource_id.ends_with(":id/url_bar") {
+                let text = unescape_xml(raw.text);
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+        pos = tag_end + 1;
+    }
+
+    None
 }
 
 fn scan_attributes(attrs: &str) -> RawNodeAttrs<'_> {
@@ -156,7 +194,9 @@ fn scan_attributes(attrs: &str) -> RawNodeAttrs<'_> {
             pos += 1;
         }
         if bytes.get(pos) != Some(&b'=') {
-            pos += 1;
+            while bytes.get(pos).is_some_and(|&b| !b.is_ascii_whitespace()) {
+                pos += 1;
+            }
             continue;
         }
         pos += 1;
@@ -346,10 +386,14 @@ mod tests {
     #[test]
     fn parses_realistic_android_chrome_hierarchy() {
         let nodes = parse_uiautomator_xml(CHROME_FIXTURE);
-        assert_eq!(nodes.len(), 8);
+        assert_eq!(nodes.len(), 7);
+        assert_eq!(
+            extract_chrome_url(CHROME_FIXTURE).as_deref(),
+            Some("https://example.com/search?a=1&b=2")
+        );
 
         // URL bar (EditText)
-        let url_bar = nodes.get(1);
+        let url_bar = nodes.first();
         assert!(url_bar.is_some());
         if let Some(node) = url_bar {
             assert_eq!(node.role, Role::TextBox);
@@ -371,38 +415,38 @@ mod tests {
         }
 
         // Tab switcher (ImageButton)
-        if let Some(node) = nodes.get(2) {
+        if let Some(node) = nodes.get(1) {
             assert_eq!(node.role, Role::Button);
             assert_eq!(node.name.as_deref(), Some("Switch or close tabs"));
             assert!(!node.focused);
         }
 
         // WebView document
-        if let Some(node) = nodes.get(3) {
+        if let Some(node) = nodes.get(2) {
             assert_eq!(node.role, Role::Document);
             assert_eq!(node.name.as_deref(), Some("Example Domain"));
         }
 
         // Static text with XML entities
-        if let Some(node) = nodes.get(4) {
+        if let Some(node) = nodes.get(3) {
             assert_eq!(node.role, Role::StaticText);
             assert_eq!(node.name.as_deref(), Some("Example & \"Demo\" <Site>"));
         }
 
         // Clickable View -> Link
-        if let Some(node) = nodes.get(5) {
+        if let Some(node) = nodes.get(4) {
             assert_eq!(node.role, Role::Link);
             assert_eq!(node.name.as_deref(), Some("More information..."));
         }
 
         // CheckBox with &apos;
-        if let Some(node) = nodes.get(6) {
+        if let Some(node) = nodes.get(5) {
             assert_eq!(node.role, Role::CheckBox);
             assert_eq!(node.name.as_deref(), Some("Accept 'Terms'"));
         }
 
         // Button with &gt;
-        if let Some(node) = nodes.get(7) {
+        if let Some(node) = nodes.get(6) {
             assert_eq!(node.role, Role::Button);
             assert_eq!(node.name.as_deref(), Some("Continue > Next"));
         }

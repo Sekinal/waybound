@@ -183,7 +183,7 @@ fn move_pointer(
         .lock()
         .map_or(Point { x: 0.0, y: 0.0 }, |g| *g);
 
-    if state.options.use_motion {
+    if state.options.use_motion && driver.backend_kind() != BackendKind::AndroidWaydroid {
         let path = plan_human_pointer_path(start, target, MotionConfig::default(), rng);
         for step in path {
             if !step.delay.is_zero() {
@@ -207,7 +207,7 @@ fn scroll_viewport(
     delta_x: f64,
     delta_y: f64,
 ) -> Result<()> {
-    if !state.options.use_motion {
+    if !state.options.use_motion || driver.backend_kind() == BackendKind::AndroidWaydroid {
         return driver.dispatch_input(&InputEvent::Scroll { delta_x, delta_y });
     }
     let mut rng = SplitMix64::from_entropy();
@@ -295,6 +295,10 @@ fn navigate_url(driver: &dyn Driver, url: &str) -> Result<()> {
             ErrorKind::InvalidInput,
             "url must start with http:// or https://",
         )));
+    }
+
+    if driver.navigate(url)? {
+        return Ok(());
     }
 
     let focus_mod = match driver.backend_kind() {
