@@ -278,7 +278,7 @@ fn poll_locate(
 ) -> Result<waybound_core::AccessibilityNode> {
     let deadline = Instant::now() + wait;
     loop {
-        match driver.locate(query) {
+        match driver.locate_within(query, deadline.saturating_duration_since(Instant::now())) {
             Ok(node) => return Ok(node),
             Err(err)
                 if matches!(
@@ -573,10 +573,18 @@ fn replace_field_content(driver: &dyn Driver, text: &str, pace: bool) -> Result<
         hold_ms: 0,
     }) {
         Ok(()) => {}
-        // Android before API 31 cannot send Ctrl+A through `adb shell input`; keep append
-        // semantics there rather than failing the whole fill.
-        Err(WayboundError::UnsupportedInput { reason, .. }) => {
-            tracing::debug!(%reason, "select-all unsupported; fill appends to existing text");
+        // Android before API 33 cannot send Ctrl+A through `adb shell input`, and a
+        // transient failure (for example the one-time API-level probe timing out) leaves
+        // it unknown. Keep append semantics there rather than failing the whole fill;
+        // fatal errors still fail.
+        Err(
+            WayboundError::UnsupportedInput { reason, .. }
+            | WayboundError::Transient { reason, .. },
+        ) => {
+            tracing::warn!(
+                %reason,
+                "select-all unavailable; fill appends to the field's existing text"
+            );
             return type_text(driver, text, pace);
         }
         Err(err) => return Err(err),
@@ -1140,8 +1148,10 @@ mod tests {
         assert_eq!(fatal.0.load(Ordering::SeqCst), 1);
     }
 
-    /// Records key presses but rejects modifier chords, like Android before API 31.
-    struct NoChordDriver(MockDriver);
+    /// Records key presses but fails every modifier chord with `chord_error()`: like
+    /// Android before API 33 (`UnsupportedInput`), a timed-out API-level probe
+    /// (`Transient`), or an offline device (`BackendUnavailable`).
+    struct NoChordDriver(MockDriver, fn() -> WayboundError);
 
     impl Driver for NoChordDriver {
         fn backend_kind(&self) -> BackendKind {
@@ -1156,26 +1166,58 @@ mod tests {
             if let InputEvent::KeyPress { modifiers, .. } = event
                 && !modifiers.is_empty()
             {
-                return Err(WayboundError::UnsupportedInput {
-                    backend: "android_waydroid".to_owned(),
-                    reason: "no keycombination".to_owned(),
-                });
+                return Err((self.1)());
             }
             self.0.dispatch_input(event)
         }
     }
 
+    fn unsupported_chord() -> WayboundError {
+        WayboundError::UnsupportedInput {
+            backend: "android_waydroid".to_owned(),
+            reason: "no keycombination".to_owned(),
+        }
+    }
+
+    fn probe_timed_out() -> WayboundError {
+        WayboundError::Transient {
+            backend: "android_waydroid".to_owned(),
+            reason: "adb command timed out: getprop ro.build.version.sdk".to_owned(),
+        }
+    }
+
+    fn device_offline() -> WayboundError {
+        WayboundError::BackendUnavailable {
+            backend: "android_waydroid".to_owned(),
+            reason: "error: device offline".to_owned(),
+        }
+    }
+
     #[test]
-    fn fill_appends_when_select_all_is_unsupported() {
-        let driver = NoChordDriver(MockDriver::sample_page());
+    fn fill_appends_when_select_all_is_unsupported_or_transiently_unknown() {
+        let chord_errors: [fn() -> WayboundError; 2] = [unsupported_chord, probe_timed_out];
+        for chord_error in chord_errors {
+            let driver = NoChordDriver(MockDriver::sample_page(), chord_error);
+            let query = LocatorQuery::by_role(Role::TextBox, Some("Origin".to_owned()));
+            assert!(fill_element(&driver, &state(), &query, "NR").is_ok());
+            assert_eq!(
+                key_events(&driver.0),
+                vec![
+                    (KeyCode::Char('N'), Vec::new()),
+                    (KeyCode::Char('R'), Vec::new()),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn fill_fails_when_select_all_hits_a_fatal_error() {
+        let driver = NoChordDriver(MockDriver::sample_page(), device_offline);
         let query = LocatorQuery::by_role(Role::TextBox, Some("Origin".to_owned()));
-        assert!(fill_element(&driver, &state(), &query, "NR").is_ok());
-        assert_eq!(
-            key_events(&driver.0),
-            vec![
-                (KeyCode::Char('N'), Vec::new()),
-                (KeyCode::Char('R'), Vec::new()),
-            ]
-        );
+        assert!(matches!(
+            fill_element(&driver, &state(), &query, "NR"),
+            Err(WayboundError::BackendUnavailable { .. })
+        ));
+        assert_eq!(key_events(&driver.0), Vec::new());
     }
 }

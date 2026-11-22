@@ -15,14 +15,23 @@ const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 const ADB_TIMEOUT: Duration = Duration::from_secs(15);
 const ADB_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// How long a single snapshot keeps retrying transient `uiautomator dump` failures before
-/// reporting [`WayboundError::Transient`] to the caller (whose own wait loop may poll again).
+/// How long a single snapshot retries transient `uiautomator dump` failures.
+///
+/// Afterwards it reports [`WayboundError::Transient`] to the caller, whose own wait loop
+/// may poll again. Capped further by the caller's remaining wait; see
+/// [`snapshot_retry_budget`].
 pub const SNAPSHOT_RETRY_BUDGET: Duration = Duration::from_secs(3);
 /// Pause between snapshot retries.
 pub const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
-/// First Android API level whose `input` tool has `keycombination` (Android 12).
-pub const KEYCOMBINATION_MIN_SDK: u32 = 31;
+/// First Android API level whose `input keycombination` actually holds modifiers
+/// (Android 13).
+///
+/// `keycombination` exists from API 31, but on Android 12 / 12L (API 31, 32) AOSP
+/// `InputShellCommand.sendKeyCombination` builds every `KeyEvent` with `metaState` 0, so
+/// Ctrl+A arrives as a plain `a`. Accumulating the modifier meta state was added in
+/// android13-release.
+pub const KEYCOMBINATION_MIN_SDK: u32 = 33;
 
 /// Android `KeyEvent` keycodes for modifier keys (left-hand variants).
 const KEYCODE_CTRL_LEFT: u32 = 113;
@@ -99,9 +108,12 @@ pub fn classify_adb_failure(text: &str) -> FailureClass {
 /// Validates the output of `adb exec-out uiautomator dump <target>` and returns the XML.
 ///
 /// A dump is accepted only when it contains a complete `<hierarchy>` element (closing tag
-/// or self-closing). Truncated, empty, or error-only output becomes
-/// [`WayboundError::Transient`]; output matching a fatal marker (see
-/// [`classify_adb_failure`]) becomes [`WayboundError::BackendUnavailable`].
+/// or self-closing). Output that starts an XML document but does not finish it is a
+/// truncated dump and always [`WayboundError::Transient`]: its text is page content (which
+/// may say "Unauthorized" or "device offline"), so it is never searched for adb markers.
+/// Otherwise the non-XML output is classified with [`classify_adb_failure`]: fatal markers
+/// become [`WayboundError::BackendUnavailable`], everything else (known transient,
+/// unrecognised, empty) becomes [`WayboundError::Transient`].
 ///
 /// # Errors
 ///
@@ -110,14 +122,21 @@ pub fn validate_dump_output(target: &str, success: bool, stdout: &str, stderr: &
     if has_complete_hierarchy(stdout) {
         return Ok(());
     }
+    let status = if success { "exit 0" } else { "non-zero exit" };
+
+    if starts_xml(stdout) {
+        return Err(WayboundError::Transient {
+            backend: BACKEND_NAME.to_owned(),
+            reason: format!(
+                "adb uiautomator dump {target} failed ({status}): truncated hierarchy \
+                 ({} bytes, no closing </hierarchy>)",
+                stdout.len()
+            ),
+        });
+    }
 
     let combined = format!("{} {}", stdout.trim(), stderr.trim());
-    let detail = if stdout.contains("<hierarchy") {
-        format!(
-            "truncated hierarchy ({} bytes, no closing </hierarchy>)",
-            stdout.len()
-        )
-    } else if combined.trim().is_empty() {
+    let detail = if combined.trim().is_empty() {
         "empty output".to_owned()
     } else {
         format!(
@@ -125,7 +144,6 @@ pub fn validate_dump_output(target: &str, success: bool, stdout: &str, stderr: &
             truncate_for_log(combined.trim())
         )
     };
-    let status = if success { "exit 0" } else { "non-zero exit" };
     let reason = format!("adb uiautomator dump {target} failed ({status}): {detail}");
 
     match classify_adb_failure(&combined) {
@@ -138,6 +156,26 @@ pub fn validate_dump_output(target: &str, success: bool, stdout: &str, stderr: &
             reason,
         }),
     }
+}
+
+/// Whether the dump output contains the start of the XML document.
+fn starts_xml(stdout: &str) -> bool {
+    stdout.contains("<?xml") || stdout.contains("<hierarchy")
+}
+
+/// Whether a failed `/dev/stdout` dump is worth repeating against `/dev/tty`.
+///
+/// Only empty or unrecognised output suggests the device cannot write the dump to
+/// `/dev/stdout`. A known transient failure (UI not idle, null root) would fail the same
+/// way on `/dev/tty` after another ~10 s idle wait, a truncated dump means the target
+/// works, and a fatal marker cannot heal.
+#[must_use]
+pub fn should_try_tty_fallback(stdout: &str, stderr: &str) -> bool {
+    if starts_xml(stdout) {
+        return false;
+    }
+    let combined = format!("{} {}", stdout.trim(), stderr.trim());
+    classify_adb_failure(&combined) == FailureClass::Unrecognized
 }
 
 fn has_complete_hierarchy(xml: &str) -> bool {
@@ -156,10 +194,14 @@ fn has_complete_hierarchy(xml: &str) -> bool {
         .is_some_and(|open_tag| open_tag.ends_with('/'))
 }
 
-/// Captures the current Android UI accessibility hierarchy XML via
-/// `adb [-s <serial>] exec-out uiautomator dump /dev/stdout` (falling back to `/dev/tty`).
+/// Captures the current Android UI accessibility hierarchy XML.
 ///
-/// Makes one attempt per target; see [`dump_ui_xml_with_retry`] for the retrying form.
+/// Runs `adb [-s <serial>] exec-out uiautomator dump /dev/stdout`, repeating against
+/// `/dev/tty` only when [`should_try_tty_fallback`] says the first target produced empty or
+/// unrecognised output.
+///
+/// Makes one attempt (one adb command, or two with the fallback); see [`retry_dump`] for
+/// the retrying form.
 ///
 /// # Errors
 ///
@@ -173,12 +215,12 @@ pub fn dump_ui_xml(serial: Option<&str>) -> Result<String> {
         let args = build_adb_args(serial, &["exec-out", "uiautomator", "dump", target]);
         let output = match run_adb(&args) {
             Ok(output) => output,
+            // A hung dump already cost ADB_TIMEOUT; do not spend it again on `/dev/tty`.
             Err(WayboundError::Timeout { context, .. }) => {
-                last_err = Some(WayboundError::Transient {
+                return Err(WayboundError::Transient {
                     backend: BACKEND_NAME.to_owned(),
                     reason: context,
                 });
-                continue;
             }
             Err(err) => return Err(err),
         };
@@ -186,8 +228,8 @@ pub fn dump_ui_xml(serial: Option<&str>) -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         match validate_dump_output(target, output.status.success(), &stdout, &stderr) {
             Ok(()) => return Ok(stdout.into_owned()),
-            Err(err) if err.is_transient() => {
-                debug!(target, error = %err, "uiautomator dump attempt failed");
+            Err(err) if err.is_transient() && should_try_tty_fallback(&stdout, &stderr) => {
+                debug!(target, error = %err, "uiautomator dump gave no usable output; trying next target");
                 last_err = Some(err);
             }
             Err(err) => return Err(err),
@@ -200,20 +242,65 @@ pub fn dump_ui_xml(serial: Option<&str>) -> Result<String> {
     }))
 }
 
-/// [`dump_ui_xml`] retried on transient failures for up to [`SNAPSHOT_RETRY_BUDGET`].
+/// Retry budget for one snapshot.
+///
+/// [`SNAPSHOT_RETRY_BUDGET`], capped at the caller's remaining wait when it has one, so a
+/// nested retry cannot outlast the caller's deadline by more than the attempt in flight.
+#[must_use]
+pub fn snapshot_retry_budget(caller_remaining: Option<Duration>) -> Duration {
+    caller_remaining.map_or(SNAPSHOT_RETRY_BUDGET, |remaining| {
+        remaining.min(SNAPSHOT_RETRY_BUDGET)
+    })
+}
+
+/// Consecutive `already registered` dump failures one retry loop tolerates.
+///
+/// Our own dumps are serialised per driver, so a persistent
+/// `UiAutomationService ... already registered` means another `UiAutomation` client
+/// (a test runner, another tool) holds the device.
+pub const MAX_ALREADY_REGISTERED: u32 = 3;
+
+/// Retries `attempt` (one [`dump_ui_xml`]) on transient failures.
+///
+/// Stops when it succeeds, fails fatally, or `budget` elapses; see [`poll_transient`].
+/// Always makes at least one attempt.
+///
+/// `attempt` should take any per-device lock itself, so other callers can interleave
+/// between attempts instead of queueing behind the whole loop.
 ///
 /// # Errors
 ///
-/// Fatal errors are returned at once. When the budget runs out, returns
+/// Fatal errors are returned at once. After [`MAX_ALREADY_REGISTERED`] consecutive
+/// "already registered" failures, returns [`WayboundError::BackendUnavailable`] naming
+/// the conflicting client. When the budget runs out, returns
 /// [`WayboundError::Transient`] carrying the attempt count and the last failure.
-pub fn dump_ui_xml_with_retry(serial: Option<&str>, clock: &dyn Clock) -> Result<String> {
-    poll_transient(
-        clock,
-        SNAPSHOT_RETRY_BUDGET,
-        SNAPSHOT_RETRY_INTERVAL,
-        || dump_ui_xml(serial),
-    )
-    .map_err(|err| match err {
+pub fn retry_dump(
+    clock: &dyn Clock,
+    budget: Duration,
+    mut attempt: impl FnMut() -> Result<String>,
+) -> Result<String> {
+    let mut already_registered: u32 = 0;
+    let op = || match attempt() {
+        Err(err) if err.is_transient() && error_reason(&err).contains("already registered") => {
+            already_registered += 1;
+            if already_registered >= MAX_ALREADY_REGISTERED {
+                return Err(WayboundError::BackendUnavailable {
+                    backend: BACKEND_NAME.to_owned(),
+                    reason: format!(
+                        "another UiAutomation client is attached to the device \
+                         ({already_registered} dumps in a row): {}",
+                        error_reason(&err)
+                    ),
+                });
+            }
+            Err(err)
+        }
+        other => {
+            already_registered = 0;
+            other
+        }
+    };
+    poll_transient(clock, budget, SNAPSHOT_RETRY_INTERVAL, op).map_err(|err| match err {
         PollError::Fatal(err) => err,
         PollError::Exhausted { attempts, last } => WayboundError::Transient {
             backend: BACKEND_NAME.to_owned(),
@@ -313,9 +400,11 @@ pub fn error_reason(err: &WayboundError) -> String {
 /// How the connected device can deliver modifier chords through `adb shell input`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChordSupport {
-    /// API 31+ (Android 12+): `input keycombination` presses every key together.
+    /// API 33+ (Android 13+): `input keycombination` presses every key together with the
+    /// modifiers' meta state applied.
     KeyCombination,
-    /// Older Android: `input` has no way to hold a modifier. Only Shift on a letter can be
+    /// API 32 and below: `input` cannot hold a modifier (API 31-32 have `keycombination`
+    /// but send it without meta state). Only Shift on a letter can be
     /// expressed (by typing the upper-case letter); everything else is unsupported.
     ShiftLettersOnly {
         /// The device's `ro.build.version.sdk`.
@@ -375,21 +464,55 @@ impl ChordSupportCache {
 ///
 /// # Errors
 ///
-/// Returns [`WayboundError::BackendUnavailable`] if `adb` fails or prints no API level.
+/// [`WayboundError::BackendUnavailable`] if `adb` is missing or the output matches a fatal
+/// marker (device offline, unauthorized, ...); [`WayboundError::Transient`] for a command
+/// timeout or any other failure, so callers such as `fill` can degrade instead of failing.
 pub fn probe_chord_support(serial: Option<&str>) -> Result<ChordSupport> {
     let args = build_adb_args(serial, &["shell", "getprop", "ro.build.version.sdk"]);
-    let output = run_adb(&args)?;
-    ensure_success(&output, "getprop ro.build.version.sdk")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let sdk = parse_sdk_level(&stdout).ok_or_else(|| WayboundError::BackendUnavailable {
+    let output = match run_adb(&args) {
+        Ok(output) => output,
+        Err(WayboundError::Timeout { context, .. }) => {
+            return Err(WayboundError::Transient {
+                backend: BACKEND_NAME.to_owned(),
+                reason: context,
+            });
+        }
+        Err(err) => return Err(err),
+    };
+    let support = parse_probe_output(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )?;
+    debug!(?support, "detected Android key chord support");
+    Ok(support)
+}
+
+/// Turns `getprop ro.build.version.sdk` output into a [`ChordSupport`].
+///
+/// # Errors
+///
+/// [`WayboundError::BackendUnavailable`] when the output matches a fatal marker
+/// (see [`classify_adb_failure`]), [`WayboundError::Transient`] for any other failure.
+pub fn parse_probe_output(success: bool, stdout: &str, stderr: &str) -> Result<ChordSupport> {
+    if success && let Some(sdk) = parse_sdk_level(stdout) {
+        return Ok(ChordSupport::from_sdk(sdk));
+    }
+    let combined = format!("{} {}", stdout.trim(), stderr.trim());
+    let reason = format!(
+        "could not read Android API level from getprop: {}",
+        truncate_for_log(combined.trim())
+    );
+    if classify_adb_failure(&combined) == FailureClass::Fatal {
+        return Err(WayboundError::BackendUnavailable {
+            backend: BACKEND_NAME.to_owned(),
+            reason,
+        });
+    }
+    Err(WayboundError::Transient {
         backend: BACKEND_NAME.to_owned(),
-        reason: format!(
-            "could not read Android API level from getprop: {}",
-            truncate_for_log(stdout.trim())
-        ),
-    })?;
-    debug!(sdk, "detected Android API level for key chords");
-    Ok(ChordSupport::from_sdk(sdk))
+        reason,
+    })
 }
 
 /// Dispatches a platform-agnostic [`InputEvent`] to an Android device via `adb shell input`.
@@ -512,9 +635,11 @@ pub fn build_key_chord_args(
                     build_key_shell_args(&KeyCode::Char(ch.to_ascii_uppercase())),
                 ),
                 _ => Err(unsupported(format!(
-                    "{chord}: Android API {sdk} has no `input keycombination` (needs API \
-                     {KEYCOMBINATION_MIN_SDK} / Android 12); `input keyevent` cannot hold \
-                     modifiers and `sendevent` needs root plus device-specific evdev codes"
+                    "{chord}: Android API {sdk} cannot hold modifiers through `adb shell \
+                     input` (`input keycombination` applies modifier meta state only from API \
+                     {KEYCOMBINATION_MIN_SDK} / Android 13; API 31-32 send the bare key and \
+                     older versions lack it); `input keyevent` cannot hold modifiers and \
+                     `sendevent` needs root plus device-specific evdev codes"
                 ))),
             }
         }
@@ -924,12 +1049,15 @@ pub(crate) fn ensure_success(output: &Output, context: &str) -> Result<()> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // `am` and other device tools print their errors on stdout.
     Err(WayboundError::BackendUnavailable {
         backend: BACKEND_NAME.to_owned(),
         reason: format!(
-            "adb {context} failed with status {}: {}",
+            "adb {context} failed with status {}: stderr: {}; stdout: {}",
             output.status,
-            truncate_for_log(stderr.trim())
+            truncate_for_log(stderr.trim()),
+            truncate_for_log(stdout.trim())
         ),
     })
 }
@@ -1457,7 +1585,7 @@ mod tests {
             ]))
         );
 
-        // Ctrl+L, upper-case letter implies Shift
+        // Ctrl+T: an upper-case letter implies Shift
         let ctrl_shift_t =
             build_key_chord_args(&KeyCode::Char('T'), &[KeyModifier::Control], api33);
         assert_eq!(
@@ -1471,29 +1599,36 @@ mod tests {
     }
 
     #[test]
-    fn chords_without_keycombination_are_unsupported_not_bare_keys() {
-        let api30 = ChordSupport::from_sdk(30);
-        assert_eq!(api30, ChordSupport::ShiftLettersOnly { sdk: 30 });
+    fn chords_without_working_keycombination_are_unsupported_not_bare_keys() {
+        // API 31/32 (Android 12/12L) have `input keycombination` but send it with metaState
+        // 0, so they must take the same path as devices without it.
+        assert_eq!(KEYCOMBINATION_MIN_SDK, 33);
+        for sdk in [30, 31, 32] {
+            let support = ChordSupport::from_sdk(sdk);
+            assert_eq!(support, ChordSupport::ShiftLettersOnly { sdk });
 
-        for (key, modifiers) in [
-            (KeyCode::Char('a'), vec![KeyModifier::Control]),
-            (KeyCode::Tab, vec![KeyModifier::Shift]),
-            (KeyCode::ArrowLeft, vec![KeyModifier::Alt]),
-            (KeyCode::Char('1'), vec![KeyModifier::Shift]),
-        ] {
-            let result = build_key_chord_args(&key, &modifiers, api30);
-            assert!(
-                matches!(&result, Err(WayboundError::UnsupportedInput { reason, .. })
-                    if reason.contains("API 30") && reason.contains("keycombination")),
-                "{key:?} {modifiers:?} -> {result:?}"
-            );
+            for (key, modifiers) in [
+                (KeyCode::Char('a'), vec![KeyModifier::Control]),
+                (KeyCode::Tab, vec![KeyModifier::Shift]),
+                (KeyCode::ArrowLeft, vec![KeyModifier::Alt]),
+                (KeyCode::Char('1'), vec![KeyModifier::Shift]),
+            ] {
+                let result = build_key_chord_args(&key, &modifiers, support);
+                let api = format!("API {sdk}");
+                assert!(
+                    matches!(&result, Err(WayboundError::UnsupportedInput { reason, .. })
+                        if reason.contains(&api) && reason.contains("Android 13")),
+                    "{key:?} {modifiers:?} -> {result:?}"
+                );
+            }
+
+            // Shift on a letter is still expressible: type the upper-case letter.
+            let shift_a = build_key_chord_args(&KeyCode::Char('a'), &[KeyModifier::Shift], support);
+            assert_eq!(shift_a.ok(), Some(shell_input(&["text", "'A'"])));
         }
 
-        // Shift on a letter is still expressible: type the upper-case letter.
-        let shift_a = build_key_chord_args(&KeyCode::Char('a'), &[KeyModifier::Shift], api30);
-        assert_eq!(shift_a.ok(), Some(shell_input(&["text", "'A'"])));
-
-        // On API 31+ a character without an Android keycode is unsupported too.
+        // With keycombination available, a character without an Android keycode is still
+        // unsupported.
         let ctrl_bang = build_key_chord_args(
             &KeyCode::Char('!'),
             &[KeyModifier::Control],
@@ -1585,5 +1720,171 @@ mod tests {
             assert_eq!(support.ok(), Some(ChordSupport::KeyCombination));
         }
         assert_eq!(probes, 2);
+    }
+
+    // ----- review follow-ups: truncated page text, fallback, budgets, probe -----
+
+    #[test]
+    fn truncated_dump_with_alarming_page_text_stays_transient() {
+        let page_text = [
+            "Unauthorized",
+            "device offline",
+            "more than one device/emulator",
+            "error: device 'x' not found",
+        ];
+        for text in page_text {
+            let partial = format!(
+                "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation=\"0\">\
+                 <node index=\"0\" text=\"{text}\" class=\"android.widget.TextView\" bounds=\"[0,0][10"
+            );
+            let result = validate_dump_output("/dev/stdout", true, &partial, "");
+            assert!(
+                matches!(&result, Err(WayboundError::Transient { reason, .. }) if reason.contains("truncated")),
+                "{text}: {result:?}"
+            );
+            // Cut even before `<hierarchy`: still a truncated document, not adb output.
+            let header_only = format!("<?xml version='1.0' ?><!-- {text} -->");
+            assert!(matches!(
+                validate_dump_output("/dev/stdout", true, &header_only, ""),
+                Err(WayboundError::Transient { .. })
+            ));
+            assert!(!should_try_tty_fallback(&partial, ""));
+        }
+    }
+
+    #[test]
+    fn tty_fallback_only_for_empty_or_unrecognised_output() {
+        assert!(should_try_tty_fallback("", ""));
+        assert!(should_try_tty_fallback(
+            "UI hierchary dumped to: /dev/stdout\n",
+            ""
+        ));
+        assert!(should_try_tty_fallback("Killed\n", ""));
+        // A known transient failure would just wait for idle again on /dev/tty.
+        assert!(!should_try_tty_fallback(IDLE_STATE, ""));
+        assert!(!should_try_tty_fallback("", NULL_ROOT));
+        // Fatal failures cannot heal.
+        assert!(!should_try_tty_fallback("", "error: device offline"));
+    }
+
+    #[test]
+    fn snapshot_budget_is_capped_by_the_callers_remaining_wait() {
+        assert_eq!(snapshot_retry_budget(None), SNAPSHOT_RETRY_BUDGET);
+        assert_eq!(
+            snapshot_retry_budget(Some(Duration::from_secs(60))),
+            SNAPSHOT_RETRY_BUDGET
+        );
+        assert_eq!(
+            snapshot_retry_budget(Some(Duration::from_millis(1_500))),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(snapshot_retry_budget(Some(Duration::ZERO)), Duration::ZERO);
+    }
+
+    #[test]
+    fn retry_dump_overshoots_the_callers_deadline_by_at_most_one_attempt() {
+        // Each dump attempt costs 1 s of (fake) time, like a slow uiautomator dump.
+        let attempt_cost = Duration::from_secs(1);
+        for remaining in [
+            Duration::ZERO,
+            Duration::from_millis(1_500),
+            Duration::from_secs(60),
+        ] {
+            let clock = FakeClock::new();
+            let mut calls = 0;
+            let result = retry_dump(&clock, snapshot_retry_budget(Some(remaining)), || {
+                calls += 1;
+                clock.sleep(attempt_cost);
+                Err(transient(IDLE_STATE))
+            });
+            assert!(
+                matches!(&result, Err(WayboundError::Transient { reason, .. })
+                    if reason.contains(&format!("after {calls} attempts")) && reason.contains("idle state")),
+                "{result:?}"
+            );
+            let cap = remaining.min(SNAPSHOT_RETRY_BUDGET);
+            assert!(
+                clock.elapsed.get() <= cap + attempt_cost,
+                "{remaining:?}: {:?}",
+                clock.elapsed.get()
+            );
+            assert!(calls >= 1);
+        }
+
+        // No caller deadline: bounded by SNAPSHOT_RETRY_BUDGET (3 s) plus one attempt.
+        let clock = FakeClock::new();
+        let result = retry_dump(&clock, snapshot_retry_budget(None), || {
+            clock.sleep(attempt_cost);
+            Err(transient(IDLE_STATE))
+        });
+        assert!(result.is_err());
+        assert!(clock.elapsed.get() <= SNAPSHOT_RETRY_BUDGET + attempt_cost);
+
+        // Success after two transient failures.
+        let clock = FakeClock::new();
+        let mut calls = 0;
+        let ok = retry_dump(&clock, SNAPSHOT_RETRY_BUDGET, || {
+            calls += 1;
+            if calls < 3 {
+                Err(transient(NULL_ROOT))
+            } else {
+                Ok(COMPLETE_DUMP.to_owned())
+            }
+        });
+        assert_eq!(ok.ok().as_deref(), Some(COMPLETE_DUMP));
+    }
+
+    #[test]
+    fn persistent_already_registered_becomes_a_clear_fatal_error() {
+        let clock = FakeClock::new();
+        let mut calls = 0;
+        let result = retry_dump(&clock, Duration::from_secs(60), || {
+            calls += 1;
+            Err(transient(ALREADY_REGISTERED))
+        });
+        assert_eq!(calls, MAX_ALREADY_REGISTERED);
+        assert!(
+            matches!(&result, Err(WayboundError::BackendUnavailable { reason, .. })
+                if reason.contains("another UiAutomation client")),
+            "{result:?}"
+        );
+
+        // Interleaved with other transient failures the counter resets, so it keeps retrying.
+        let clock = FakeClock::new();
+        let mut calls = 0;
+        let ok = retry_dump(&clock, Duration::from_secs(60), || {
+            calls += 1;
+            match calls {
+                1 | 2 | 4 | 5 => Err(transient(ALREADY_REGISTERED)),
+                3 => Err(transient(IDLE_STATE)),
+                _ => Ok(COMPLETE_DUMP.to_owned()),
+            }
+        });
+        assert!(ok.is_ok(), "{ok:?}");
+        assert_eq!(calls, 6);
+    }
+
+    #[test]
+    fn probe_output_failures_are_transient_unless_fatal() {
+        assert_eq!(
+            parse_probe_output(true, "33\n", "").ok(),
+            Some(ChordSupport::KeyCombination)
+        );
+        assert_eq!(
+            parse_probe_output(true, "32\n", "").ok(),
+            Some(ChordSupport::ShiftLettersOnly { sdk: 32 })
+        );
+        assert!(matches!(
+            parse_probe_output(true, "", ""),
+            Err(WayboundError::Transient { .. })
+        ));
+        assert!(matches!(
+            parse_probe_output(false, "", "error: closed"),
+            Err(WayboundError::Transient { .. })
+        ));
+        assert!(matches!(
+            parse_probe_output(false, "", "error: device offline"),
+            Err(WayboundError::BackendUnavailable { .. })
+        ));
     }
 }
