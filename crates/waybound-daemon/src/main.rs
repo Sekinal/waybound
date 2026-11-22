@@ -62,6 +62,7 @@ struct CliArgs {
     block_presets: Vec<String>,
     timezone: Option<String>,
     locale: Option<String>,
+    password_store: Option<String>,
     focus: bool,
     no_motion: bool,
     replay: bool,
@@ -74,6 +75,17 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 
 fn parse_args() -> Result<CliArgs, String> {
     parse_args_from(env::args().skip(1))
+}
+
+fn password_store_arg(val: String) -> Result<String, String> {
+    if launcher::PASSWORD_STORES.contains(&val.as_str()) {
+        Ok(val)
+    } else {
+        Err(format!(
+            "invalid --password-store value: {val} (expected one of {:?})",
+            launcher::PASSWORD_STORES
+        ))
+    }
 }
 
 fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> {
@@ -99,6 +111,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, St
         block_presets: Vec::new(),
         timezone: None,
         locale: None,
+        password_store: None,
         focus: false,
         no_motion: false,
         replay: false,
@@ -157,6 +170,12 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, St
                 .push(next_arg(&mut args, "--block-preset")?),
             "--timezone" => cli.timezone = Some(next_arg(&mut args, "--timezone")?),
             "--locale" => cli.locale = Some(next_arg(&mut args, "--locale")?),
+            "--password-store" => {
+                cli.password_store = Some(password_store_arg(next_arg(
+                    &mut args,
+                    "--password-store",
+                )?)?);
+            }
             "--focus" => cli.focus = true,
             "--no-motion" => cli.no_motion = true,
             "--replay" => cli.replay = true,
@@ -287,6 +306,7 @@ fn launch_desktop_chrome(
         display,
         wayland_display,
         focus: cli.focus,
+        password_store: cli.password_store.clone(),
     };
     let chrome = launch_chrome(&opts).map_err(|e| e.to_string())?;
     let pid = chrome.pid();

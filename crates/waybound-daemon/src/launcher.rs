@@ -40,7 +40,22 @@ pub struct ChromeLaunchOptions {
     pub wayland_display: Option<(String, PathBuf)>,
     /// Whether to bring the launched browser window to the foreground on macOS.
     pub focus: bool,
+    /// Optional Linux `--password-store` backend (one of [`PASSWORD_STORES`]). `None` (the
+    /// default) passes no flag, so Chrome auto-detects the store exactly as before. `basic`
+    /// makes cookies use Chrome's fixed Linux key, which is what makes a profile portable
+    /// between Linux machines and containers. Chrome ignores the flag on macOS and Windows.
+    pub password_store: Option<String>,
 }
+
+/// Values Chrome accepts for `--password-store` on Linux.
+pub const PASSWORD_STORES: &[&str] = &[
+    "basic",
+    "gnome-libsecret",
+    "kwallet",
+    "kwallet5",
+    "kwallet6",
+    "detect",
+];
 
 /// RAII handle owning a spawned Google Chrome process.
 pub struct LaunchedChrome {
@@ -152,6 +167,17 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
         }
     })?;
 
+    if let Some(store) = &options.password_store
+        && !PASSWORD_STORES.contains(&store.as_str())
+    {
+        return Err(WayboundError::BackendUnavailable {
+            backend: "chrome_launcher".to_owned(),
+            reason: format!(
+                "unsupported password store {store:?} (expected one of {PASSWORD_STORES:?})"
+            ),
+        });
+    }
+
     let mut cmd = waybound_core::process::command(&binary);
     let _ = cmd
         .arg("--force-renderer-accessibility")
@@ -198,6 +224,9 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
     }
     if let Some(locale) = &options.locale {
         let _ = cmd.env("LANG", locale).env("LC_ALL", locale);
+    }
+    if let Some(store) = &options.password_store {
+        let _ = cmd.arg(format!("--password-store={store}"));
     }
     if let Some(url) = &options.initial_url {
         let _ = cmd.arg(url);
@@ -265,6 +294,7 @@ mod tests {
             focus: false,
             display: None,
             wayland_display: None,
+            password_store: None,
         }
     }
 
@@ -278,22 +308,28 @@ mod tests {
         script
     }
 
-    fn recorded_profile_dir(script: &Path) -> Option<PathBuf> {
+    fn recorded_args(script: &Path) -> Option<Vec<String>> {
         let args_file = PathBuf::from(format!("{}.args", script.display()));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Ok(args) = std::fs::read_to_string(&args_file)
-                && let Some(dir) = args
+                && args
                     .lines()
-                    .find_map(|line| line.strip_prefix("--user-data-dir="))
+                    .any(|line| line.starts_with("--user-data-dir="))
             {
-                return Some(PathBuf::from(dir));
+                return Some(args.lines().map(str::to_owned).collect());
             }
             if Instant::now() >= deadline {
                 return None;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn recorded_profile_dir(script: &Path) -> Option<PathBuf> {
+        recorded_args(script)?
+            .iter()
+            .find_map(|line| line.strip_prefix("--user-data-dir=").map(PathBuf::from))
     }
 
     #[test]
@@ -390,6 +426,35 @@ mod tests {
         );
 
         drop(launched);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn password_store_flag_is_absent_by_default_and_passed_when_set() {
+        let scratch = create_temp_profile_dir().unwrap_or_default();
+        assert!(scratch.is_dir(), "could not create scratch dir");
+
+        let default_script = fake_browser(&scratch);
+        let launched = launch_chrome(&options(&default_script, Some(scratch.join("p1"))));
+        assert!(launched.is_ok());
+        let args = recorded_args(&default_script).unwrap_or_default();
+        assert!(!args.is_empty(), "browser arguments were not recorded");
+        assert!(!args.iter().any(|a| a.starts_with("--password-store")));
+        drop(launched);
+
+        let basic_dir = scratch.join("basic");
+        assert!(std::fs::create_dir_all(&basic_dir).is_ok());
+        let basic_script = fake_browser(&basic_dir);
+        let mut opts = options(&basic_script, Some(scratch.join("p2")));
+        opts.password_store = Some("basic".to_owned());
+        let launched = launch_chrome(&opts);
+        assert!(launched.is_ok());
+        let args = recorded_args(&basic_script).unwrap_or_default();
+        assert!(args.iter().any(|a| a == "--password-store=basic"));
+        drop(launched);
+
+        opts.password_store = Some("plaintext; rm -rf".to_owned());
+        assert!(launch_chrome(&opts).is_err());
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
