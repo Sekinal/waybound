@@ -40,6 +40,10 @@ pub enum Request {
         query: LocatorQuery,
     },
     /// Locate an element matching `query` and double-click its center.
+    ///
+    /// The wire name is `dbl_click`; `dblclick` is accepted as an alias because the
+    /// Python SDK up to v0.4.0 sent that spelling.
+    #[serde(alias = "dblclick")]
     DblClick {
         /// Semantic locator query.
         query: LocatorQuery,
@@ -206,6 +210,22 @@ mod tests {
             if let Ok(parsed) = decoded {
                 assert_eq!(parsed, req);
             }
+        }
+    }
+
+    #[test]
+    fn dbl_click_accepts_canonical_and_legacy_method_names() {
+        let expected = Request::DblClick {
+            query: LocatorQuery::by_role(Role::Button, Some("Search".to_owned())),
+        };
+        let encoded = serde_json::to_value(&expected).unwrap_or_default();
+        assert_eq!(encoded["method"], "dbl_click");
+
+        for method in ["dbl_click", "dblclick"] {
+            let mut legacy = encoded.clone();
+            legacy["method"] = serde_json::Value::String(method.to_owned());
+            let decoded: Result<Request, _> = serde_json::from_value(legacy);
+            assert_eq!(decoded.ok(), Some(expected.clone()), "method {method}");
         }
     }
 }
