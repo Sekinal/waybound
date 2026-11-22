@@ -13,7 +13,7 @@ import urllib.request
 from pathlib import Path
 
 DEFAULT_REPO = "Sekinal/waybound"
-DEFAULT_VERSION = "v0.2.0"
+DEFAULT_VERSION = "v0.2.1"
 _SAFE_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _SAFE_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
