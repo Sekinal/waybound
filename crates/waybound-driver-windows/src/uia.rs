@@ -3,6 +3,9 @@
 use serde::Deserialize;
 use waybound_core::{AccessibilityNode, Bounds, Result, Role, WayboundError};
 
+/// Prefix of the positional ids used when an element has no UIA runtime id.
+pub const POSITIONAL_ID_PREFIX: &str = "uia-pos-";
+
 /// Maximum number of accessibility nodes accepted from a single UIA tree snapshot.
 pub const MAX_NODES: usize = 4_000;
 
@@ -111,6 +114,47 @@ struct RawUiaNode {
     height: f64,
     #[serde(default)]
     focused: bool,
+    /// `TogglePattern.ToggleState` (`0` off, `1` on, `2` indeterminate), if supported.
+    #[serde(default)]
+    toggle_state: Option<i64>,
+    /// `SelectionItemPattern.IsSelected` (radio buttons), if supported.
+    #[serde(default)]
+    selected: Option<bool>,
+    /// `AutomationElement.IsEnabled`; a missing value means enabled.
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// `ExpandCollapsePattern.ExpandCollapseState`
+    /// (`0` collapsed, `1` expanded, `2` partially expanded, `3` leaf), if supported.
+    #[serde(default)]
+    expand_state: Option<i64>,
+}
+
+/// Derives the checked state from UIA patterns for checkable roles.
+///
+/// Checkboxes and switches use `TogglePattern` (indeterminate maps to `Some(false)`); radio
+/// buttons use `SelectionItemPattern.IsSelected` and fall back to `TogglePattern`.
+#[must_use]
+pub fn uia_checked(role: Role, toggle_state: Option<i64>, selected: Option<bool>) -> Option<bool> {
+    let from_toggle = toggle_state.and_then(|state| match state {
+        1 => Some(true),
+        0 | 2 => Some(false),
+        _ => None,
+    });
+    match role {
+        Role::CheckBox | Role::Switch | Role::MenuItem => from_toggle,
+        Role::Radio => selected.or(from_toggle),
+        _ => None,
+    }
+}
+
+/// Maps `ExpandCollapseState` to the expanded state (`LeafNode` and unknown values are `None`).
+#[must_use]
+pub const fn uia_expanded(expand_state: Option<i64>) -> Option<bool> {
+    match expand_state {
+        Some(0) => Some(false),
+        Some(1 | 2) => Some(true),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,7 +227,8 @@ pub fn parse_uia_snapshot_json(raw: &str) -> Result<UiaSnapshot> {
             inferred_viewport = Some(bounds);
         }
 
-        let id = normalize_non_empty(raw_node.id).unwrap_or_else(|| format!("uia-{idx}"));
+        let id = normalize_non_empty(raw_node.id)
+            .unwrap_or_else(|| format!("{POSITIONAL_ID_PREFIX}{idx}"));
 
         nodes.push(AccessibilityNode {
             id,
@@ -192,6 +237,9 @@ pub fn parse_uia_snapshot_json(raw: &str) -> Result<UiaSnapshot> {
             value: normalize_non_empty(raw_node.value),
             bounds,
             focused: raw_node.focused,
+            checked: uia_checked(role, raw_node.toggle_state, raw_node.selected),
+            disabled: raw_node.enabled == Some(false),
+            expanded: uia_expanded(raw_node.expand_state),
         });
     }
 
@@ -334,8 +382,38 @@ while ($queue.Count -gt 0 -and $nodes.Count -lt $maxNodes) {
             }
         } catch {}
 
+        # Probe state patterns only on control types that can carry them: each
+        # TryGetCurrentPattern is a cross-process call.
+        $toggleState = $null
+        if ($ct -eq 'ControlType.CheckBox' -or $ct -eq 'ControlType.RadioButton' -or $ct -eq 'ControlType.Button' -or $ct -eq 'ControlType.MenuItem') {
+            try {
+                $tp = $null
+                if ($el.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$tp)) {
+                    $toggleState = [int]$tp.Current.ToggleState
+                }
+            } catch {}
+        }
+        $selected = $null
+        if ($ct -eq 'ControlType.RadioButton') {
+            try {
+                $sp = $null
+                if ($el.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$sp)) {
+                    $selected = [bool]$sp.Current.IsSelected
+                }
+            } catch {}
+        }
+        $expandState = $null
+        if ($ct -eq 'ControlType.ComboBox' -or $ct -eq 'ControlType.Button' -or $ct -eq 'ControlType.MenuItem' -or $ct -eq 'ControlType.TreeItem' -or $ct -eq 'ControlType.Hyperlink' -or $ct -eq 'ControlType.SplitButton') {
+            try {
+                $ep = $null
+                if ($el.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$ep)) {
+                    $expandState = [int]$ep.Current.ExpandCollapseState
+                }
+            } catch {}
+        }
+
         $rid = $el.GetRuntimeId()
-        $idStr = if ($null -ne $rid) { ($rid -join '-') } else { "uia-$($nodes.Count)" }
+        $idStr = if ($null -ne $rid) { ($rid -join '-') } else { "uia-pos-$($nodes.Count)" }
 
         if ($null -eq $currentUrl -and $ct -eq 'ControlType.Edit' -and $val) {
             if (($name -and $name -match 'Address|URL') -or $val -match '^https?://') {
@@ -358,6 +436,10 @@ while ($queue.Count -gt 0 -and $nodes.Count -lt $maxNodes) {
             width = $w
             height = $h
             focused = [bool]$cur.HasKeyboardFocus
+            enabled = [bool]$cur.IsEnabled
+            toggle_state = $toggleState
+            selected = $selected
+            expand_state = $expandState
         })
 
         $child = $walker.GetFirstChild($el)
@@ -565,7 +647,7 @@ mod tests {
         assert_eq!(first.map(|n| n.focused), Some(true));
 
         let second = snapshot.nodes.get(1);
-        assert_eq!(second.map(|n| n.id.as_str()), Some("uia-1"));
+        assert_eq!(second.map(|n| n.id.as_str()), Some("uia-pos-1"));
         assert_eq!(second.map(|n| n.role), Some(Role::TextBox));
         assert_eq!(second.and_then(|n| n.value.as_deref()), Some("rust"));
         Ok(())
@@ -599,6 +681,55 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    #[test]
+    fn parses_toggle_enabled_and_expand_states() -> Result<()> {
+        let json = r#"{"nodes":[
+            {"id":"cb","control_type":"ControlType.CheckBox","name":"Agree","x":0,"y":0,"width":10,"height":10,
+             "enabled":true,"toggle_state":1,"selected":null,"expand_state":null},
+            {"id":"mixed","control_type":"ControlType.CheckBox","name":"All","x":0,"y":0,"width":10,"height":10,
+             "enabled":false,"toggle_state":2},
+            {"id":"radio","control_type":"ControlType.RadioButton","name":"Economy","x":0,"y":0,"width":10,"height":10,
+             "enabled":true,"selected":true},
+            {"id":"combo","control_type":"ControlType.ComboBox","name":"Cabin","x":0,"y":0,"width":10,"height":10,
+             "enabled":true,"expand_state":0},
+            {"id":"pressed","control_type":"ControlType.Button","name":"Bold","x":0,"y":0,"width":10,"height":10,
+             "enabled":true,"toggle_state":1,"expand_state":3},
+            {"id":"legacy","control_type":"ControlType.Button","name":"Old","x":0,"y":0,"width":10,"height":10}
+        ]}"#;
+        let snapshot = parse_uia_snapshot_json(json)?;
+        let states: Vec<(&str, Option<bool>, bool, Option<bool>)> = snapshot
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.checked, n.disabled, n.expanded))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                ("cb", Some(true), false, None),
+                ("mixed", Some(false), true, None),
+                ("radio", Some(true), false, None),
+                ("combo", None, false, Some(false)),
+                ("pressed", None, false, None),
+                ("legacy", None, false, None),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uia_state_helpers_map_pattern_values() {
+        assert_eq!(uia_checked(Role::CheckBox, Some(0), None), Some(false));
+        assert_eq!(uia_checked(Role::Switch, Some(1), None), Some(true));
+        assert_eq!(uia_checked(Role::CheckBox, None, None), None);
+        assert_eq!(uia_checked(Role::Radio, Some(0), Some(true)), Some(true));
+        assert_eq!(uia_checked(Role::Radio, Some(1), None), Some(true));
+        assert_eq!(uia_checked(Role::Button, Some(1), Some(true)), None);
+        assert_eq!(uia_expanded(Some(1)), Some(true));
+        assert_eq!(uia_expanded(Some(2)), Some(true));
+        assert_eq!(uia_expanded(Some(3)), None);
+        assert_eq!(uia_expanded(None), None);
     }
 
     #[test]

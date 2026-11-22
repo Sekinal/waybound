@@ -70,7 +70,11 @@ class Bounds:
 
 @dataclass(frozen=True, slots=True)
 class AccessibilityNode:
-    """Single node captured from the OS accessibility tree."""
+    """Single node captured from the OS accessibility tree.
+
+    `checked` and `expanded` are `None` when the state does not apply to the node. A mixed /
+    indeterminate checkbox is reported as `checked=False` (not fully checked).
+    """
 
     id: str
     role: Role
@@ -78,6 +82,9 @@ class AccessibilityNode:
     value: str | None
     bounds: Bounds
     focused: bool
+    checked: bool | None = None
+    disabled: bool = False
+    expanded: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +158,10 @@ class Transport(Protocol):
 
     def fill(self, query: LocatorQuery, text: str) -> None:
         """Focus the target element and type text via native keyboard events."""
+        ...
+
+    def set_checked(self, query: LocatorQuery, *, checked: bool) -> AccessibilityNode:
+        """Idempotently drive a checkbox/radio/switch to `checked`; return the re-read node."""
         ...
 
     def navigate(self, url: str) -> None:

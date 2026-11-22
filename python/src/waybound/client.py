@@ -98,6 +98,41 @@ class Locator:
         """Fill the resolved input element using native keyboard events."""
         self._transport.fill(self.query, text)
 
+    def check(self) -> None:
+        """Ensure the checkbox/radio/switch is checked, clicking only if it is not.
+
+        Waits for the element to appear and, if a click is needed, to become enabled. Raises
+        `WayboundDaemonError` with code `element_disabled` if it stays disabled, or
+        `invalid_element_state` if the element has no checked state or the click did not
+        check it.
+        """
+        self._transport.set_checked(self.query, checked=True)
+
+    def uncheck(self) -> None:
+        """Ensure the checkbox/switch is unchecked, clicking only if it is checked.
+
+        A mixed (indeterminate) checkbox counts as unchecked, so it is left mixed without a
+        click. Radio buttons cannot be unchecked (`invalid_element_state`); check another
+        option instead. Errors are otherwise the same as for `check()`.
+        """
+        self._transport.set_checked(self.query, checked=False)
+
+    def is_checked(self, *, timeout_ms: int = 5_000) -> bool:
+        """Return whether the element is checked (a mixed checkbox is not checked).
+
+        Raises `WayboundDaemonError` with code `invalid_element_state` if the element has
+        no checked state.
+        """
+        node = self.wait_for(timeout_ms=timeout_ms)
+        if node.checked is None:
+            msg = f"element {node.name!r} (role {node.role.value}) has no checked state"
+            raise WayboundDaemonError("invalid_element_state", msg)
+        return node.checked
+
+    def is_enabled(self, *, timeout_ms: int = 5_000) -> bool:
+        """Return `True` unless the element is disabled."""
+        return not self.wait_for(timeout_ms=timeout_ms).disabled
+
 
 class Page:
     """High-level semantic interface to a controlled browser session."""

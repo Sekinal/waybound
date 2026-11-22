@@ -107,6 +107,13 @@ pub trait Driver: Send + Sync {
         self.locate(query)
     }
 
+    /// Returns `true` when the node id `id` identifies the same UI element across snapshots
+    /// (for example a UIA runtime id), rather than being a positional index.
+    fn is_stable_node_id(&self, id: &str) -> bool {
+        let _ = id;
+        false
+    }
+
     /// Returns the URL currently loaded in the active browser tab, if available.
     ///
     /// # Errors
