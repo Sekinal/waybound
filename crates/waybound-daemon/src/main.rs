@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
 use waybound_core::Driver;
-use waybound_driver_android::AndroidDriver;
+use waybound_driver_android::{AndroidDriver, WaydroidConfig, WaydroidSession};
 use waybound_driver_macos::MacOsDriver;
 
 use crate::launcher::{ChromeLaunchOptions, launch_chrome};
@@ -27,12 +27,16 @@ use crate::net_tap::{ResponseStore, start_passive_tap};
 use crate::proxy::{ProxyForwarder, UpstreamProxy};
 use crate::server::ServerOptions;
 
+#[allow(clippy::struct_excessive_bools)]
 struct CliArgs {
     socket_path: Option<PathBuf>,
     backend: String,
     pid: Option<i32>,
     serial: Option<String>,
     launch_chrome: bool,
+    launch_waydroid: bool,
+    instance_id: Option<String>,
+    adb_port: Option<u16>,
     profile_dir: Option<PathBuf>,
     ssl_keylog_file: Option<PathBuf>,
     initial_url: Option<String>,
@@ -55,6 +59,9 @@ fn parse_args() -> Result<CliArgs, String> {
         pid: None,
         serial: None,
         launch_chrome: false,
+        launch_waydroid: false,
+        instance_id: None,
+        adb_port: None,
         profile_dir: None,
         ssl_keylog_file: None,
         initial_url: None,
@@ -82,6 +89,15 @@ fn parse_args() -> Result<CliArgs, String> {
             }
             "--serial" => cli.serial = Some(next_arg(&mut args, "--serial")?),
             "--launch-chrome" => cli.launch_chrome = true,
+            "--launch-waydroid" => cli.launch_waydroid = true,
+            "--instance-id" => cli.instance_id = Some(next_arg(&mut args, "--instance-id")?),
+            "--adb-port" => {
+                let val = next_arg(&mut args, "--adb-port")?;
+                let parsed = val
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid --adb-port value: {val}"))?;
+                cli.adb_port = Some(parsed);
+            }
             "--profile-dir" => {
                 cli.profile_dir = Some(PathBuf::from(next_arg(&mut args, "--profile-dir")?));
             }
@@ -125,18 +141,52 @@ type BackendBundle = (
     bool,
     Option<launcher::LaunchedChrome>,
     Option<ProxyForwarder>,
+    Option<WaydroidSession>,
 );
 
 fn build_backend(cli: CliArgs) -> Result<BackendBundle, String> {
     match cli.backend.as_str() {
-        "mock" => Ok((Arc::new(MockDriver::sample_page()), false, None, None)),
+        "mock" => Ok((Arc::new(MockDriver::sample_page()), false, None, None, None)),
         "android" => {
-            let android = AndroidDriver::new(cli.serial);
+            let (serial, waydroid_session, proxy_fwd) = if cli.launch_waydroid {
+                let (local_proxy, fwd) = setup_proxy(cli.proxy)?;
+                let android_proxy = local_proxy.map(|p| {
+                    p.strip_prefix("http://")
+                        .map_or_else(|| p.clone(), ToOwned::to_owned)
+                });
+                let instance_id = cli
+                    .instance_id
+                    .unwrap_or_else(|| format!("wb-{}", std::process::id()));
+                let data_dir = cli
+                    .profile_dir
+                    .unwrap_or_else(|| PathBuf::from(format!("/tmp/waybound-wd-{instance_id}")));
+                let wd_cfg = WaydroidConfig {
+                    instance_id,
+                    data_dir,
+                    adb_port: cli.adb_port.unwrap_or(5555),
+                    headless: true,
+                    android_http_proxy: android_proxy,
+                    timezone: cli.timezone,
+                };
+                let session = WaydroidSession::start(wd_cfg).map_err(|e| e.to_string())?;
+                let s = session.serial();
+                (Some(s), Some(session), fwd)
+            } else {
+                (cli.serial, None, None)
+            };
+
+            let android = AndroidDriver::new(serial);
             if let Some(url) = &cli.initial_url {
                 android.open_url(url).map_err(|e| e.to_string())?;
             }
             tracing::info!(serial = ?android.serial(), "starting android/waydroid driver");
-            Ok((Arc::new(android), !cli.no_motion, None, None))
+            Ok((
+                Arc::new(android),
+                !cli.no_motion,
+                None,
+                proxy_fwd,
+                waydroid_session,
+            ))
         }
         "macos" => {
             let (target_pid, launched, fwd) = if cli.launch_chrome {
@@ -167,6 +217,7 @@ fn build_backend(cli: CliArgs) -> Result<BackendBundle, String> {
                 !cli.no_motion,
                 launched,
                 fwd,
+                None,
             ))
         }
         other => Err(format!(
@@ -213,7 +264,7 @@ fn main() -> ExitCode {
         }
     });
 
-    let (driver, use_motion, _launched, _proxy_forwarder) = match build_backend(cli) {
+    let (driver, use_motion, _launched, _proxy_forwarder, _waydroid) = match build_backend(cli) {
         Ok(bundle) => bundle,
         Err(msg) => {
             tracing::error!(error = %msg, "failed to initialize backend");

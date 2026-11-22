@@ -2,7 +2,10 @@
 //! via ADB (`uiautomator dump`, `input`, `screencap`, and `am start`).
 
 pub mod adb;
+pub mod waydroid;
 pub mod xml;
+
+pub use waydroid::{WaydroidConfig, WaydroidSession};
 
 use std::path::Path;
 use std::sync::Mutex;

@@ -30,6 +30,9 @@ class LaunchOptions:
     pid: int | None = None
     serial: str | None = None
     launch_chrome: bool = False
+    launch_waydroid: bool = False
+    instance_id: str | None = None
+    adb_port: int | None = None
     url: str | None = None
     profile_dir: Path | str | None = None
     ssl_keylog: Path | str | None = None
@@ -109,6 +112,8 @@ class Session:
         pairs: tuple[tuple[str, str | None], ...] = (
             ("--pid", str(opts.pid) if opts.pid is not None else None),
             ("--serial", opts.serial),
+            ("--instance-id", opts.instance_id),
+            ("--adb-port", str(opts.adb_port) if opts.adb_port is not None else None),
             ("--url", opts.url),
             (
                 "--profile-dir",
@@ -123,6 +128,8 @@ class Session:
                 cmd.extend([flag, val])
         if opts.launch_chrome:
             cmd.append("--launch-chrome")
+        if opts.launch_waydroid:
+            cmd.append("--launch-waydroid")
         if opts.focus:
             cmd.append("--focus")
         if opts.no_motion:
