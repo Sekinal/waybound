@@ -114,10 +114,13 @@ impl Driver for MacOsDriver {
         #[cfg(target_os = "macos")]
         {
             // Clicks and keystrokes go to the frontmost application, so make sure that is
-            // the target browser before sending either.
+            // the target browser before sending either. A drag's press counts too, but never
+            // its release: a focus failure must not stop a held button from being let go.
             if matches!(
                 event,
-                InputEvent::KeyPress { .. } | InputEvent::MouseClick { .. }
+                InputEvent::KeyPress { .. }
+                    | InputEvent::MouseClick { .. }
+                    | InputEvent::MouseDown { .. }
             ) {
                 ax::ensure_frontmost(self.pid)?;
             }

@@ -232,6 +232,15 @@ pub mod win32_input {
         }
     }
 
+    /// Returns the `(down, up)` `MOUSEEVENTF_*` flags for `button`.
+    const fn button_flags(button: MouseButton) -> (u32, u32) {
+        match button {
+            MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+            MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+            MouseButton::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+        }
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     fn scroll_delta_to_dword(delta: f64) -> u32 {
         if !delta.is_finite() {
@@ -264,7 +273,9 @@ pub mod win32_input {
         tracing::debug!(?event, "dispatching Win32 input event");
 
         match event {
-            InputEvent::PointerMove { to } => {
+            // Windows tracks the held button itself and reports moves as drags (`WM_MOUSEMOVE`
+            // with `MK_LBUTTON`), so a drag step is an ordinary absolute move.
+            InputEvent::PointerMove { to } | InputEvent::PointerDrag { to, .. } => {
                 // SAFETY: `GetSystemMetrics` is a pure Win32 query accepting integer metric IDs.
                 let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
                 // SAFETY: `GetSystemMetrics` is a pure Win32 query accepting integer metric IDs.
@@ -279,12 +290,16 @@ pub mod win32_input {
                     MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
                 )])
             }
+            InputEvent::MouseDown { button } => {
+                let (down_flag, _) = button_flags(*button);
+                send_inputs(&[mouse_input(0, 0, 0, down_flag)])
+            }
+            InputEvent::MouseUp { button } => {
+                let (_, up_flag) = button_flags(*button);
+                send_inputs(&[mouse_input(0, 0, 0, up_flag)])
+            }
             InputEvent::MouseClick { button, hold_ms } => {
-                let (down_flag, up_flag) = match button {
-                    MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
-                    MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
-                    MouseButton::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
-                };
+                let (down_flag, up_flag) = button_flags(*button);
 
                 send_inputs(&[mouse_input(0, 0, 0, down_flag)])?;
                 if *hold_ms > 0 {

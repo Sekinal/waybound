@@ -208,3 +208,9 @@ class Transport(Protocol):
     def screenshot(self, path: str) -> None:
         """Capture a native OS PNG screenshot of the browser window to `path`."""
         ...
+
+    def drag_to(
+        self, source: LocatorQuery, target: LocatorQuery, *, timeout_ms: int = 5_000
+    ) -> None:
+        """Press on `source`, drag along a native pointer path to `target`, and release."""
+        ...

@@ -17,6 +17,10 @@ const ADB_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Default swipe origin used when scrolling before any `PointerMove` has been dispatched.
 const DEFAULT_SCROLL_ORIGIN: Point = Point { x: 540.0, y: 960.0 };
 const SCROLL_SWIPE_DURATION_MS: u64 = 250;
+/// Shortest touch drag gesture; `input swipe` with a tiny duration reads as a fling.
+const MIN_DRAG_DURATION_MS: u64 = 300;
+/// Longest touch drag gesture, bounded well below [`ADB_TIMEOUT`].
+const MAX_DRAG_DURATION_MS: u64 = 10_000;
 
 /// Android `KeyEvent` keycodes for non-character keys.
 const KEYCODE_ENTER: u32 = 66;
@@ -61,10 +65,25 @@ pub fn dump_ui_xml(serial: Option<&str>) -> Result<String> {
     })
 }
 
+/// A touch drag that has been pressed but not yet released.
+///
+/// `adb shell input` cannot hold a finger down across separate commands, so a
+/// [`InputEvent::MouseDown`] only records where and when the gesture started; the
+/// matching [`InputEvent::MouseUp`] then emits the whole drag as a single `input swipe`
+/// from that point to the last [`InputEvent::PointerDrag`] position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PendingDrag {
+    /// Where the finger went down.
+    pub from: Point,
+    /// When the press was recorded.
+    pub pressed_at: Instant,
+}
+
 /// Dispatches a platform-agnostic [`InputEvent`] to an Android device via `adb shell input`.
 ///
 /// Tracks `last_cursor` across [`InputEvent::PointerMove`], [`InputEvent::MouseClick`],
-/// and [`InputEvent::Scroll`] events.
+/// and [`InputEvent::Scroll`] events, and buffers press / drag / release sequences in
+/// `pending_drag` (see [`PendingDrag`]).
 ///
 /// # Errors
 ///
@@ -73,8 +92,30 @@ pub fn dispatch_input(
     serial: Option<&str>,
     event: &InputEvent,
     last_cursor: &mut Point,
+    pending_drag: &mut Option<PendingDrag>,
 ) -> Result<()> {
-    let Some(shell_args) = build_input_shell_args(event, last_cursor) else {
+    let shell_args = match event {
+        InputEvent::MouseDown { .. } => {
+            *pending_drag = Some(PendingDrag {
+                from: *last_cursor,
+                pressed_at: Instant::now(),
+            });
+            None
+        }
+        InputEvent::MouseUp { .. } => {
+            let swipe = pending_drag.take().map(|drag| {
+                let held_ms = u64::try_from(drag.pressed_at.elapsed().as_millis()).unwrap_or(0);
+                build_drag_swipe_args(drag.from, *last_cursor, held_ms)
+            });
+            if swipe.is_none() {
+                // No finger is down on the device, so there is nothing to lift.
+                debug!("ignoring adb release without a pending press");
+            }
+            swipe
+        }
+        other => build_input_shell_args(other, last_cursor),
+    };
+    let Some(shell_args) = shell_args else {
         return Ok(());
     };
 
@@ -143,16 +184,37 @@ pub fn build_adb_args(serial: Option<&str>, subcommand: &[&str]) -> Vec<String> 
     args
 }
 
+/// Builds the `adb shell input swipe` arguments for a touch drag from `from` to `to`
+/// lasting `duration_ms` (clamped to a range Chrome reads as a drag, not a fling).
+#[must_use]
+pub fn build_drag_swipe_args(from: Point, to: Point, duration_ms: u64) -> Vec<String> {
+    vec![
+        "shell".to_owned(),
+        "input".to_owned(),
+        "swipe".to_owned(),
+        coord_to_i32(from.x).to_string(),
+        coord_to_i32(from.y).to_string(),
+        coord_to_i32(to.x).to_string(),
+        coord_to_i32(to.y).to_string(),
+        duration_ms
+            .clamp(MIN_DRAG_DURATION_MS, MAX_DRAG_DURATION_MS)
+            .to_string(),
+    ]
+}
+
 /// Builds the `adb shell input ...` arguments for an [`InputEvent`], updating `last_cursor`.
 ///
-/// Returns `None` for events that only update local pointer state (such as `PointerMove`).
+/// Returns `None` for events that only update local pointer state (such as `PointerMove`
+/// and `PointerDrag`). [`InputEvent::MouseDown`] and [`InputEvent::MouseUp`] also return
+/// `None` here: [`dispatch_input`] turns a press / release pair into one swipe.
 #[must_use]
 pub fn build_input_shell_args(event: &InputEvent, last_cursor: &mut Point) -> Option<Vec<String>> {
     match event {
-        InputEvent::PointerMove { to } => {
+        InputEvent::PointerMove { to } | InputEvent::PointerDrag { to, .. } => {
             *last_cursor = *to;
             None
         }
+        InputEvent::MouseDown { .. } | InputEvent::MouseUp { .. } => None,
         InputEvent::MouseClick { button: _, hold_ms } => {
             let x = coord_to_i32(last_cursor.x);
             let y = coord_to_i32(last_cursor.y);
@@ -531,6 +593,65 @@ mod tests {
                 "250".to_owned(),
             ])
         );
+    }
+
+    #[test]
+    fn build_drag_swipe_args_clamps_duration() {
+        let from = Point { x: 100.4, y: 200.6 };
+        let to = Point { x: 300.0, y: 50.0 };
+        assert_eq!(
+            build_drag_swipe_args(from, to, 850),
+            vec!["shell", "input", "swipe", "100", "201", "300", "50", "850"]
+        );
+        assert_eq!(build_drag_swipe_args(from, to, 5)[7], "300");
+        assert_eq!(build_drag_swipe_args(from, to, 120_000)[7], "10000");
+    }
+
+    #[test]
+    fn press_drag_and_release_buffer_without_invoking_adb() {
+        let mut cursor = Point { x: 10.0, y: 20.0 };
+        let mut pending = None;
+
+        // A release with nothing pressed has nothing to send.
+        assert!(
+            dispatch_input(
+                None,
+                &InputEvent::MouseUp {
+                    button: MouseButton::Left,
+                },
+                &mut cursor,
+                &mut pending,
+            )
+            .is_ok()
+        );
+
+        assert!(
+            dispatch_input(
+                None,
+                &InputEvent::MouseDown {
+                    button: MouseButton::Left,
+                },
+                &mut cursor,
+                &mut pending,
+            )
+            .is_ok()
+        );
+        assert_eq!(pending.map(|d| d.from), Some(Point { x: 10.0, y: 20.0 }));
+
+        assert!(
+            dispatch_input(
+                None,
+                &InputEvent::PointerDrag {
+                    to: Point { x: 90.0, y: 40.0 },
+                    button: MouseButton::Left,
+                },
+                &mut cursor,
+                &mut pending,
+            )
+            .is_ok()
+        );
+        assert_eq!(cursor, Point { x: 90.0, y: 40.0 });
+        assert!(pending.is_some());
     }
 
     #[test]

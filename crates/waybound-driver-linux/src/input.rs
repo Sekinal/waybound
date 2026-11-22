@@ -108,10 +108,20 @@ fn xdotool_keysym(ch: char) -> String {
 #[must_use]
 pub fn build_xdotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
     match event {
-        InputEvent::PointerMove { to } => vec![vec![
+        // `xdotool mousemove` goes through XTEST, which tracks held buttons itself, so a
+        // move during a drag needs no special form.
+        InputEvent::PointerMove { to } | InputEvent::PointerDrag { to, .. } => vec![vec![
             "mousemove".to_owned(),
             format_coord(to.x),
             format_coord(to.y),
+        ]],
+        InputEvent::MouseDown { button } => vec![vec![
+            "mousedown".to_owned(),
+            xdotool_button(*button).to_owned(),
+        ]],
+        InputEvent::MouseUp { button } => vec![vec![
+            "mouseup".to_owned(),
+            xdotool_button(*button).to_owned(),
         ]],
         InputEvent::MouseClick { button, hold_ms } => {
             let btn = xdotool_button(*button).to_owned();
@@ -276,11 +286,21 @@ const fn linux_char_keycode(ch: char) -> Option<u16> {
     }
 }
 
+/// Builds a `ydotool click` that only presses (`down`) or only releases `button`.
+fn ydotool_button_command(button: MouseButton, down: bool) -> Vec<String> {
+    let (_, down_code, up_code) = ydotool_button_codes(button);
+    let code = if down { down_code } else { up_code };
+    vec!["click".to_owned(), code.to_owned()]
+}
+
 /// Builds the sequence of `ydotool` argument vectors for an [`InputEvent`].
 #[must_use]
 pub fn build_ydotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
     match event {
-        InputEvent::PointerMove { to } => vec![vec![
+        InputEvent::MouseDown { button } => vec![ydotool_button_command(*button, true)],
+        InputEvent::MouseUp { button } => vec![ydotool_button_command(*button, false)],
+        // uinput keeps the button state, so a move while it is held is already a drag.
+        InputEvent::PointerMove { to } | InputEvent::PointerDrag { to, .. } => vec![vec![
             "mousemove".to_owned(),
             "--absolute".to_owned(),
             "-x".to_owned(),
@@ -646,6 +666,40 @@ mod tests {
                 hold_ms: 0,
             }),
             vec![vec!["type", "--key-delay", "0", "--", "z"]]
+        );
+    }
+
+    #[test]
+    fn builds_press_drag_and_release_commands() {
+        let down = InputEvent::MouseDown {
+            button: MouseButton::Left,
+        };
+        let drag = InputEvent::PointerDrag {
+            to: Point { x: 410.4, y: 88.6 },
+            button: MouseButton::Left,
+        };
+        let up = InputEvent::MouseUp {
+            button: MouseButton::Left,
+        };
+
+        assert_eq!(build_xdotool_commands(&down), vec![vec!["mousedown", "1"]]);
+        assert_eq!(
+            build_xdotool_commands(&drag),
+            vec![vec!["mousemove", "410", "89"]]
+        );
+        assert_eq!(build_xdotool_commands(&up), vec![vec!["mouseup", "1"]]);
+
+        assert_eq!(build_ydotool_commands(&down), vec![vec!["click", "0x40"]]);
+        assert_eq!(
+            build_ydotool_commands(&drag),
+            vec![vec!["mousemove", "--absolute", "-x", "410", "-y", "89"]]
+        );
+        assert_eq!(build_ydotool_commands(&up), vec![vec!["click", "0x80"]]);
+        assert_eq!(
+            build_ydotool_commands(&InputEvent::MouseUp {
+                button: MouseButton::Right,
+            }),
+            vec![vec!["click", "0x81"]]
         );
     }
 

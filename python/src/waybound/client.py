@@ -98,6 +98,14 @@ class Locator:
         """Fill the resolved input element using native keyboard events."""
         self._transport.fill(self.query, text)
 
+    def drag_to(self, target: Locator, *, timeout_ms: int = 5_000) -> None:
+        """Drag this element onto `target` with a native press, pointer path, and release.
+
+        Waits up to `timeout_ms` for each of the two elements to appear. The mouse button
+        is always released, even when the drag fails part-way.
+        """
+        self._transport.drag_to(self.query, target.query, timeout_ms=timeout_ms)
+
 
 class Page:
     """High-level semantic interface to a controlled browser session."""

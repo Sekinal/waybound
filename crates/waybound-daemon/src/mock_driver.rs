@@ -21,6 +21,9 @@ const ONE_BY_ONE_PNG: &[u8] = &[
 pub struct MockDriver {
     nodes: Vec<AccessibilityNode>,
     events: Mutex<Vec<InputEvent>>,
+    /// When set, the `n`-th (0-based) [`InputEvent::PointerDrag`] fails instead of being
+    /// recorded, to exercise cleanup paths in the middle of a drag.
+    fail_drag_at: Option<usize>,
 }
 
 impl MockDriver {
@@ -57,6 +60,17 @@ impl MockDriver {
                 },
             ],
             events: Mutex::new(Vec::new()),
+            fail_drag_at: None,
+        }
+    }
+
+    /// Returns a sample-page driver whose `n`-th (0-based) pointer drag step fails.
+    #[cfg(test)]
+    #[must_use]
+    pub fn failing_drag_at(n: usize) -> Self {
+        Self {
+            fail_drag_at: Some(n),
+            ..Self::sample_page()
         }
     }
 
@@ -88,6 +102,18 @@ impl Driver for MockDriver {
 
     fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
         if let Ok(mut guard) = self.events.lock() {
+            if let (InputEvent::PointerDrag { .. }, Some(fail_at)) = (event, self.fail_drag_at) {
+                let drags_so_far = guard
+                    .iter()
+                    .filter(|e| matches!(e, InputEvent::PointerDrag { .. }))
+                    .count();
+                if drags_so_far == fail_at {
+                    return Err(WayboundError::BackendUnavailable {
+                        backend: "mock".to_owned(),
+                        reason: format!("injected failure on pointer drag step {fail_at}"),
+                    });
+                }
+            }
             guard.push(event.clone());
         }
         Ok(())

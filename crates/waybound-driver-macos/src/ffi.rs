@@ -83,10 +83,16 @@ pub enum CgEventType {
     RightMouseUp = 4,
     /// `kCGEventMouseMoved`
     MouseMoved = 5,
+    /// `kCGEventLeftMouseDragged`
+    LeftMouseDragged = 6,
+    /// `kCGEventRightMouseDragged`
+    RightMouseDragged = 7,
     /// `kCGEventOtherMouseDown`
     OtherMouseDown = 25,
     /// `kCGEventOtherMouseUp`
     OtherMouseUp = 26,
+    /// `kCGEventOtherMouseDragged`
+    OtherMouseDragged = 27,
 }
 
 /// CoreGraphics mouse buttons.

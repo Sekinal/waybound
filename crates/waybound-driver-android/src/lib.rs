@@ -19,6 +19,7 @@ use waybound_core::{
 pub struct AndroidDriver {
     serial: Option<String>,
     cursor: Mutex<Point>,
+    pending_drag: Mutex<Option<adb::PendingDrag>>,
 }
 
 impl AndroidDriver {
@@ -31,6 +32,7 @@ impl AndroidDriver {
         Self {
             serial,
             cursor: Mutex::new(Point { x: 0.0, y: 0.0 }),
+            pending_drag: Mutex::new(None),
         }
     }
 
@@ -83,7 +85,13 @@ impl Driver for AndroidDriver {
                 backend: "android_waydroid".to_owned(),
                 reason: "cursor state mutex poisoned".to_owned(),
             })?;
-        adb::dispatch_input(self.serial.as_deref(), event, &mut guard)
+        // A poisoned drag state only means an earlier dispatch panicked; the buffered press
+        // is still valid, and refusing here would leave a release unsent.
+        let mut pending = self
+            .pending_drag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        adb::dispatch_input(self.serial.as_deref(), event, &mut guard, &mut pending)
     }
 }
 

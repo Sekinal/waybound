@@ -42,6 +42,8 @@ _NAMED_KEYS = frozenset(
 )
 # The daemon paces typing at up to ~180 ms per key; allow headroom on top of the base timeout.
 _FILL_SECONDS_PER_CHAR = 0.25
+# A drag waits up to `timeout_ms` for each of its two elements before moving.
+_DRAG_WAITED_ELEMENTS = 2
 
 
 class WayboundDaemonError(RuntimeError):
@@ -327,6 +329,23 @@ class UnixSocketTransport:
                 "modifiers": [m.value for m in modifiers],
             },
             "press",
+        )
+
+    def drag_to(
+        self, source: LocatorQuery, target: LocatorQuery, *, timeout_ms: int = 5_000
+    ) -> None:
+        """Press on `source`, drag along a native pointer path to `target`, and release."""
+        clamped_ms = max(0, timeout_ms)
+        self._expect_ok(
+            {
+                "method": "drag_to",
+                "source": _encode_query(source),
+                "target": _encode_query(target),
+                "timeout_ms": clamped_ms,
+            },
+            "drag_to",
+            # Both element waits run back to back before the drag itself starts.
+            timeout_override_s=self._base_timeout_s + _DRAG_WAITED_ELEMENTS * clamped_ms / 1000.0,
         )
 
     def _expect_ok(

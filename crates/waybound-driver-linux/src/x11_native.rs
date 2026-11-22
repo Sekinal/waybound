@@ -152,18 +152,24 @@ impl X11Client {
     /// key cannot be mapped.
     pub fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
         match event {
-            InputEvent::PointerMove { to } => {
+            // XTEST keeps the button state server-side, so motion while a button is held is
+            // reported to clients as a drag without any special event type.
+            InputEvent::PointerMove { to } | InputEvent::PointerDrag { to, .. } => {
                 let x = clamp_i16(to.x);
                 let y = clamp_i16(to.y);
                 self.fake_input(MOTION_NOTIFY_EVENT, 0, x, y)?;
                 self.flush()
             }
+            InputEvent::MouseDown { button } => {
+                self.fake_input(BUTTON_PRESS_EVENT, button_detail(*button), 0, 0)?;
+                self.flush()
+            }
+            InputEvent::MouseUp { button } => {
+                self.fake_input(BUTTON_RELEASE_EVENT, button_detail(*button), 0, 0)?;
+                self.flush()
+            }
             InputEvent::MouseClick { button, hold_ms } => {
-                let detail = match button {
-                    MouseButton::Left => 1,
-                    MouseButton::Middle => 2,
-                    MouseButton::Right => 3,
-                };
+                let detail = button_detail(*button);
                 self.fake_input(BUTTON_PRESS_EVENT, detail, 0, 0)?;
                 self.flush()?;
                 if *hold_ms > 0 {
@@ -406,6 +412,16 @@ pub fn bgrx_to_rgb(data: &[u8], width: usize, height: usize) -> Option<Vec<u8>> 
     Some(rgb)
 }
 
+/// Maps a [`MouseButton`] to its X11 core pointer button number.
+#[must_use]
+pub const fn button_detail(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 1,
+        MouseButton::Middle => 2,
+        MouseButton::Right => 3,
+    }
+}
+
 const fn modifier_keysym(modifier: KeyModifier) -> u32 {
     match modifier {
         KeyModifier::Shift => XK_SHIFT_L,
@@ -489,6 +505,13 @@ mod tests {
         assert_eq!(map.get(&u32::from(b'a')), Some(&(38, false)));
         assert_eq!(map.get(&u32::from(b'A')), Some(&(38, true)));
         assert_eq!(map.get(&XK_SHIFT_L), Some(&(39, false)));
+    }
+
+    #[test]
+    fn maps_mouse_buttons_to_x11_button_numbers() {
+        assert_eq!(button_detail(MouseButton::Left), 1);
+        assert_eq!(button_detail(MouseButton::Middle), 2);
+        assert_eq!(button_detail(MouseButton::Right), 3);
     }
 
     #[test]
