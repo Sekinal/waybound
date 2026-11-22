@@ -104,9 +104,12 @@ impl ChunkedDecoder {
         match self.phase {
             Phase::Size => {
                 let size_part = text.split(|&b| b == b';').next().unwrap_or(&[]);
+                // Only hex digits: `from_str_radix` alone would also accept a leading `+`.
                 let Some(size) = std::str::from_utf8(size_part)
                     .ok()
-                    .and_then(|s| usize::from_str_radix(s.trim(), 16).ok())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .and_then(|s| usize::from_str_radix(s, 16).ok())
                 else {
                     return false;
                 };
@@ -182,6 +185,11 @@ mod tests {
     #[test]
     fn rejects_malformed_framing() {
         assert_eq!(decode_all(b"zz\r\n", usize::MAX).2, ChunkStatus::Invalid);
+        assert_eq!(
+            decode_all(b"+5\r\nhello\r\n", usize::MAX).2,
+            ChunkStatus::Invalid
+        );
+        assert_eq!(decode_all(b"\r\n", usize::MAX).2, ChunkStatus::Invalid);
         assert_eq!(
             decode_all(b"3\r\nabcX\r\n", usize::MAX).2,
             ChunkStatus::Invalid

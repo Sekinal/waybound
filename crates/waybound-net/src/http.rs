@@ -42,8 +42,12 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 pub const MAX_HEADERS_PER_MESSAGE: usize = 256;
 /// Maximum total name + value bytes retained per request or response header list (64 KiB).
 pub const MAX_HEADER_BYTES_PER_MESSAGE: usize = 64 * 1024;
-/// Maximum HTTP/1.1 requests awaiting a response per connection (oldest dropped first).
+/// HTTP/1.1 requests awaiting a response that keep their headers and body; older queued
+/// requests are reduced to a URL/method placeholder so responses stay correctly paired.
 pub const MAX_PENDING_H1_REQUESTS: usize = 64;
+/// Hard cap on queued HTTP/1.1 requests (placeholders included). Beyond it the connection
+/// is marked out of sync and responses are recorded with the fallback URL, not a wrong one.
+pub const MAX_PENDING_H1_PLACEHOLDERS: usize = 1024;
 /// Maximum HTTP/2 streams tracked per connection (lowest stream ID dropped first).
 pub const MAX_TRACKED_H2_STREAMS: usize = 256;
 /// Maximum size of an HTTP/2 header block assembled from `CONTINUATION` frames (1 MiB).
@@ -51,10 +55,9 @@ const MAX_HEADER_BLOCK_BYTES: usize = 1024 * 1024;
 
 /// Callback invoked whenever a response is created or receives new streaming body bytes.
 ///
-/// The first call for a sequence ID carries everything known so far. Later calls for the
-/// same ID always carry `url`, `status`, `content_type` and `body`, but `headers` and the
-/// `request_*` fields only when they changed since the previous call (they are empty
-/// otherwise), so consumers must merge updates rather than replace them.
+/// Every call carries the full state known so far (later calls for the same sequence ID
+/// may add body bytes, trailers, a final status or late request data). Header lists and
+/// the request body are shared `Arc`s, so repeated calls do not copy them.
 pub type ResponseCallback = Arc<dyn Fn(u64, CapturedResponse) + Send + Sync>;
 
 /// Callback invoked with every complete WebSocket message or control frame.
@@ -112,15 +115,15 @@ struct H2StreamState {
     status: Option<u16>,
     content_type: Option<String>,
     content_encoding: Option<String>,
-    headers: Vec<HttpHeader>,
-    /// `headers` changed since the last emit.
-    headers_dirty: bool,
+    headers: Arc<[HttpHeader]>,
     body: Vec<u8>,
     request_method: Option<String>,
-    request_headers: Vec<HttpHeader>,
+    request_headers: Arc<[HttpHeader]>,
     request_content_encoding: Option<String>,
     request_body: Vec<u8>,
-    /// Request metadata or body changed since the last emit.
+    /// `request_body` decoded once per change (see `request_dirty`).
+    request_body_text: Option<Arc<str>>,
+    /// Request metadata or body changed since `request_body_text` was decoded and emitted.
     request_dirty: bool,
     client_ended: bool,
     server_ended: bool,
@@ -145,10 +148,11 @@ struct H1PendingRequest {
 impl H1PendingRequest {
     /// Moves this request's URL and metadata onto the response it belongs to.
     fn attach_to(self, resp: &mut CapturedResponse) {
-        resp.request_body = decode_request_body(&self.body, self.content_encoding.as_deref());
+        resp.request_body =
+            decode_request_body(&self.body, self.content_encoding.as_deref()).map(Arc::from);
         resp.url = self.url;
         resp.request_method = Some(self.method);
-        resp.request_headers = self.headers;
+        resp.request_headers = self.headers.into();
     }
 }
 
@@ -184,6 +188,8 @@ struct WebSocketSession {
 }
 
 /// Bidirectional HTTP/1.1 + HTTP/2 stream correlator for a single decrypted connection.
+// The flags are independent per-direction/per-protocol states, not one encoded enum.
+#[allow(clippy::struct_excessive_bools)]
 pub struct HttpConnectionCorrelator {
     host_fallback: String,
     mode: ProtoMode,
@@ -195,12 +201,19 @@ pub struct HttpConnectionCorrelator {
     c2s_pending_headers: HashMap<u32, (u8, Vec<u8>)>,
     s2c_pending_headers: HashMap<u32, (u8, Vec<u8>)>,
     h2_streams: HashMap<u32, H2StreamState>,
+    /// A client header block was skipped or failed to decode: the HPACK dynamic table is
+    /// out of sync, so later client header blocks are not trusted.
+    c2s_hpack_broken: bool,
+    /// Same for server header blocks.
+    s2c_hpack_broken: bool,
     /// Queued HTTP/1.1 requests awaiting responses on this keep-alive connection.
     h1_pending: VecDeque<H1PendingRequest>,
     h1_next_request_id: u64,
     h1_client_body: H1ClientBody,
     /// Client bytes after a WebSocket upgrade request are held until the server answers.
     h1_client_paused: bool,
+    /// Requests were dropped from `h1_pending`, so responses can no longer be paired.
+    h1_out_of_sync: bool,
     h1_response_chunks: Option<H1ResponseChunks>,
     h1_current_seq: u64,
     next_seq_base: u64,
@@ -256,10 +269,13 @@ impl HttpConnectionCorrelator {
             c2s_pending_headers: HashMap::new(),
             s2c_pending_headers: HashMap::new(),
             h2_streams: HashMap::new(),
+            c2s_hpack_broken: false,
+            s2c_hpack_broken: false,
             h1_pending: VecDeque::new(),
             h1_next_request_id: 0,
             h1_client_body: H1ClientBody::None,
             h1_client_paused: false,
+            h1_out_of_sync: false,
             h1_response_chunks: None,
             h1_current_seq: seq_base,
             next_seq_base: seq_base,
@@ -422,6 +438,23 @@ impl HttpConnectionCorrelator {
         let _ = self.s2c_pending_headers.remove(&stream_id);
     }
 
+    /// Handles `RST_STREAM`: flushes request data not yet emitted, then frees the stream.
+    fn reset_h2_stream(&mut self, stream_id: u32) {
+        self.emit_pending_request(stream_id);
+        self.remove_h2_stream(stream_id);
+    }
+
+    /// Emits the stream again if request data changed after its response started.
+    fn emit_pending_request(&mut self, stream_id: u32) {
+        if self
+            .h2_streams
+            .get(&stream_id)
+            .is_some_and(|st| st.status.is_some() && st.request_dirty)
+        {
+            self.emit_h2_stream(stream_id);
+        }
+    }
+
     /// Frees a stream's state once both directions have ended (after its final emit).
     fn finish_h2_stream_if_done(&mut self, stream_id: u32) {
         if self
@@ -433,8 +466,10 @@ impl HttpConnectionCorrelator {
         }
     }
 
-    /// Handles `GOAWAY`: streams above the last processed ID will never complete.
-    fn apply_h2_goaway(&mut self, payload: &[u8]) {
+    /// Handles a `GOAWAY` sent by the server: client streams above its last processed
+    /// stream ID will never complete. (A client `GOAWAY` names server-initiated streams,
+    /// which are never tracked, so it is ignored.)
+    fn apply_h2_server_goaway(&mut self, payload: &[u8]) {
         let Some(bytes) = payload.get(..4) else {
             return;
         };
@@ -453,9 +488,6 @@ impl HttpConnectionCorrelator {
     fn drain_h2_client(&mut self) {
         while let Some((ftype, flags, stream_id, payload)) = pop_h2_frame(&mut self.c2s_buf) {
             if stream_id == 0 {
-                if ftype == H2_FRAME_GOAWAY {
-                    self.apply_h2_goaway(&payload);
-                }
                 continue;
             }
             match ftype {
@@ -472,18 +504,21 @@ impl HttpConnectionCorrelator {
                     }
                 }
                 H2_FRAME_CONTINUATION => {
-                    let Some((first_flags, block)) = take_continued_block(
+                    match take_continued_block(
                         &mut self.c2s_pending_headers,
                         stream_id,
                         flags,
                         &payload,
-                    ) else {
-                        continue;
-                    };
-                    self.apply_h2_client_headers(stream_id, &block, first_flags);
+                    ) {
+                        Continued::Pending => {}
+                        Continued::Dropped => self.c2s_hpack_broken = true,
+                        Continued::Complete(first_flags, block) => {
+                            self.apply_h2_client_headers(stream_id, &block, first_flags);
+                        }
+                    }
                 }
                 H2_FRAME_DATA => self.apply_h2_client_data(stream_id, flags, &payload),
-                H2_FRAME_RST_STREAM => self.remove_h2_stream(stream_id),
+                H2_FRAME_RST_STREAM => self.reset_h2_stream(stream_id),
                 _ => {}
             }
         }
@@ -491,27 +526,51 @@ impl HttpConnectionCorrelator {
 
     fn apply_h2_client_data(&mut self, stream_id: u32, flags: u8, payload: &[u8]) {
         let data = strip_h2_padding(flags, payload);
-        let response_seen = self.h2_streams.get_mut(&stream_id).is_some_and(|st| {
+        let request_ended = self.h2_streams.get_mut(&stream_id).is_some_and(|st| {
             if !data.is_empty() && st.request_body.len() < MAX_REQUEST_BODY_BYTES {
                 append_capped(&mut st.request_body, data, MAX_REQUEST_BODY_BYTES);
                 st.request_dirty = true;
             }
             st.client_ended |= (flags & H2_FLAG_END_STREAM) != 0;
-            st.status.is_some() && st.request_dirty && st.client_ended
+            st.client_ended
         });
         // Request bodies normally finish before the response starts; if not, re-emit once
         // the request ends so the stored response picks up the full body (decoded once).
-        if response_seen {
-            self.emit_h2_stream(stream_id);
+        if request_ended {
+            self.emit_pending_request(stream_id);
         }
         self.finish_h2_stream_if_done(stream_id);
     }
 
+    /// Decodes a client header block, or returns `None` (marking the direction broken)
+    /// once the HPACK dynamic table can no longer be trusted.
+    fn decode_client_block(&mut self, block: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        if self.c2s_hpack_broken {
+            return None;
+        }
+        let decoded = self.c2s_hpack.decode(block).ok();
+        self.c2s_hpack_broken = decoded.is_none();
+        decoded
+    }
+
     fn apply_h2_client_headers(&mut self, stream_id: u32, block: &[u8], flags: u8) {
-        let Ok(decoded) = self.c2s_hpack.decode(block) else {
+        let end_stream = (flags & H2_FLAG_END_STREAM) != 0;
+        let Some(decoded) = self.decode_client_block(block) else {
+            // Undecodable: still track the stream for network-idle, without any
+            // header-derived data (a wrong URL is worse than none).
+            if !self.h2_streams.contains_key(&stream_id) {
+                self.ensure_h2_stream(stream_id);
+                if let Some(st) = self.h2_streams.get_mut(&stream_id) {
+                    st.inflight = true;
+                    self.inflight.inc();
+                }
+            }
+            if let Some(st) = self.h2_streams.get_mut(&stream_id) {
+                st.client_ended |= end_stream;
+            }
+            self.finish_h2_stream_if_done(stream_id);
             return;
         };
-        let end_stream = (flags & H2_FLAG_END_STREAM) != 0;
         let mut authority = String::new();
         let mut path = String::new();
         let mut method = None;
@@ -543,6 +602,9 @@ impl HttpConnectionCorrelator {
             if let Some(st) = self.h2_streams.get_mut(&stream_id) {
                 st.client_ended |= end_stream;
             }
+            if end_stream {
+                self.emit_pending_request(stream_id);
+            }
             self.finish_h2_stream_if_done(stream_id);
             return;
         }
@@ -556,7 +618,7 @@ impl HttpConnectionCorrelator {
         };
         st.url = Some(url);
         st.request_method = method;
-        st.request_headers = headers;
+        st.request_headers = headers.into();
         st.request_content_encoding = content_encoding;
         st.request_dirty = true;
         st.client_ended |= end_stream;
@@ -570,7 +632,7 @@ impl HttpConnectionCorrelator {
         while let Some((ftype, flags, stream_id, payload)) = pop_h2_frame(&mut self.s2c_buf) {
             if stream_id == 0 {
                 if ftype == H2_FRAME_GOAWAY {
-                    self.apply_h2_goaway(&payload);
+                    self.apply_h2_server_goaway(&payload);
                 }
                 continue;
             }
@@ -588,29 +650,59 @@ impl HttpConnectionCorrelator {
                     }
                 }
                 H2_FRAME_CONTINUATION => {
-                    let Some((first_flags, block)) = take_continued_block(
+                    match take_continued_block(
                         &mut self.s2c_pending_headers,
                         stream_id,
                         flags,
                         &payload,
-                    ) else {
-                        continue;
-                    };
-                    self.apply_h2_server_headers(stream_id, &block, first_flags);
+                    ) {
+                        Continued::Pending => {}
+                        Continued::Dropped => {
+                            self.s2c_hpack_broken = true;
+                            // The dropped block's flags are lost; END_STREAM may follow as DATA.
+                        }
+                        Continued::Complete(first_flags, block) => {
+                            self.apply_h2_server_headers(stream_id, &block, first_flags);
+                        }
+                    }
                 }
                 H2_FRAME_DATA => {
                     let data = strip_h2_padding(flags, &payload);
                     self.apply_h2_server_data(stream_id, data, flags);
                 }
-                H2_FRAME_RST_STREAM => self.remove_h2_stream(stream_id),
+                H2_FRAME_RST_STREAM => self.reset_h2_stream(stream_id),
                 _ => {}
             }
         }
     }
 
+    /// Marks the server side of a stream ended, releasing its inflight slot.
+    fn end_h2_server_side(&mut self, stream_id: u32) {
+        if let Some(st) = self.h2_streams.get_mut(&stream_id) {
+            st.server_ended = true;
+            if st.inflight {
+                st.inflight = false;
+                self.inflight.dec();
+            }
+        }
+    }
+
     fn apply_h2_server_headers(&mut self, stream_id: u32, block: &[u8], flags: u8) {
-        // Always decode so the HPACK dynamic table stays in sync, even for blocks we drop.
-        let Ok(decoded) = self.s2c_hpack.decode(block) else {
+        let end_stream = (flags & H2_FLAG_END_STREAM) != 0;
+        // Always decode (while the table is trusted) so the HPACK dynamic table stays in
+        // sync, even for blocks that are not recorded.
+        let decoded = if self.s2c_hpack_broken {
+            None
+        } else {
+            let decoded = self.s2c_hpack.decode(block).ok();
+            self.s2c_hpack_broken = decoded.is_none();
+            decoded
+        };
+        let Some(decoded) = decoded else {
+            if end_stream {
+                self.end_h2_server_side(stream_id);
+                self.finish_h2_stream_if_done(stream_id);
+            }
             return;
         };
         let mut status = None;
@@ -635,32 +727,29 @@ impl HttpConnectionCorrelator {
             // Interim response (e.g. `103 Early Hints`); the final header block follows.
             return;
         }
-        self.ensure_h2_stream(stream_id);
+        // Never create state from a server block alone: such orphans would evict live streams.
         let Some(st) = self.h2_streams.get_mut(&stream_id) else {
             return;
         };
         if let Some(code) = status {
             st.status = Some(code);
-            st.headers = headers;
+            st.headers = headers.into();
         } else {
             // Trailer section: appended after the response headers.
+            let mut all = st.headers.to_vec();
             for header in headers {
-                push_header(&mut st.headers, header);
+                push_header(&mut all, header);
             }
+            st.headers = all.into();
         }
-        st.headers_dirty = true;
         if content_type.is_some() {
             st.content_type = content_type;
         }
         if content_encoding.is_some() {
             st.content_encoding = content_encoding;
         }
-        if (flags & H2_FLAG_END_STREAM) != 0 {
-            st.server_ended = true;
-            if st.inflight {
-                st.inflight = false;
-                self.inflight.dec();
-            }
+        if end_stream {
+            self.end_h2_server_side(stream_id);
         }
         self.emit_h2_stream(stream_id);
         self.finish_h2_stream_if_done(stream_id);
@@ -669,18 +758,16 @@ impl HttpConnectionCorrelator {
     fn apply_h2_server_data(&mut self, stream_id: u32, data: &[u8], flags: u8) {
         if let Some(st) = self.h2_streams.get_mut(&stream_id) {
             append_capped(&mut st.body, data, MAX_BODY_BYTES);
-            if (flags & H2_FLAG_END_STREAM) != 0 {
-                st.server_ended = true;
-                if st.inflight {
-                    st.inflight = false;
-                    self.inflight.dec();
-                }
-            }
+        }
+        if (flags & H2_FLAG_END_STREAM) != 0 {
+            self.end_h2_server_side(stream_id);
         }
         self.emit_h2_stream(stream_id);
         self.finish_h2_stream_if_done(stream_id);
     }
 
+    /// Emits the full current state of a stream. Shared metadata (`Arc`) makes repeated
+    /// emits cheap; the request body is decoded only when request data changed.
     fn emit_h2_stream(&mut self, stream_id: u32) {
         let Some(st) = self.h2_streams.get_mut(&stream_id) else {
             return;
@@ -688,28 +775,26 @@ impl HttpConnectionCorrelator {
         let (Some(url), Some(status)) = (&st.url, st.status) else {
             return;
         };
-        let mut resp = CapturedResponse {
-            url: url.clone(),
-            status,
-            content_type: st.content_type.clone(),
-            body: decode_body_bytes(&st.body, st.content_encoding.as_deref()),
-            ..CapturedResponse::default()
-        };
-        if st.headers_dirty {
-            resp.headers.clone_from(&st.headers);
-            st.headers_dirty = false;
-        }
         if st.request_dirty {
-            resp.request_method.clone_from(&st.request_method);
-            resp.request_headers.clone_from(&st.request_headers);
-            resp.request_body =
-                decode_request_body(&st.request_body, st.request_content_encoding.as_deref());
+            st.request_body_text =
+                decode_request_body(&st.request_body, st.request_content_encoding.as_deref())
+                    .map(Arc::from);
             st.request_dirty = false;
             #[cfg(test)]
             {
                 self.request_body_decodes += 1;
             }
         }
+        let resp = CapturedResponse {
+            url: url.clone(),
+            status,
+            content_type: st.content_type.clone(),
+            body: decode_body_bytes(&st.body, st.content_encoding.as_deref()),
+            headers: Arc::clone(&st.headers),
+            request_method: st.request_method.clone(),
+            request_headers: Arc::clone(&st.request_headers),
+            request_body: st.request_body_text.clone(),
+        };
         let seq = st.seq;
         (self.on_response)(seq, resp);
     }
@@ -787,11 +872,7 @@ impl HttpConnectionCorrelator {
                 .map_or_else(|| self.host_fallback.clone(), |h| h.value.clone());
             let id = self.h1_next_request_id;
             self.h1_next_request_id = self.h1_next_request_id.wrapping_add(1);
-            if self.h1_pending.len() >= MAX_PENDING_H1_REQUESTS
-                && self.h1_pending.pop_front().is_some()
-            {
-                self.inflight.dec();
-            }
+            self.make_room_for_h1_request();
             self.h1_pending.push_back(H1PendingRequest {
                 id,
                 url: build_https_url(&host, path),
@@ -818,6 +899,25 @@ impl HttpConnectionCorrelator {
             if head.websocket {
                 // Whatever follows is WebSocket framing if the server accepts the upgrade.
                 self.h1_client_paused = true;
+            }
+        }
+    }
+
+    /// Keeps the pending-request queue bounded without breaking request/response pairing.
+    fn make_room_for_h1_request(&mut self) {
+        let len = self.h1_pending.len();
+        if len >= MAX_PENDING_H1_REQUESTS
+            && let Some(old) = self.h1_pending.get_mut(len - MAX_PENDING_H1_REQUESTS)
+        {
+            // Keep the entry (its position pairs it with a response) but drop its weight.
+            old.headers = Vec::new();
+            old.body = Vec::new();
+            old.content_encoding = None;
+        }
+        if len >= MAX_PENDING_H1_PLACEHOLDERS {
+            self.h1_out_of_sync = true;
+            if self.h1_pending.pop_front().is_some() {
+                self.inflight.dec();
             }
         }
     }
@@ -916,10 +1016,12 @@ impl HttpConnectionCorrelator {
                 status,
                 content_type: head.content_type,
                 body: decode_body_bytes(&raw_body, head.content_encoding.as_deref()),
-                headers: head.headers,
+                headers: head.headers.into(),
                 ..CapturedResponse::default()
             };
-            if let Some(req) = request {
+            if let Some(req) = request
+                && !self.h1_out_of_sync
+            {
                 req.attach_to(&mut resp);
             }
             let websocket = upgrade.then(|| {
@@ -944,24 +1046,35 @@ impl HttpConnectionCorrelator {
     }
 }
 
-/// Removes the pending header block for `stream_id`, appends a `CONTINUATION` fragment,
-/// and returns `(initial HEADERS flags, block)` once `END_HEADERS` is set.
+/// Outcome of appending a `CONTINUATION` fragment to a pending header block.
+enum Continued {
+    /// More fragments are expected (or there was no pending block for this stream).
+    Pending,
+    /// `END_HEADERS` reached: initial `HEADERS` flags and the full block.
+    Complete(u8, Vec<u8>),
+    /// The block exceeded [`MAX_HEADER_BLOCK_BYTES`] and was discarded.
+    Dropped,
+}
+
+/// Removes the pending header block for `stream_id` and appends a `CONTINUATION` fragment.
 fn take_continued_block(
     pending: &mut HashMap<u32, (u8, Vec<u8>)>,
     stream_id: u32,
     flags: u8,
     fragment: &[u8],
-) -> Option<(u8, Vec<u8>)> {
-    let (first_flags, mut block) = pending.remove(&stream_id)?;
+) -> Continued {
+    let Some((first_flags, mut block)) = pending.remove(&stream_id) else {
+        return Continued::Pending;
+    };
     if block.len() + fragment.len() > MAX_HEADER_BLOCK_BYTES {
-        return None;
+        return Continued::Dropped;
     }
     block.extend_from_slice(fragment);
     if (flags & H2_FLAG_END_HEADERS) != 0 {
-        Some((first_flags, block))
+        Continued::Complete(first_flags, block)
     } else {
         let _ = pending.insert(stream_id, (first_flags, block));
-        None
+        Continued::Pending
     }
 }
 
@@ -1443,7 +1556,7 @@ mod tests {
         let list = snapshot(&captured);
         assert_eq!(list.len(), 2);
         assert_eq!(
-            list[0].request_body.as_ref().map(String::len),
+            list[0].request_body.as_deref().map(str::len),
             Some(MAX_REQUEST_BODY_BYTES)
         );
         assert_eq!(list[1].url, "https://up.example.com/after");
@@ -1661,7 +1774,8 @@ mod tests {
             corr.feed_server(&h2_frame(H2_FRAME_DATA, flags, 1, b"data: x\n\n"));
         }
         assert_eq!(corr.request_body_decodes, 1);
-        assert_eq!(emits_with_request.load(Ordering::Relaxed), 1);
+        // Every emit (1 for HEADERS + 2000 for DATA) carries the shared request data.
+        assert_eq!(emits_with_request.load(Ordering::Relaxed), 2001);
         // Both directions ended: the stream state (and its 1 MiB request body) is freed.
         assert_eq!(corr.h2_streams.len(), 0);
     }
@@ -1721,16 +1835,205 @@ mod tests {
     }
 
     #[test]
-    fn http1_pending_requests_are_capped() {
-        let (mut corr, _, _) = correlator("api.example.com");
+    fn http1_many_pipelined_requests_keep_their_own_urls() {
+        let (mut corr, captured, _) = correlator("api.example.com");
         for i in 0..100 {
+            corr.feed_client(
+                format!("GET /{i} HTTP/1.1\r\nHost: api.example.com\r\nX-N: {i}\r\n\r\n")
+                    .as_bytes(),
+            );
+        }
+        assert_eq!(corr.inflight.get(), 100);
+        // Only the newest requests keep their headers; older ones are light placeholders.
+        let heavy = corr
+            .h1_pending
+            .iter()
+            .filter(|r| !r.headers.is_empty())
+            .count();
+        assert_eq!(heavy, MAX_PENDING_H1_REQUESTS);
+        for _ in 0..100 {
+            corr.feed_server(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        }
+        let got = snapshot(&captured);
+        assert_eq!(got.len(), 100);
+        for (i, resp) in got.iter().enumerate() {
+            assert_eq!(resp.url, format!("https://api.example.com/{i}"));
+            assert_eq!(resp.request_method.as_deref(), Some("GET"));
+        }
+        assert_eq!(header_values(&got[99].request_headers, "x-n"), vec!["99"]);
+        assert_eq!(corr.inflight.get(), 0);
+    }
+
+    #[test]
+    fn http1_queue_overflow_records_fallback_urls_not_wrong_ones() {
+        let (mut corr, captured, _) = correlator("api.example.com");
+        let total = MAX_PENDING_H1_PLACEHOLDERS + 6;
+        for i in 0..total {
             corr.feed_client(
                 format!("GET /{i} HTTP/1.1\r\nHost: api.example.com\r\n\r\n").as_bytes(),
             );
         }
-        assert_eq!(corr.h1_pending.len(), MAX_PENDING_H1_REQUESTS);
-        assert_eq!(corr.inflight.get(), MAX_PENDING_H1_REQUESTS);
-        drop(corr);
+        assert_eq!(corr.h1_pending.len(), MAX_PENDING_H1_PLACEHOLDERS);
+        assert_eq!(corr.inflight.get(), MAX_PENDING_H1_PLACEHOLDERS);
+        corr.feed_server(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let got = snapshot(&captured);
+        assert_eq!(got[0].url, "https://api.example.com/");
+        assert_eq!(got[0].request_method, None);
+    }
+
+    #[test]
+    fn client_goaway_does_not_tear_down_client_streams() {
+        let (mut corr, captured, _) = correlator("h2.example.com");
+        let mut c_enc = fluke_hpack::Encoder::new();
+        let block = h2_request_block(&mut c_enc, "GET", "/stream");
+        corr.feed_client(&h2_preface_with(&[h2_frame(
+            H2_FRAME_HEADERS,
+            H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+            1,
+            &block,
+        )]));
+        let mut s_enc = fluke_hpack::Encoder::new();
+        let resp = s_enc.encode([(&b":status"[..], &b"200"[..])]);
+        let mut s2c = h2_frame(H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, 1, &resp);
+        s2c.extend(h2_frame(H2_FRAME_DATA, 0, 1, b"part1-"));
+        corr.feed_server(&s2c);
+        corr.feed_client(&h2_frame(H2_FRAME_GOAWAY, 0, 0, &[0, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(corr.inflight.get(), 1);
+        corr.feed_server(&h2_frame(H2_FRAME_DATA, H2_FLAG_END_STREAM, 1, b"part2"));
+        assert_eq!(corr.inflight.get(), 0);
+        assert_eq!(snapshot(&captured)[0].body.as_deref(), Some("part1-part2"));
+    }
+
+    /// HPACK integer with an `prefix_bits`-bit prefix (RFC 7541 section 5.1).
+    fn hpack_int(first: u8, prefix_bits: u32, mut value: usize, out: &mut Vec<u8>) {
+        let max = (1_usize << prefix_bits) - 1;
+        if value < max {
+            out.push(first | u8::try_from(value).unwrap_or(0));
+            return;
+        }
+        out.push(first | u8::try_from(max).unwrap_or(0));
+        value -= max;
+        while value >= 128 {
+            out.push(u8::try_from(value % 128).unwrap_or(0) | 0x80);
+            value /= 128;
+        }
+        out.push(u8::try_from(value).unwrap_or(0));
+    }
+
+    #[test]
+    fn dropped_header_block_stops_recording_header_derived_data() {
+        let (mut corr, captured, _) = correlator("h2.example.com");
+        let mut c_enc = fluke_hpack::Encoder::new();
+        let first = h2_request_block(&mut c_enc, "GET", "/old");
+        // Stream 3 inserts `/new` into the encoder's table, then an oversized literal
+        // (without indexing) pushes the block past the cap so the correlator drops it.
+        let mut third = h2_request_block(&mut c_enc, "GET", "/new");
+        third.push(0x00);
+        hpack_int(0, 7, 5, &mut third);
+        third.extend_from_slice(b"x-pad");
+        let pad = MAX_HEADER_BLOCK_BYTES + 10;
+        hpack_int(0, 7, pad, &mut third);
+        third.extend(std::iter::repeat_n(b'p', pad));
+        // Stream 5 references `/new` by its dynamic index; a desynced decoder would read `/old`.
+        let fifth = h2_request_block(&mut c_enc, "GET", "/new");
+        let mut frames = vec![h2_frame(
+            H2_FRAME_HEADERS,
+            H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+            1,
+            &first,
+        )];
+        let mut chunks = third.chunks(256 * 1024);
+        frames.push(h2_frame(
+            H2_FRAME_HEADERS,
+            H2_FLAG_END_STREAM,
+            3,
+            chunks.next().unwrap_or(&[]),
+        ));
+        let tail: Vec<&[u8]> = chunks.collect();
+        for (i, chunk) in tail.iter().enumerate() {
+            let flags = if i + 1 == tail.len() {
+                H2_FLAG_END_HEADERS
+            } else {
+                0
+            };
+            frames.push(h2_frame(H2_FRAME_CONTINUATION, flags, 3, chunk));
+        }
+        frames.push(h2_frame(
+            H2_FRAME_HEADERS,
+            H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+            5,
+            &fifth,
+        ));
+        corr.feed_client(&h2_preface_with(&frames));
+        let mut s_enc = fluke_hpack::Encoder::new();
+        for id in [1_u32, 5] {
+            let resp = s_enc.encode([(&b":status"[..], &b"200"[..])]);
+            corr.feed_server(&h2_frame(
+                H2_FRAME_HEADERS,
+                H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+                id,
+                &resp,
+            ));
+        }
+        assert_eq!(
+            responses_urls(&captured),
+            vec!["https://h2.example.com/old"]
+        );
+        // Stream 5 was still tracked for network-idle and released by its response.
+        assert_eq!(corr.inflight.get(), 0);
+    }
+
+    #[test]
+    fn late_request_data_is_emitted_on_trailers_and_reset() {
+        for reset in [false, true] {
+            let (mut corr, captured, _) = correlator("h2.example.com");
+            let mut c_enc = fluke_hpack::Encoder::new();
+            let block = h2_request_block(&mut c_enc, "POST", "/late");
+            corr.feed_client(&h2_preface_with(&[h2_frame(
+                H2_FRAME_HEADERS,
+                H2_FLAG_END_HEADERS,
+                1,
+                &block,
+            )]));
+            let mut s_enc = fluke_hpack::Encoder::new();
+            let resp = s_enc.encode([(&b":status"[..], &b"200"[..])]);
+            let mut s2c = h2_frame(H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, 1, &resp);
+            s2c.extend(h2_frame(H2_FRAME_DATA, H2_FLAG_END_STREAM, 1, b"early"));
+            corr.feed_server(&s2c);
+            corr.feed_client(&h2_frame(H2_FRAME_DATA, 0, 1, b"payload"));
+            if reset {
+                corr.feed_client(&h2_frame(H2_FRAME_RST_STREAM, 0, 1, &[0, 0, 0, 0]));
+            } else {
+                let trailers = c_enc.encode([(&b"x-checksum"[..], &b"1"[..])]);
+                corr.feed_client(&h2_frame(
+                    H2_FRAME_HEADERS,
+                    H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+                    1,
+                    &trailers,
+                ));
+            }
+            let got = snapshot(&captured);
+            assert_eq!(got.len(), 1, "reset={reset}");
+            assert_eq!(
+                got[0].request_body.as_deref(),
+                Some("payload"),
+                "reset={reset}"
+            );
+            assert_eq!(corr.h2_streams.len(), 0, "reset={reset}");
+        }
+    }
+
+    #[test]
+    fn server_headers_without_client_state_create_nothing() {
+        let (mut corr, captured, _) = correlator("h2.example.com");
+        corr.feed_client(H2_PREFACE);
+        let mut s_enc = fluke_hpack::Encoder::new();
+        for id in [2_u32, 4, 6] {
+            let resp = s_enc.encode([(&b":status"[..], &b"200"[..])]);
+            corr.feed_server(&h2_frame(H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, id, &resp));
+        }
+        assert_eq!(corr.h2_streams.len(), 0);
+        assert_eq!(snapshot(&captured), Vec::new());
     }
 
     #[test]
@@ -1756,7 +2059,7 @@ mod tests {
         corr.feed_server(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
         let got = snapshot(&captured);
         assert_eq!(
-            got[0].request_body.as_ref().map(String::len),
+            got[0].request_body.as_deref().map(str::len),
             Some(MAX_REQUEST_BODY_BYTES)
         );
         let header_bytes: usize = got[0]

@@ -1,5 +1,7 @@
 //! Passive wire-level HTTP response and WebSocket types captured via `SSLKEYLOGFILE`.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// A single HTTP header field as seen on the wire.
@@ -33,7 +35,9 @@ impl HttpHeader {
 ///
 /// The `headers` and `request_*` fields were added after the initial schema; they are
 /// optional, default to empty, and are omitted from JSON when empty so older clients
-/// and previously stored JSON keep working.
+/// and previously stored JSON keep working. The potentially large ones are shared
+/// (`Arc`) so repeated streaming updates of one response can carry them for the cost of
+/// a pointer copy; on the wire they are plain JSON arrays and strings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapturedResponse {
     /// Request URL (`https://authority/path`).
@@ -45,20 +49,24 @@ pub struct CapturedResponse {
     /// UTF-8 decoded response body, if captured and valid UTF-8.
     pub body: Option<String>,
     /// Response headers in wire order (repeated names preserved).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub headers: Vec<HttpHeader>,
+    #[serde(default, skip_serializing_if = "is_empty_slice")]
+    pub headers: Arc<[HttpHeader]>,
     /// Request method (`GET`, `POST`, ...), if the request was observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_method: Option<String>,
     /// Request headers in wire order (repeated names preserved).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub request_headers: Vec<HttpHeader>,
+    #[serde(default, skip_serializing_if = "is_empty_slice")]
+    pub request_headers: Arc<[HttpHeader]>,
     /// UTF-8 decoded request body (for example a POST/PUT payload), if present.
     ///
     /// Follows the same convention as [`Self::body`]: bytes are decompressed according
     /// to `content-encoding`, and only the longest valid UTF-8 prefix is kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_body: Option<String>,
+    pub request_body: Option<Arc<str>>,
+}
+
+fn is_empty_slice<T>(items: &Arc<[T]>) -> bool {
+    items.is_empty()
 }
 
 /// Direction of a captured WebSocket message.
@@ -140,9 +148,9 @@ mod tests {
         if let Ok(resp) = parsed {
             assert_eq!(resp.url, "https://a.test/x");
             assert_eq!(resp.body.as_deref(), Some("hi"));
-            assert_eq!(resp.headers, Vec::new());
+            assert_eq!(resp.headers.len(), 0);
             assert!(resp.request_method.is_none());
-            assert_eq!(resp.request_headers, Vec::new());
+            assert_eq!(resp.request_headers.len(), 0);
             assert!(resp.request_body.is_none());
         }
     }
@@ -169,10 +177,11 @@ mod tests {
             headers: vec![
                 HttpHeader::new("set-cookie", "a=1"),
                 HttpHeader::new("set-cookie", "b=2"),
-            ],
+            ]
+            .into(),
             request_method: Some("POST".to_owned()),
-            request_headers: vec![HttpHeader::new("content-type", "application/json")],
-            request_body: Some("{}".to_owned()),
+            request_headers: vec![HttpHeader::new("content-type", "application/json")].into(),
+            request_body: Some("{}".into()),
             ..CapturedResponse::default()
         };
         let json = serde_json::to_string(&resp).unwrap_or_default();
