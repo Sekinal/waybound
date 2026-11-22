@@ -88,12 +88,33 @@ TOOLS: list[dict[str, object]] = [
     },
     {
         "name": "waybound_wait_for_response",
-        "description": "Wait for a passively decrypted HTTP response matching url_contains.",
+        "description": (
+            "Wait for a passively decrypted HTTP response matching url_contains. Returns "
+            "status, headers, body and request method/headers. Values of cookie, "
+            "authorization, proxy-authorization and set-cookie headers are redacted and the "
+            "request body is omitted unless explicitly requested."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "url_contains": {"type": "string"},
                 "timeout_ms": {"type": "integer", "default": 10000},
+                "include_sensitive_headers": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Return cookie, authorization, proxy-authorization and set-cookie "
+                        "header values unredacted (they may contain credentials)."
+                    ),
+                },
+                "include_request_body": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Include the request body (e.g. a POST payload, which may contain "
+                        "passwords or personal data)."
+                    ),
+                },
             },
             "required": ["url_contains"],
         },
@@ -102,13 +123,21 @@ TOOLS: list[dict[str, object]] = [
         "name": "waybound_websocket_frames",
         "description": (
             "List passively decrypted WebSocket messages (newest last), optionally filtered "
-            "by URL substring."
+            "by URL substring. Message text is omitted unless include_payloads is true; "
+            "direction, opcode and sizes are always returned."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "url_contains": {"type": "string"},
                 "limit": {"type": "integer", "default": 50},
+                "include_payloads": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Include decoded message text (may contain tokens or personal data)."
+                    ),
+                },
             },
         },
     },
@@ -211,13 +240,32 @@ def _tool_screenshot(page: Page, _args: dict[str, object]) -> dict[str, object]:
     return {"content": [{"type": "image", "data": encoded, "mimeType": "image/png"}]}
 
 
-def _headers_payload(headers: tuple[HttpHeader, ...]) -> list[dict[str, str]]:
-    return [{"name": h.name, "value": h.value} for h in headers]
+_SENSITIVE_HEADERS = frozenset({"cookie", "authorization", "proxy-authorization", "set-cookie"})
+_REDACTED = "[redacted]"
+
+
+def _as_bool(raw: object) -> bool:
+    return raw is True
+
+
+def _headers_payload(
+    headers: tuple[HttpHeader, ...], *, include_sensitive: bool
+) -> list[dict[str, str]]:
+    return [
+        {
+            "name": h.name,
+            "value": h.value
+            if include_sensitive or h.name.lower() not in _SENSITIVE_HEADERS
+            else _REDACTED,
+        }
+        for h in headers
+    ]
 
 
 def _tool_wait_for_response(page: Page, args: dict[str, object]) -> dict[str, object]:
     needle = str(args.get("url_contains", ""))
     timeout_ms = _as_int(args.get("timeout_ms"), 10_000)
+    include_sensitive = _as_bool(args.get("include_sensitive_headers"))
     resp = page.wait_for_response(needle, timeout_ms=timeout_ms)
     payload: dict[str, object] = {
         "url": resp.url,
@@ -226,12 +274,14 @@ def _tool_wait_for_response(page: Page, args: dict[str, object]) -> dict[str, ob
         "body": resp.body,
     }
     if resp.headers:
-        payload["headers"] = _headers_payload(resp.headers)
+        payload["headers"] = _headers_payload(resp.headers, include_sensitive=include_sensitive)
     if resp.request_method is not None:
         payload["request_method"] = resp.request_method
     if resp.request_headers:
-        payload["request_headers"] = _headers_payload(resp.request_headers)
-    if resp.request_body is not None:
+        payload["request_headers"] = _headers_payload(
+            resp.request_headers, include_sensitive=include_sensitive
+        )
+    if resp.request_body is not None and _as_bool(args.get("include_request_body")):
         payload["request_body"] = resp.request_body
     return _text_result(json.dumps(payload))
 
@@ -240,20 +290,22 @@ def _tool_websocket_frames(page: Page, args: dict[str, object]) -> dict[str, obj
     raw_needle = args.get("url_contains")
     needle = raw_needle if isinstance(raw_needle, str) and raw_needle else None
     limit = max(1, _as_int(args.get("limit"), 50))
-    frames = page.captured_websocket_frames(url_contains=needle)[-limit:]
-    payload = [
-        {
+    include_payloads = _as_bool(args.get("include_payloads"))
+    frames = page.captured_websocket_frames(url_contains=needle, limit=limit)
+    payload: list[dict[str, object]] = []
+    for f in frames:
+        item: dict[str, object] = {
             "url": f.url,
             "direction": f.direction.value,
             "opcode": f.opcode.value,
-            "payload": f.payload,
             "payload_len": f.payload_len,
             "compressed": f.compressed,
             "truncated": f.truncated,
             "close_code": f.close_code,
         }
-        for f in frames
-    ]
+        if include_payloads:
+            item["payload"] = f.payload
+        payload.append(item)
     return _text_result(json.dumps(payload))
 
 

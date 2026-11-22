@@ -175,11 +175,11 @@ class AsyncPage:
         )
 
     async def captured_websocket_frames(
-        self, *, url_contains: str | None = None
+        self, *, url_contains: str | None = None, limit: int | None = None
     ) -> list[CapturedWebSocketFrame]:
-        """Return passively decrypted WebSocket messages (oldest first)."""
+        """Return passively decrypted WebSocket messages (oldest first, newest `limit`)."""
         return await asyncio.to_thread(
-            self._inner.captured_websocket_frames, url_contains=url_contains
+            self._inner.captured_websocket_frames, url_contains=url_contains, limit=limit
         )
 
     async def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:

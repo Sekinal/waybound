@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 
 class BackendKind(StrEnum):
@@ -85,7 +85,8 @@ class HttpHeader:
     """Single HTTP header field as seen on the wire (repeated names are kept separately)."""
 
     name: str
-    value: str
+    # Values can be credentials (cookie, authorization); keep them out of reprs and logs.
+    value: str = field(repr=False)
 
 
 def _header_values(headers: tuple[HttpHeader, ...], name: str) -> list[str]:
@@ -105,11 +106,12 @@ class CapturedResponse:
     url: str
     status: int
     content_type: str | None
-    body: str | None
-    headers: tuple[HttpHeader, ...] = ()
+    # Bodies and header values may hold credentials or personal data: kept out of reprs.
+    body: str | None = field(repr=False)
+    headers: tuple[HttpHeader, ...] = field(default=(), repr=False)
     request_method: str | None = None
-    request_headers: tuple[HttpHeader, ...] = ()
-    request_body: str | None = None
+    request_headers: tuple[HttpHeader, ...] = field(default=(), repr=False)
+    request_body: str | None = field(default=None, repr=False)
 
     def json(self) -> object:
         """Parse and return the captured response body as JSON."""
@@ -168,7 +170,7 @@ class CapturedWebSocketFrame:
     url: str
     direction: WebSocketDirection
     opcode: WebSocketOpcode
-    payload: str | None = None
+    payload: str | None = field(default=None, repr=False)
     payload_len: int = 0
     compressed: bool = False
     truncated: bool = False
@@ -286,16 +288,25 @@ class Transport(Protocol):
         """Wait until a passively captured HTTP response matches `url_contains`."""
         ...
 
-    def captured_websocket_frames(
-        self, *, url_contains: str | None = None
-    ) -> list[CapturedWebSocketFrame]:
-        """Return passively captured WebSocket messages, optionally filtered by URL substring."""
-        ...
-
     def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
         """Wait until zero HTTP/1.1 or HTTP/2 requests remain inflight for `idle_ms`."""
         ...
 
     def screenshot(self, path: str) -> None:
         """Capture a native OS PNG screenshot of the browser window to `path`."""
+        ...
+
+
+@runtime_checkable
+class SupportsWebSocketFrames(Protocol):
+    """Optional transport capability: listing passively captured WebSocket messages.
+
+    Kept separate from `Transport` so custom transports written before WebSocket
+    capture existed remain valid `Transport` implementations.
+    """
+
+    def captured_websocket_frames(
+        self, *, url_contains: str | None = None, limit: int | None = None
+    ) -> list[CapturedWebSocketFrame]:
+        """Return captured WebSocket messages (oldest first), at most the newest `limit`."""
         ...

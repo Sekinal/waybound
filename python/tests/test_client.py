@@ -16,6 +16,7 @@ from waybound import (
     LocatorQuery,
     Page,
     Role,
+    SupportsWebSocketFrames,
     WebSocketDirection,
     WebSocketOpcode,
 )
@@ -118,11 +119,21 @@ class FakeTransport:
             request_body='{"q":1}',
         )
 
+    def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
+        self.events.append(("wait_for_network_idle", (idle_ms, timeout_ms)))
+
+    def screenshot(self, path: str) -> None:
+        self.events.append(("screenshot", path))
+
+
+class WsFakeTransport(FakeTransport):
+    """Fake transport that also supports WebSocket capture."""
+
     def captured_websocket_frames(
-        self, *, url_contains: str | None = None
+        self, *, url_contains: str | None = None, limit: int | None = None
     ) -> list[CapturedWebSocketFrame]:
-        self.events.append(("captured_websocket_frames", url_contains))
-        return [
+        self.events.append(("captured_websocket_frames", (url_contains, limit)))
+        frames = [
             CapturedWebSocketFrame(
                 url="wss://example.com/ws",
                 direction=WebSocketDirection.SENT,
@@ -132,12 +143,7 @@ class FakeTransport:
             )
             for n in range(3)
         ]
-
-    def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
-        self.events.append(("wait_for_network_idle", (idle_ms, timeout_ms)))
-
-    def screenshot(self, path: str) -> None:
-        self.events.append(("screenshot", path))
+        return frames if limit is None else frames[-limit:]
 
 
 def test_bounds_center() -> None:
@@ -245,7 +251,7 @@ def test_parse_websocket_frames() -> None:
 
 
 def test_page_network_accessors() -> None:
-    transport = FakeTransport()
+    transport = WsFakeTransport()
     page = Page(transport)
 
     resp = page.wait_for_response("api", timeout_ms=500)
@@ -254,10 +260,45 @@ def test_page_network_accessors() -> None:
 
     frames = page.captured_websocket_frames(url_contains="example")
     assert [f.json() for f in frames] == [{"n": 0}, {"n": 1}, {"n": 2}]
+    assert [f.payload for f in page.captured_websocket_frames(limit=1)] == ['{"n":2}']
     assert transport.events == [
         ("wait_for_response", ("api", 500)),
-        ("captured_websocket_frames", "example"),
+        ("captured_websocket_frames", ("example", None)),
+        ("captured_websocket_frames", (None, 1)),
     ]
+
+
+def test_transport_without_websocket_support_degrades_clearly() -> None:
+    # A transport written before WebSocket capture is still a valid Transport.
+    page = Page(FakeTransport())
+    with pytest.raises(NotImplementedError, match="captured_websocket_frames"):
+        page.captured_websocket_frames()
+    assert not isinstance(FakeTransport(), SupportsWebSocketFrames)
+    assert isinstance(WsFakeTransport(), SupportsWebSocketFrames)
+
+
+def test_reprs_do_not_leak_header_values_or_bodies() -> None:
+    resp = CapturedResponse(
+        url="https://a.test/login",
+        status=200,
+        content_type="text/plain",
+        body="secret-body",
+        headers=(HttpHeader("set-cookie", "sid=secret-cookie"),),
+        request_method="POST",
+        request_headers=(HttpHeader("authorization", "Bearer secret-token"),),
+        request_body="password=secret-pw",
+    )
+    frame = CapturedWebSocketFrame(
+        url="wss://a.test/ws",
+        direction=WebSocketDirection.SENT,
+        opcode=WebSocketOpcode.TEXT,
+        payload="secret-payload",
+    )
+    text = repr(resp) + repr(frame) + repr(resp.headers)
+    assert "secret" not in text
+    assert "https://a.test/login" in text
+    assert "set-cookie" in text
+    assert resp.header("set-cookie") == "sid=secret-cookie"
 
 
 def _call_tool(page: Page, name: str, arguments: dict[str, object]) -> object:
@@ -278,20 +319,46 @@ def _call_tool(page: Page, name: str, arguments: dict[str, object]) -> object:
     return json.loads(content[0]["text"])
 
 
-def test_mcp_tools_expose_headers_request_and_websocket_frames() -> None:
-    page = Page(FakeTransport())
+def test_mcp_tools_redact_by_default() -> None:
+    page = Page(WsFakeTransport())
 
     payload = _call_tool(page, "waybound_wait_for_response", {"url_contains": "api"})
+    assert isinstance(payload, dict)
+    assert payload["headers"] == [
+        {"name": "set-cookie", "value": "[redacted]"},
+        {"name": "set-cookie", "value": "[redacted]"},
+    ]
+    assert payload["request_headers"] == [{"name": "content-type", "value": "application/json"}]
+    assert payload["request_method"] == "POST"
+    assert "request_body" not in payload
+
+    frames = _call_tool(page, "waybound_websocket_frames", {"limit": 2})
+    assert isinstance(frames, list)
+    assert len(frames) == 2
+    assert all("payload" not in f for f in frames)
+    assert frames[0]["direction"] == "sent"
+    assert frames[0]["opcode"] == "text"
+    assert frames[0]["payload_len"] == 7
+
+
+def test_mcp_tools_return_sensitive_data_on_opt_in() -> None:
+    transport = WsFakeTransport()
+    page = Page(transport)
+
+    payload = _call_tool(
+        page,
+        "waybound_wait_for_response",
+        {"url_contains": "api", "include_sensitive_headers": True, "include_request_body": True},
+    )
     assert isinstance(payload, dict)
     assert payload["headers"] == [
         {"name": "set-cookie", "value": "a=1"},
         {"name": "set-cookie", "value": "b=2"},
     ]
-    assert payload["request_method"] == "POST"
     assert payload["request_body"] == '{"q":1}'
 
-    frames = _call_tool(page, "waybound_websocket_frames", {"limit": 2})
+    frames = _call_tool(page, "waybound_websocket_frames", {"limit": 2, "include_payloads": True})
     assert isinstance(frames, list)
     assert [f["payload"] for f in frames] == ['{"n":1}', '{"n":2}']
-    assert frames[0]["direction"] == "sent"
-    assert frames[0]["opcode"] == "text"
+    # The limit is sent to the daemon rather than applied after fetching everything.
+    assert ("captured_websocket_frames", (None, 2)) in transport.events

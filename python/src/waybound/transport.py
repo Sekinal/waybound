@@ -197,12 +197,19 @@ class UnixSocketTransport:
         return [_parse_http_response(item) for item in raw_items if isinstance(item, dict)]
 
     def captured_websocket_frames(
-        self, *, url_contains: str | None = None
+        self, *, url_contains: str | None = None, limit: int | None = None
     ) -> list[CapturedWebSocketFrame]:
-        """Return passively captured WebSocket messages, optionally filtered by URL substring."""
-        response = self._request(
-            {"method": "captured_websocket_frames", "url_contains": url_contains}
-        )
+        """Return passively captured WebSocket messages (oldest first).
+
+        Optionally filtered by URL substring and limited to the newest `limit` messages.
+        """
+        payload: dict[str, object] = {
+            "method": "captured_websocket_frames",
+            "url_contains": url_contains,
+        }
+        if limit is not None:
+            payload["limit"] = max(0, limit)
+        response = self._request(payload)
         raw_items = response.get("frames")
         if not isinstance(raw_items, list):
             msg = f"unexpected captured_websocket_frames payload: {response!r}"

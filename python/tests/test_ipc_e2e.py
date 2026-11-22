@@ -45,6 +45,7 @@ def test_ergonomic_launch_full_workflow() -> None:
         # The mock backend has no network tap: both capture lists are empty but well-formed.
         assert page.captured_responses() == []
         assert page.captured_websocket_frames(url_contains="wss://") == []
+        assert page.captured_websocket_frames(limit=5) == []
 
         png_bytes = page.screenshot()
         assert png_bytes.startswith(b"\x89PNG\r\n\x1a\n")

@@ -16,6 +16,7 @@ from waybound.types import (
     KeyModifier,
     LocatorQuery,
     Role,
+    SupportsWebSocketFrames,
 )
 
 if TYPE_CHECKING:
@@ -188,14 +189,22 @@ class Page:
         return self._transport.wait_for_response(url_contains, timeout_ms=timeout_ms)
 
     def captured_websocket_frames(
-        self, *, url_contains: str | None = None
+        self, *, url_contains: str | None = None, limit: int | None = None
     ) -> list[CapturedWebSocketFrame]:
         """Return passively decrypted WebSocket messages (oldest first).
 
         Covers HTTP/1.1 `101 Switching Protocols` upgrades; fragmented messages are
-        reassembled and `permessage-deflate` payloads are inflated.
+        reassembled and `permessage-deflate` payloads are inflated. `limit` keeps only
+        the newest messages.
+
+        Raises:
+            NotImplementedError: if the page's transport does not support WebSocket capture.
         """
-        return self._transport.captured_websocket_frames(url_contains=url_contains)
+        transport = self._transport
+        if not isinstance(transport, SupportsWebSocketFrames):
+            msg = f"{type(transport).__name__} does not support captured_websocket_frames"
+            raise NotImplementedError(msg)
+        return transport.captured_websocket_frames(url_contains=url_contains, limit=limit)
 
     def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
         """Wait until zero HTTP/1.1 or HTTP/2 requests remain inflight for `idle_ms`."""
