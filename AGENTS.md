@@ -29,6 +29,17 @@ This runs:
 - `uv run mypy src tests`
 - `uv run pytest` (with `-W error`, including live Rust ↔ Python IPC E2E tests)
 
+When touching the TypeScript SDK (`packages/waybound-ts`), also run (after `cargo build -p waybound-daemon`, so the daemon end-to-end tests run instead of skipping):
+
+```bash
+cd packages/waybound-ts
+npm ci
+npm run lint        # Biome lint + format check (`npm run format` fixes)
+npm run typecheck   # tsc strict, noUncheckedIndexedAccess, exactOptionalPropertyTypes
+npm run build
+npm test            # node:test; WAYBOUND_REQUIRE_DAEMON=1 fails if the daemon is missing
+```
+
 To auto-format and apply safe lint fixes:
 
 ```bash
@@ -54,3 +65,4 @@ Examples:
 - `crates/waybound-driver-*` — OS/container implementations of `waybound_core::Driver`. Minimal, audited FFI wrapped in RAII types.
 - `crates/waybound-daemon` — CLI, Unix-socket JSON-RPC server, driver lifecycle.
 - `python/` — Typed Playwright-style SDK (`Page`, `Locator`, `UnixSocketTransport`).
+- `packages/waybound-ts` — Typed async Node.js SDK mirroring the Python SDK. Zero runtime dependencies; never downloads at install time.
