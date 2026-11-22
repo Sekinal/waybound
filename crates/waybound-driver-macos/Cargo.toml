@@ -6,8 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-tracing.workspace = true
 waybound-core.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tracing.workspace = true
 
 [lints.rust]
 missing_docs = "warn"

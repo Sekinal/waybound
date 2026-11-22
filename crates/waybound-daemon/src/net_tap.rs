@@ -511,7 +511,7 @@ mod tests {
             "3\t\t1\t\t\t\t\t\tapi.example.com\t/v1/fares\t\t\t\t\t\t\t524551\t",
             &store,
         );
-        assert!(store.list(None).is_empty());
+        assert_eq!(store.list(None).len(), 0);
 
         correlator.ingest_line(
             "3\t\t1\t\t\t200\t\t\t\t\t\t\t\tapplication/json\t\t\t7b226f6b223a747275657d\t",

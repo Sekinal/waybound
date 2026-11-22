@@ -359,7 +359,7 @@ mod tests {
             0.0,
             inverted,
         );
-        assert!(!path.is_empty());
+        assert_ne!(path.len(), 0);
         assert!(path.iter().all(|s| s.point.y.abs() < 1e-12));
 
         let bad = plan_pointer_path(
@@ -371,7 +371,7 @@ mod tests {
             1.0,
             MotionConfig::default(),
         );
-        assert!(bad.is_empty());
+        assert_eq!(bad.len(), 0);
     }
 
     #[test]
