@@ -398,7 +398,7 @@ pub fn bgrx_to_rgb(data: &[u8], width: usize, height: usize) -> Option<Vec<u8>> 
         return None;
     }
     let mut rgb = Vec::with_capacity(pixels.checked_mul(3)?);
-    for px in data[..expected].chunks_exact(4) {
+    for px in data[..expected].as_chunks::<4>().0 {
         rgb.push(px[2]); // R
         rgb.push(px[1]); // G
         rgb.push(px[0]); // B

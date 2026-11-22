@@ -50,11 +50,17 @@ impl InflightCounter {
 
     /// Saturating decrement of the active inflight stream count.
     pub fn dec(&self) {
-        let _ = self
-            .count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                Some(v.saturating_sub(1))
-            });
+        let mut cur = self.count.load(Ordering::Acquire);
+        loop {
+            let next = cur.saturating_sub(1);
+            match self
+                .count
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     /// Returns the current number of inflight requests.
