@@ -18,8 +18,8 @@ use waybound_core::{CapturedResponse, Result, WayboundError};
 
 const MAX_CAPTURED_RESPONSES: usize = 500;
 const MAX_PENDING_STREAMS: usize = 1_000;
-const MAX_BODY_BYTES: usize = 512 * 1024;
-const MAX_DECOMPRESSED_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_WAIT_MS: u64 = 120_000;
 /// A matched response is returned once its body has stopped growing for this long.
@@ -323,35 +323,37 @@ fn decode_body_bytes(raw: &[u8], encoding: Option<&str>) -> Option<String> {
         Some("gzip" | "x-gzip") => {
             let mut out = Vec::new();
             let mut decoder = GzDecoder::new(raw).take(MAX_DECOMPRESSED_BYTES);
-            if decoder.read_to_end(&mut out).is_ok() && !out.is_empty() {
-                out
-            } else {
-                // Wireshark may have already decompressed `http.file_data`.
-                raw.to_vec()
-            }
+            // Retain decompressed prefix even on UnexpectedEof (e.g. streaming SSE / truncated frames).
+            let _ = decoder.read_to_end(&mut out);
+            if out.is_empty() { raw.to_vec() } else { out }
         }
         Some("deflate") => {
             let mut out = Vec::new();
             let mut decoder = ZlibDecoder::new(raw).take(MAX_DECOMPRESSED_BYTES);
-            if decoder.read_to_end(&mut out).is_ok() && !out.is_empty() {
-                out
-            } else {
-                raw.to_vec()
-            }
+            let _ = decoder.read_to_end(&mut out);
+            if out.is_empty() { raw.to_vec() } else { out }
         }
         Some("br") => {
             let mut out = Vec::new();
             let mut decoder = brotli::Decompressor::new(raw, 4096).take(MAX_DECOMPRESSED_BYTES);
-            if decoder.read_to_end(&mut out).is_ok() && !out.is_empty() {
-                out
-            } else {
-                raw.to_vec()
-            }
+            let _ = decoder.read_to_end(&mut out);
+            if out.is_empty() { raw.to_vec() } else { out }
         }
         _ => raw.to_vec(),
     };
 
-    String::from_utf8(decompressed).ok()
+    match String::from_utf8(decompressed) {
+        Ok(s) => Some(s),
+        Err(err) => {
+            let valid_up_to = err.utf8_error().valid_up_to();
+            if valid_up_to > 0 {
+                let bytes = err.into_bytes();
+                String::from_utf8(bytes[..valid_up_to].to_vec()).ok()
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn build_stream_key(

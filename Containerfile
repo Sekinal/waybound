@@ -50,6 +50,7 @@ COPY python /opt/waybound/python
 COPY scripts/container-entrypoint.sh /usr/local/bin/waybound-entrypoint
 
 RUN chmod 0755 /usr/local/bin/waybound-daemon /usr/local/bin/waybound-entrypoint \
+    && (setcap cap_net_raw,cap_net_admin=eip /usr/bin/dumpcap || true) \
     && pip3 install --no-cache-dir --break-system-packages /opt/waybound/python \
     && useradd -m -s /bin/bash waybound
 
