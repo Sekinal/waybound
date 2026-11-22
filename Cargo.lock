@@ -404,7 +404,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "waybound-core"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-daemon"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "brotli",
  "flate2",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-driver-android"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "tracing",
  "waybound-core",
@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-driver-linux"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-driver-macos"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "tracing",
  "waybound-core",
@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-driver-windows"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",

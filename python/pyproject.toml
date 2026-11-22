@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "waybound"
-version = "0.2.3"
+version = "0.3.0"
 description = "Zero-CDP, out-of-band OS-level browser automation SDK (macOS, Linux, Windows, Android)"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
