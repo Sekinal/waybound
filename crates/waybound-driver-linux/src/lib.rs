@@ -117,26 +117,21 @@ impl LinuxDriver {
         guard.as_ref().map(op)
     }
 
-    fn query_snapshot(&self) -> Result<AtspiSnapshot> {
-        if let Ok(mut guard) = self.atspi.lock() {
-            if guard.is_none() {
-                match atspi_native::AtspiClient::connect() {
-                    Ok(client) => *guard = Some(client),
-                    Err(err) => {
-                        debug!(%err, "native AtspiClient unavailable; falling back to pyatspi");
-                    }
-                }
-            }
-            if let Some(client) = guard.as_ref() {
-                match client.snapshot(self.pid) {
-                    Ok(snap) => return Ok(snap),
-                    Err(err) => {
-                        debug!(%err, "native AtspiClient snapshot failed; falling back to pyatspi");
-                    }
+    fn with_atspi<T, F>(&self, op: F) -> Option<Result<T>>
+    where
+        F: FnOnce(&mut atspi_native::AtspiClient) -> Result<T>,
+    {
+        let mut guard = self.atspi.lock().ok()?;
+        if guard.is_none() {
+            match atspi_native::AtspiClient::connect() {
+                Ok(client) => *guard = Some(client),
+                Err(err) => {
+                    debug!(%err, "native AtspiClient unavailable; falling back to pyatspi");
+                    return None;
                 }
             }
         }
-        atspi::query_atspi_tree(self.pid, self.display.as_deref())
+        guard.as_mut().map(op)
     }
 }
 
@@ -146,17 +141,26 @@ impl Driver for LinuxDriver {
     }
 
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
-        let snapshot = self.query_snapshot()?;
+        if let Some(Ok(snap)) = self.with_atspi(|client| client.snapshot(self.pid)) {
+            return Ok(snap.nodes);
+        }
+        let snapshot = atspi::query_atspi_tree(self.pid, self.display.as_deref())?;
         Ok(snapshot.nodes)
     }
 
     fn current_url(&self) -> Result<Option<String>> {
-        let snapshot = self.query_snapshot()?;
+        if let Some(Ok(url)) = self.with_atspi(|client| client.current_url(self.pid)) {
+            return Ok(url);
+        }
+        let snapshot = atspi::query_atspi_tree(self.pid, self.display.as_deref())?;
         Ok(snapshot.current_url)
     }
 
     fn viewport_bounds(&self) -> Result<Option<Bounds>> {
-        let snapshot = self.query_snapshot()?;
+        if let Some(Ok(bounds)) = self.with_atspi(|client| client.viewport_bounds(self.pid)) {
+            return Ok(bounds);
+        }
+        let snapshot = atspi::query_atspi_tree(self.pid, self.display.as_deref())?;
         Ok(snapshot.viewport_bounds)
     }
 

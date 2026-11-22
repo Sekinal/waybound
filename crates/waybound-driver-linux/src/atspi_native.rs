@@ -33,11 +33,15 @@ type AccessibleRef = (String, OwnedObjectPath);
 /// Persistent pure-Rust D-Bus client connected to the AT-SPI2 accessibility bus.
 pub struct AtspiClient {
     conn: Connection,
+    /// Cached `(target_pid, web_root)` so subsequent snapshots skip walking browser chrome.
+    cached_web_root: Option<(Option<i32>, AccessibleRef)>,
 }
 
 impl std::fmt::Debug for AtspiClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AtspiClient").finish_non_exhaustive()
+        f.debug_struct("AtspiClient")
+            .field("has_cached_web_root", &self.cached_web_root.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -62,15 +66,34 @@ impl AtspiClient {
                 reason: format!("failed to connect to AT-SPI2 bus: {err}"),
             })?;
         debug!(addr = %addr, "connected native pure-Rust AtspiClient");
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            cached_web_root: None,
+        })
     }
 
-    /// Captures a bounded accessibility snapshot of the active browser web document.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WayboundError::BackendUnavailable`] if the AT-SPI2 registry cannot be queried.
-    pub fn snapshot(&self, target_pid: Option<i32>) -> Result<AtspiSnapshot> {
+    /// Resolves the active `document web` node, reusing the cached reference when still alive.
+    fn resolve_web_root(
+        &mut self,
+        target_pid: Option<i32>,
+    ) -> Result<(Option<AccessibleRef>, Option<String>, Option<Bounds>)> {
+        if let Some((cached_pid, ref root)) = self.cached_web_root
+            && cached_pid == target_pid
+            && matches!(
+                self.get_role_name(&root.0, root.1.as_str())
+                    .as_deref()
+                    .map(str::trim),
+                Some("document web" | "document frame")
+            )
+            && let Some(bounds) = self.get_extents(&root.0, root.1.as_str())
+            && bounds.width > 0.0
+            && bounds.height > 0.0
+        {
+            let url = self.get_document_url(&root.0, root.1.as_str());
+            return Ok((Some(root.clone()), url, Some(bounds)));
+        }
+
+        self.cached_web_root = None;
         let apps = self
             .get_children(REGISTRY_BUS, REGISTRY_ROOT)
             .map_err(|err| WayboundError::BackendUnavailable {
@@ -79,14 +102,43 @@ impl AtspiClient {
             })?;
 
         let Some(target_app) = self.find_target_app(&apps, target_pid) else {
-            return Ok(AtspiSnapshot {
-                nodes: Vec::new(),
-                current_url: None,
-                viewport_bounds: None,
-            });
+            return Ok((None, None, None));
         };
 
-        let (web_root, mut current_url, viewport_bounds) = self.locate_web_document(&target_app);
+        let (web_root, current_url, viewport_bounds) = self.locate_web_document(&target_app);
+        if let Some(ref root) = web_root {
+            self.cached_web_root = Some((target_pid, root.clone()));
+        }
+        Ok((web_root, current_url, viewport_bounds))
+    }
+
+    /// Fast-path URL lookup on the active web document without walking DOM children.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WayboundError::BackendUnavailable`] if the AT-SPI2 registry cannot be queried.
+    pub fn current_url(&mut self, target_pid: Option<i32>) -> Result<Option<String>> {
+        let (_, url, _) = self.resolve_web_root(target_pid)?;
+        Ok(url.filter(|u| !u.trim().is_empty()))
+    }
+
+    /// Fast-path viewport bounds lookup on the active web document without walking DOM children.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WayboundError::BackendUnavailable`] if the AT-SPI2 registry cannot be queried.
+    pub fn viewport_bounds(&mut self, target_pid: Option<i32>) -> Result<Option<Bounds>> {
+        let (_, _, bounds) = self.resolve_web_root(target_pid)?;
+        Ok(bounds)
+    }
+
+    /// Captures a bounded accessibility snapshot of the active browser web document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WayboundError::BackendUnavailable`] if the AT-SPI2 registry cannot be queried.
+    pub fn snapshot(&mut self, target_pid: Option<i32>) -> Result<AtspiSnapshot> {
+        let (web_root, mut current_url, viewport_bounds) = self.resolve_web_root(target_pid)?;
         let Some(root) = web_root else {
             return Ok(AtspiSnapshot {
                 nodes: Vec::new(),
@@ -227,7 +279,11 @@ impl AtspiClient {
                 width: 0.0,
                 height: 0.0,
             });
-            let focused = self.is_focused(&bus, path.as_str());
+            let focused = if matches!(role, Role::StaticText | Role::Unknown | Role::Document) {
+                false
+            } else {
+                self.is_focused(&bus, path.as_str())
+            };
 
             if bounds.width >= 0.0 && bounds.height >= 0.0 {
                 nodes.push(AccessibilityNode {
