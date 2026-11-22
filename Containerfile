@@ -9,7 +9,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --release --bin waybound-daemon
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive \
     ACCESSIBILITY_ENABLED=1 \

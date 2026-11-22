@@ -110,7 +110,6 @@ pub fn build_xdotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
     match event {
         InputEvent::PointerMove { to } => vec![vec![
             "mousemove".to_owned(),
-            "--sync".to_owned(),
             format_coord(to.x),
             format_coord(to.y),
         ]],
@@ -134,7 +133,8 @@ pub fn build_xdotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
             let mut cmds = Vec::new();
             let y_steps = scroll_steps(*delta_y);
             if y_steps > 0 {
-                let btn = if *delta_y < 0.0 { "4" } else { "5" };
+                // Negative delta_y scrolls down (X11 button 5); positive scrolls up (button 4).
+                let btn = if *delta_y < 0.0 { "5" } else { "4" };
                 cmds.push(vec![
                     "click".to_owned(),
                     "--repeat".to_owned(),
@@ -441,7 +441,7 @@ mod tests {
             build_xdotool_commands(&InputEvent::PointerMove {
                 to: Point { x: 120.6, y: 45.2 },
             }),
-            vec![vec!["mousemove", "--sync", "121", "45"]]
+            vec![vec!["mousemove", "121", "45"]]
         );
 
         assert_eq!(
@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(
             build_xdotool_commands(&InputEvent::Scroll {
                 delta_x: 0.0,
-                delta_y: 3.0,
+                delta_y: -3.0,
             }),
             vec![vec!["click", "--repeat", "3", "--delay", "12", "5"]]
         );
@@ -557,7 +557,7 @@ mod tests {
                     y: f64::INFINITY,
                 },
             }),
-            vec![vec!["mousemove", "--sync", "0", "0"]]
+            vec![vec!["mousemove", "0", "0"]]
         );
 
         assert_eq!(

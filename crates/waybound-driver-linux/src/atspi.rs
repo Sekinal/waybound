@@ -23,8 +23,9 @@ pub struct AtspiSnapshot {
 /// Maps an AT-SPI2 role name (case-insensitive) to a normalized [`Role`].
 #[must_use]
 pub fn map_atspi_role(role: &str) -> Role {
-    match role.trim().to_ascii_lowercase().as_str() {
-        "push button" => Role::Button,
+    let normalized = role.trim().to_ascii_lowercase().replace(['-', '_'], " ");
+    match normalized.as_str() {
+        "button" | "push button" => Role::Button,
         "link" => Role::Link,
         "entry" | "password text" | "text" => Role::TextBox,
         "check box" => Role::CheckBox,
@@ -178,10 +179,93 @@ if target_app is None:
     print(json.dumps({"nodes": [], "current_url": None, "viewport_bounds": None}))
     sys.exit(0)
 
-nodes = []
+def read_text_value(acc):
+    try:
+        n = Atspi.Text.get_character_count(acc)
+        if 0 < n <= 4096:
+            return Atspi.Text.get_text(acc, 0, n)
+    except Exception:
+        pass
+    try:
+        text_iface = acc.get_text_iface()
+        if text_iface is not None:
+            n = text_iface.get_character_count()
+            if 0 < n <= 4096:
+                return text_iface.get_text(0, n)
+    except Exception:
+        pass
+    return None
+
+# Locate the active web document (`document web` with the largest non-zero viewport)
+# and also grab the omnibox URL as a fallback if DocURL/URI isn't exposed.
 current_url = None
 viewport_bounds = None
-queue = collections.deque([target_app])
+web_root = None
+best_area = -1.0
+scan_queue = collections.deque([target_app])
+scanned = 0
+
+while scan_queue and scanned < MAX_NODES:
+    acc = scan_queue.popleft()
+    if acc is None:
+        continue
+    scanned += 1
+    try:
+        r = (acc.get_role_name() or "").strip().lower()
+    except Exception:
+        r = ""
+    if r == "entry" and current_url is None:
+        try:
+            n = acc.get_name() or ""
+        except Exception:
+            n = ""
+        if n == "Address and search bar":
+            v = read_text_value(acc)
+            if v:
+                current_url = str(v)
+    if r in ("document web", "document frame"):
+        try:
+            comp = acc.get_component_iface()
+            if comp is not None:
+                rect = comp.get_extents(Atspi.CoordType.SCREEN)
+                area = max(0.0, float(rect.width)) * max(0.0, float(rect.height))
+                if area > best_area:
+                    best_area = area
+                    web_root = acc
+                    if rect.width > 0 and rect.height > 0:
+                        viewport_bounds = {
+                            "x": float(rect.x),
+                            "y": float(rect.y),
+                            "width": float(rect.width),
+                            "height": float(rect.height),
+                        }
+        except Exception:
+            if web_root is None:
+                web_root = acc
+        try:
+            doc = acc.get_document_iface()
+            if doc is not None:
+                attrs = doc.get_attributes() or {}
+                url = attrs.get("DocURL") or attrs.get("URI")
+                if url:
+                    current_url = str(url)
+        except Exception:
+            pass
+        continue
+    try:
+        cc = acc.get_child_count()
+    except Exception:
+        cc = 0
+    for idx in range(cc):
+        try:
+            child = acc.get_child_at_index(idx)
+            if child is not None:
+                scan_queue.append(child)
+        except Exception:
+            continue
+
+nodes = []
+queue = collections.deque([web_root if web_root is not None else target_app])
 
 while queue and len(nodes) < MAX_NODES:
     acc = queue.popleft()
@@ -199,14 +283,8 @@ while queue and len(nodes) < MAX_NODES:
         name = ""
 
     value = None
-    try:
-        text_iface = acc.get_text_iface()
-        if text_iface is not None and role_name in ("entry", "password text", "text", "combo box"):
-            char_count = text_iface.get_character_count()
-            if 0 < char_count <= 4096:
-                value = text_iface.get_text(0, char_count)
-    except Exception:
-        value = None
+    if role_name.strip().lower() in ("entry", "password text", "text", "combo box"):
+        value = read_text_value(acc)
 
     bx, by, bw, bh = 0.0, 0.0, 0.0, 0.0
     try:
@@ -241,6 +319,8 @@ while queue and len(nodes) < MAX_NODES:
                         current_url = str(url)
             except Exception:
                 pass
+    elif current_url is None and role_name == "entry" and name == "Address and search bar" and value:
+        current_url = str(value)
 
     nodes.append({
         "id": f"atspi-{len(nodes)}",
