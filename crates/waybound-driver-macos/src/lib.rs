@@ -7,6 +7,8 @@ mod ax;
 mod ffi;
 #[cfg(target_os = "macos")]
 mod input;
+#[cfg(any(target_os = "macos", test))]
+mod keymap;
 #[cfg(target_os = "macos")]
 mod screenshot;
 
@@ -82,6 +84,17 @@ impl Driver for MacOsDriver {
         }
     }
 
+    fn cursor_position(&self) -> Result<Option<Point>> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok(input::current_cursor_position())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(None)
+        }
+    }
+
     fn screenshot(&self, output_path: &Path) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
@@ -100,6 +113,14 @@ impl Driver for MacOsDriver {
     fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
+            // Clicks and keystrokes go to the frontmost application, so make sure that is
+            // the target browser before sending either.
+            if matches!(
+                event,
+                InputEvent::KeyPress { .. } | InputEvent::MouseClick { .. }
+            ) {
+                ax::ensure_frontmost(self.pid)?;
+            }
             let mut guard = self.cursor.lock().map_err(|_| {
                 waybound_core::WayboundError::BackendUnavailable {
                     backend: "macos_native".to_owned(),

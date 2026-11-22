@@ -200,7 +200,7 @@ pub fn build_input_shell_args(event: &InputEvent, last_cursor: &mut Point) -> Op
                 SCROLL_SWIPE_DURATION_MS.to_string(),
             ])
         }
-        InputEvent::KeyPress { key, modifiers: _ } => Some(build_key_shell_args(key)),
+        InputEvent::KeyPress { key, .. } => Some(build_key_shell_args(key)),
     }
 }
 
@@ -532,6 +532,7 @@ mod tests {
                 &InputEvent::KeyPress {
                     key: KeyCode::Enter,
                     modifiers: vec![],
+                    hold_ms: 0,
                 },
                 &mut cursor,
             ),
@@ -547,6 +548,7 @@ mod tests {
                 &InputEvent::KeyPress {
                     key: KeyCode::Tab,
                     modifiers: vec![],
+                    hold_ms: 0,
                 },
                 &mut cursor,
             ),
@@ -562,6 +564,7 @@ mod tests {
                 &InputEvent::KeyPress {
                     key: KeyCode::Escape,
                     modifiers: vec![],
+                    hold_ms: 0,
                 },
                 &mut cursor,
             ),
@@ -577,6 +580,7 @@ mod tests {
                 &InputEvent::KeyPress {
                     key: KeyCode::Backspace,
                     modifiers: vec![],
+                    hold_ms: 0,
                 },
                 &mut cursor,
             ),
@@ -592,6 +596,7 @@ mod tests {
                 &InputEvent::KeyPress {
                     key: KeyCode::Char(';'),
                     modifiers: vec![],
+                    hold_ms: 0,
                 },
                 &mut cursor,
             ),

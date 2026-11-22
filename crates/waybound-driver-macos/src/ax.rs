@@ -27,6 +27,63 @@ pub fn is_accessibility_trusted() -> bool {
     unsafe { AXIsProcessTrusted() != 0 }
 }
 
+const FRONTMOST_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+const FRONTMOST_POLL_ATTEMPTS: usize = 40;
+
+fn is_frontmost(app: &OwnedCf) -> bool {
+    copy_attr(app, "AXFrontmost")
+        .and_then(|v| cf_to_bool(&v))
+        .unwrap_or(false)
+}
+
+/// Makes the application `pid` frontmost, or fails without sending anything.
+///
+/// Events posted to the HID event tap are delivered to whichever application is frontmost,
+/// so keyboard input must never be sent before this succeeds: otherwise a URL or form text
+/// would be typed into the user's terminal or editor.
+///
+/// # Errors
+///
+/// Returns [`WayboundError::BackendUnavailable`] if Accessibility permission is missing or
+/// the application cannot be brought to the front.
+pub fn ensure_frontmost(pid: i32) -> Result<()> {
+    let unavailable = |reason: String| WayboundError::BackendUnavailable {
+        backend: "macos_native".to_owned(),
+        reason,
+    };
+    if pid <= 0 {
+        return Err(unavailable(format!("invalid target pid: {pid}")));
+    }
+    if !is_accessibility_trusted() {
+        return Err(unavailable(
+            "macOS Accessibility permission not granted (enable in System Settings > Privacy & Security > Accessibility)".to_owned(),
+        ));
+    }
+    // SAFETY: `AXUIElementCreateApplication` returns a `+1` retained `AXUIElementRef` or null.
+    let app = unsafe { OwnedCf::from_owned(AXUIElementCreateApplication(pid)) }
+        .ok_or_else(|| unavailable(format!("failed to create AXUIElement for pid {pid}")))?;
+
+    if is_frontmost(&app) {
+        return Ok(());
+    }
+
+    if let Some(key) = cf_string("AXFrontmost") {
+        // SAFETY: `app` and `key` are valid retained CF objects, and `kCFBooleanTrue` is a global CF constant.
+        let status =
+            unsafe { AXUIElementSetAttributeValue(app.as_ptr(), key.as_ptr(), kCFBooleanTrue) };
+        tracing::debug!(pid, status, "requested AXFrontmost on target application");
+    }
+    for _ in 0..FRONTMOST_POLL_ATTEMPTS {
+        if is_frontmost(&app) {
+            return Ok(());
+        }
+        std::thread::sleep(FRONTMOST_POLL);
+    }
+    Err(unavailable(format!(
+        "could not bring target browser (pid {pid}) to the front; refusing to send input to another application"
+    )))
+}
+
 fn open_window_root(pid: i32) -> Result<OwnedCf> {
     if pid <= 0 {
         return Err(WayboundError::BackendUnavailable {

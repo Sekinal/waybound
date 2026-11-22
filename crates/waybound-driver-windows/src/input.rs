@@ -303,7 +303,7 @@ pub mod win32_input {
                 }
                 send_inputs(&batch)
             }
-            InputEvent::KeyPress { key, modifiers } => {
+            InputEvent::KeyPress { key, modifiers, .. } => {
                 let has_shortcut_modifier = modifiers.iter().any(|m| {
                     matches!(
                         m,

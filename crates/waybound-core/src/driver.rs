@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::input::InputEvent;
+use crate::input::{InputEvent, Point};
 use crate::locator::{AccessibilityNode, Bounds, LocatorQuery};
 
 /// Supported execution backends.
@@ -109,6 +109,18 @@ pub trait Driver: Send + Sync {
     /// Returns an error if native navigation fails.
     fn navigate(&self, _url: &str) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Returns the current on-screen pointer position, if the backend can read it.
+    ///
+    /// Used by `waybound-daemon` as the start of planned pointer paths, so a move begins
+    /// where the cursor really is rather than at the last position the daemon sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OS input subsystem cannot be queried.
+    fn cursor_position(&self) -> Result<Option<Point>> {
+        Ok(None)
     }
 
     /// Returns the visible screen-space bounds of the active web viewport, if known.

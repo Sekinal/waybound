@@ -176,6 +176,10 @@ unsafe extern "C" {
         unicode_string: *const u16,
     );
     pub fn CGEventSetFlags(event: CgEventRef, flags: u64);
+    /// Creates an empty event carrying the current pointer location (`+1` retained).
+    pub fn CGEventCreate(source: CfTypeRef) -> CgEventRef;
+    /// Returns the event location in global display coordinates (top-left origin).
+    pub fn CGEventGetLocation(event: CgEventRef) -> CgPoint;
     pub fn CGEventPost(tap: u32, event: CgEventRef);
 }
 
