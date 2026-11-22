@@ -238,6 +238,22 @@ class UnixSocketTransport:
         """Navigate forward in browser history via native OS shortcut."""
         self._expect_ok({"method": "go_forward"}, "go_forward")
 
+    def new_tab(self, url: str | None = None) -> None:
+        """Open a new browser tab via native OS shortcut, optionally navigating to `url`."""
+        self._expect_ok({"method": "new_tab", "url": url}, "new_tab")
+
+    def close_tab(self) -> None:
+        """Close the active browser tab via native OS shortcut."""
+        self._expect_ok({"method": "close_tab"}, "close_tab")
+
+    def next_tab(self) -> None:
+        """Switch to the next browser tab (Ctrl+Tab)."""
+        self._expect_ok({"method": "next_tab"}, "next_tab")
+
+    def prev_tab(self) -> None:
+        """Switch to the previous browser tab (Ctrl+Shift+Tab)."""
+        self._expect_ok({"method": "prev_tab"}, "prev_tab")
+
     def screenshot(self, path: str) -> None:
         """Capture a native OS PNG screenshot of the browser window to `path`."""
         self._expect_ok({"method": "screenshot", "path": path}, "screenshot")

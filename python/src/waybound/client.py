@@ -130,6 +130,28 @@ class Page:
         """Navigate forward in browser history via native OS shortcut."""
         self._transport.go_forward()
 
+    def new_tab(self, url: str | None = None) -> None:
+        """Open a new browser tab via native OS shortcut, optionally navigating to `url`."""
+        self._transport.new_tab(url)
+
+    def close_tab(self) -> None:
+        """Close the active browser tab via native OS shortcut."""
+        self._transport.close_tab()
+
+    def next_tab(self) -> None:
+        """Switch to the next browser tab (Ctrl+Tab)."""
+        self._transport.next_tab()
+
+    def prev_tab(self) -> None:
+        """Switch to the previous browser tab (Ctrl+Shift+Tab)."""
+        self._transport.prev_tab()
+
+    def wait_for_text(
+        self, text: str, *, exact: bool = False, timeout_ms: int = 10_000
+    ) -> AccessibilityNode:
+        """Wait until any element with accessible text matching `text` appears."""
+        return self.get_by_text(text, exact=exact).wait_for(timeout_ms=timeout_ms)
+
     def scroll(self, *, delta_x: float = 0.0, delta_y: float = -300.0) -> None:
         """Scroll the viewport by `(delta_x, delta_y)` pixels."""
         self._transport.scroll(delta_x, delta_y)

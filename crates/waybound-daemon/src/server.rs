@@ -90,6 +90,7 @@ impl SessionState {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -> Response {
     match request {
         Request::Ping => Response::Pong {
@@ -138,6 +139,22 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             Err(err) => Response::from(&err),
         },
         Request::GoForward => match browser_shortcut(driver, BrowserAction::GoForward) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
+        Request::NewTab { url } => match open_new_tab(driver, url.as_deref()) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
+        Request::CloseTab => match browser_shortcut(driver, BrowserAction::CloseTab) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
+        Request::NextTab => match browser_shortcut(driver, BrowserAction::NextTab) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
+        Request::PrevTab => match browser_shortcut(driver, BrowserAction::PrevTab) {
             Ok(()) => Response::Ok,
             Err(err) => Response::from(&err),
         },
@@ -353,6 +370,19 @@ enum BrowserAction {
     Reload,
     GoBack,
     GoForward,
+    NewTab,
+    CloseTab,
+    NextTab,
+    PrevTab,
+}
+
+fn open_new_tab(driver: &dyn Driver, url: Option<&str>) -> Result<()> {
+    browser_shortcut(driver, BrowserAction::NewTab)?;
+    if let Some(dest) = url {
+        thread::sleep(Duration::from_millis(120));
+        navigate_url(driver, dest)?;
+    }
+    Ok(())
 }
 
 fn browser_shortcut(driver: &dyn Driver, action: BrowserAction) -> Result<()> {
@@ -364,6 +394,14 @@ fn browser_shortcut(driver: &dyn Driver, action: BrowserAction) -> Result<()> {
         (BrowserAction::GoBack, false) => (KeyCode::ArrowLeft, vec![KeyModifier::Alt]),
         (BrowserAction::GoForward, true) => (KeyCode::Char(']'), vec![KeyModifier::Meta]),
         (BrowserAction::GoForward, false) => (KeyCode::ArrowRight, vec![KeyModifier::Alt]),
+        (BrowserAction::NewTab, true) => (KeyCode::Char('t'), vec![KeyModifier::Meta]),
+        (BrowserAction::NewTab, false) => (KeyCode::Char('t'), vec![KeyModifier::Control]),
+        (BrowserAction::CloseTab, true) => (KeyCode::Char('w'), vec![KeyModifier::Meta]),
+        (BrowserAction::CloseTab, false) => (KeyCode::Char('w'), vec![KeyModifier::Control]),
+        (BrowserAction::NextTab, _) => (KeyCode::Tab, vec![KeyModifier::Control]),
+        (BrowserAction::PrevTab, _) => {
+            (KeyCode::Tab, vec![KeyModifier::Control, KeyModifier::Shift])
+        }
     };
     driver.dispatch_input(&InputEvent::KeyPress {
         key,

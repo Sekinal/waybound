@@ -149,6 +149,22 @@ class Transport(Protocol):
         """Navigate forward in browser history."""
         ...
 
+    def new_tab(self, url: str | None = None) -> None:
+        """Open a new browser tab, optionally navigating to `url`."""
+        ...
+
+    def close_tab(self) -> None:
+        """Close the active browser tab."""
+        ...
+
+    def next_tab(self) -> None:
+        """Switch to the next browser tab."""
+        ...
+
+    def prev_tab(self) -> None:
+        """Switch to the previous browser tab."""
+        ...
+
     def scroll(self, delta_x: float, delta_y: float) -> None:
         """Emit a native scroll event."""
         ...

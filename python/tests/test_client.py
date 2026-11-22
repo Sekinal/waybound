@@ -61,6 +61,18 @@ class FakeTransport:
     def go_forward(self) -> None:
         self.events.append(("go_forward", None))
 
+    def new_tab(self, url: str | None = None) -> None:
+        self.events.append(("new_tab", url))
+
+    def close_tab(self) -> None:
+        self.events.append(("close_tab", None))
+
+    def next_tab(self) -> None:
+        self.events.append(("next_tab", None))
+
+    def prev_tab(self) -> None:
+        self.events.append(("prev_tab", None))
+
     def scroll(self, delta_x: float, delta_y: float) -> None:
         self.events.append(("scroll", (delta_x, delta_y)))
 

@@ -27,5 +27,11 @@ def test_session_over_loopback_tcp_round_trips_requests() -> None:
             page.reload()
             page.go_back()
             page.go_forward()
+            page.new_tab()
+            page.next_tab()
+            page.prev_tab()
+            page.close_tab()
+            node = page.wait_for_text("Search")
+            assert node.name is not None
     except FileNotFoundError:
         pytest.skip("waybound-daemon binary not built in this environment")

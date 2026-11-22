@@ -60,3 +60,19 @@ jobs:
             echo "::error::tests were skipped; the daemon end-to-end tests must run in CI"
             exit 1
           fi
+
+  windows-live-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+      - name: Build waybound-daemon.exe
+        run: cargo build -p waybound-daemon
+      - name: Sync Python SDK
+        working-directory: python
+        run: uv sync --dev
+      - name: Run live Windows Chrome UIA + SendInput smoke test
+        working-directory: python
+        run: uv run python ../scripts/windows_live_smoke.py

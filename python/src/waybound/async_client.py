@@ -110,6 +110,30 @@ class AsyncPage:
         """Navigate forward in browser history via native OS shortcut."""
         await asyncio.to_thread(self._inner.go_forward)
 
+    async def new_tab(self, url: str | None = None) -> None:
+        """Open a new browser tab via native OS shortcut, optionally navigating to `url`."""
+        await asyncio.to_thread(self._inner.new_tab, url)
+
+    async def close_tab(self) -> None:
+        """Close the active browser tab via native OS shortcut."""
+        await asyncio.to_thread(self._inner.close_tab)
+
+    async def next_tab(self) -> None:
+        """Switch to the next browser tab (Ctrl+Tab)."""
+        await asyncio.to_thread(self._inner.next_tab)
+
+    async def prev_tab(self) -> None:
+        """Switch to the previous browser tab (Ctrl+Shift+Tab)."""
+        await asyncio.to_thread(self._inner.prev_tab)
+
+    async def wait_for_text(
+        self, text: str, *, exact: bool = False, timeout_ms: int = 10_000
+    ) -> AccessibilityNode:
+        """Wait until any element with accessible text matching `text` appears."""
+        return await asyncio.to_thread(
+            self._inner.wait_for_text, text, exact=exact, timeout_ms=timeout_ms
+        )
+
     async def scroll(self, *, delta_x: float = 0.0, delta_y: float = -300.0) -> None:
         """Scroll the viewport by `(delta_x, delta_y)` pixels."""
         await asyncio.to_thread(self._inner.scroll, delta_x=delta_x, delta_y=delta_y)

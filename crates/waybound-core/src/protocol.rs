@@ -57,6 +57,18 @@ pub enum Request {
     GoBack,
     /// Navigate forward in browser history via native OS shortcut (Cmd+] / Alt+Right).
     GoForward,
+    /// Open a new browser tab via native OS shortcut (Cmd/Ctrl+T), optionally navigating to `url`.
+    NewTab {
+        /// Optional destination URL to navigate to after opening the tab.
+        #[serde(default)]
+        url: Option<String>,
+    },
+    /// Close the active browser tab via native OS shortcut (Cmd/Ctrl+W).
+    CloseTab,
+    /// Switch to the next browser tab (Ctrl+Tab).
+    NextTab,
+    /// Switch to the previous browser tab (Ctrl+Shift+Tab).
+    PrevTab,
     /// Emit a native scroll event.
     Scroll {
         /// Horizontal scroll delta in pixels.
