@@ -10,11 +10,21 @@
 //! - **Linux:** the connecting socket is looked up in `/proc/net/tcp` (then `/proc/net/tcp6`,
 //!   for dual-stack clients using IPv4-mapped addresses) by its exact four-tuple, and the
 //!   connection is refused unless the socket's owning UID equals the daemon's effective UID
-//!   (read from `/proc/self/status`). Lookups that fail (socket gone, `/proc` unreadable)
-//!   are refused (fail closed). At startup the forwarder checks that its own listening socket
+//!   (read from `/proc/self/status`). Rows with inode 0 (orphaned sockets whose owner already
+//!   closed them, `TIME_WAIT` mini-sockets) report UID 0 regardless of who created them, so
+//!   they count as "not found". Because the kernel reads the table in chunks and can skip a
+//!   row whose hash bucket changes mid-read, a miss is retried once after a few
+//!   milliseconds. Lookups that still fail (socket gone, `/proc` unreadable) are refused
+//!   (fail closed). At startup the forwarder checks that its own listening socket
 //!   is visible in `/proc/net/tcp` under its own UID; if it is not (an unusual `/proc`,
 //!   gVisor-like sandboxes), enforcement would refuse Chrome too, so the forwarder logs a
 //!   warning and runs unrestricted instead.
+//!
+//!   The UID comparison means little when the daemon runs as root (UID 0: every root
+//!   process is admitted, and root can read the credentials anyway) or as the overflow UID
+//!   65534 (inside a user namespace every unmapped user's sockets also report 65534). The
+//!   check stays on in both cases, but a startup warning says the forwarder is effectively
+//!   unrestricted for those users.
 //!
 //!   Processes running as the *same* user are still allowed. Narrowing further to "the
 //!   launched browser or one of its descendants" would require mapping the socket inode to
@@ -73,10 +83,17 @@ pub fn platform_verifier(listen: SocketAddr) -> Arc<dyn PeerVerifier> {
     };
     match verifier.owns_listener(listen) {
         Ok(true) => {
-            tracing::debug!(
-                uid = verifier.uid(),
-                "local proxy forwarder restricted to the daemon's user"
-            );
+            if let Some(caveat) = procfs::uid_caveat(verifier.uid()) {
+                tracing::warn!(
+                    uid = verifier.uid(),
+                    "local proxy forwarder is effectively unrestricted: {caveat}"
+                );
+            } else {
+                tracing::debug!(
+                    uid = verifier.uid(),
+                    "local proxy forwarder restricted to the daemon's user"
+                );
+            }
             Arc::new(verifier)
         }
         Ok(false) => {
@@ -114,6 +131,8 @@ pub mod procfs {
     use std::io::{self, BufRead, BufReader, ErrorKind};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::path::PathBuf;
+    use std::thread;
+    use std::time::Duration;
 
     use super::{PeerDecision, PeerVerifier};
 
@@ -121,6 +140,26 @@ pub mod procfs {
     pub const STATE_TIME_WAIT: u8 = 0x06;
     /// `TCP_LISTEN`.
     pub const STATE_LISTEN: u8 = 0x0A;
+    /// The kernel's overflow UID, reported for UIDs unmapped in the reader's user namespace.
+    pub const OVERFLOW_UID: u32 = 65534;
+    /// Pause before re-reading the tables after a miss (see the module docs).
+    pub const LOOKUP_RETRY_PAUSE: Duration = Duration::from_millis(5);
+
+    /// Explains why the UID check is not a meaningful boundary for `uid`, if it is not.
+    #[must_use]
+    pub const fn uid_caveat(uid: u32) -> Option<&'static str> {
+        match uid {
+            0 => Some(
+                "the daemon runs as root, so any root-owned process can use the forwarder; \
+                 run waybound as an unprivileged user",
+            ),
+            OVERFLOW_UID => Some(
+                "the daemon runs as the overflow uid 65534, which every user unmapped in this \
+                 user namespace shares; run waybound under a mapped uid",
+            ),
+            _ => None,
+        }
+    }
 
     /// One parsed row of `/proc/net/tcp` or `/proc/net/tcp6`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +172,8 @@ pub mod procfs {
         pub state: u8,
         /// UID owning the socket.
         pub uid: u32,
+        /// Socket inode; 0 for orphaned and `TIME_WAIT` sockets, which have no owner.
+        pub inode: u64,
     }
 
     /// Converts an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to plain IPv4.
@@ -197,15 +238,25 @@ pub mod procfs {
             return None;
         }
         let uid = uid_field.parse().ok()?;
+        // timeout, then inode
+        let inode_field = fields.nth(1)?;
+        if !inode_field.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let inode = inode_field.parse().ok()?;
         Some(TcpEntry {
             local,
             remote,
             state,
             uid,
+            inode,
         })
     }
 
-    /// Returns the UID of the first live (not `TIME_WAIT`) socket matching `want`.
+    /// Returns the UID of the first owned socket (inode not 0, not `TIME_WAIT`) matching `want`.
+    ///
+    /// Orphaned sockets (the owning process already closed them) keep their four-tuple but
+    /// report UID 0 and inode 0; they are skipped so they can never pass as root-owned.
     ///
     /// # Errors
     ///
@@ -217,6 +268,7 @@ pub mod procfs {
         for line in reader.lines() {
             let line = line?;
             if let Some(entry) = parse_tcp_line(&line)
+                && entry.inode != 0
                 && entry.state != STATE_TIME_WAIT
                 && want(&entry)
             {
@@ -233,17 +285,46 @@ pub mod procfs {
         line.split_whitespace().nth(1)?.parse().ok()
     }
 
-    /// Allows only sockets owned by one UID, looked up under a `/proc` root.
+    /// Source of the kernel's TCP socket tables (a seam for tests).
+    pub trait TableSource: Send + Sync {
+        /// Opens table `name` (`tcp` or `tcp6`); `Ok(None)` if the table does not exist.
+        ///
+        /// # Errors
+        ///
+        /// Returns any other I/O error from opening the table.
+        fn open(&self, name: &str) -> io::Result<Option<Box<dyn BufRead>>>;
+    }
+
+    /// Reads tables from `<root>/net/<name>`.
+    pub struct ProcDir(pub PathBuf);
+
+    impl TableSource for ProcDir {
+        fn open(&self, name: &str) -> io::Result<Option<Box<dyn BufRead>>> {
+            match File::open(self.0.join("net").join(name)) {
+                Ok(file) => Ok(Some(Box::new(BufReader::new(file)))),
+                Err(err) if err.kind() == ErrorKind::NotFound && name != "tcp" => Ok(None),
+                Err(err) => Err(err),
+            }
+        }
+    }
+
+    /// Allows only sockets owned by one UID.
     pub struct ProcUidVerifier {
-        proc_root: PathBuf,
+        source: Box<dyn TableSource>,
         uid: u32,
     }
 
     impl ProcUidVerifier {
         /// Creates a verifier allowing `uid`, reading tables under `proc_root`.
         #[must_use]
-        pub const fn new(proc_root: PathBuf, uid: u32) -> Self {
-            Self { proc_root, uid }
+        pub fn new(proc_root: PathBuf, uid: u32) -> Self {
+            Self::with_source(Box::new(ProcDir(proc_root)), uid)
+        }
+
+        /// Creates a verifier allowing `uid`, reading tables from `source`.
+        #[must_use]
+        pub fn with_source(source: Box<dyn TableSource>, uid: u32) -> Self {
+            Self { source, uid }
         }
 
         /// Creates a verifier allowing the current process's effective UID.
@@ -265,18 +346,26 @@ pub mod procfs {
             self.uid
         }
 
-        /// Searches `net/tcp`, then `net/tcp6` (absent when IPv6 is disabled).
+        /// Searches `tcp`, then `tcp6` (absent when IPv6 is disabled), once.
+        fn lookup_once(&self, want: &impl Fn(&TcpEntry) -> bool) -> io::Result<Option<u32>> {
+            for name in ["tcp", "tcp6"] {
+                if let Some(table) = self.source.open(name)?
+                    && let Some(uid) = find_uid(table, want)?
+                {
+                    return Ok(Some(uid));
+                }
+            }
+            Ok(None)
+        }
+
+        /// Like [`Self::lookup_once`], but re-reads once after a miss: the kernel serves the
+        /// table in chunks and can skip a row when its hash bucket changes between them.
         fn lookup(&self, want: impl Fn(&TcpEntry) -> bool) -> io::Result<Option<u32>> {
-            let net = self.proc_root.join("net");
-            let v4 = File::open(net.join("tcp"))?;
-            if let Some(uid) = find_uid(BufReader::new(v4), &want)? {
+            if let Some(uid) = self.lookup_once(&want)? {
                 return Ok(Some(uid));
             }
-            match File::open(net.join("tcp6")) {
-                Ok(v6) => find_uid(BufReader::new(v6), &want),
-                Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-                Err(err) => Err(err),
-            }
+            thread::sleep(LOOKUP_RETRY_PAUSE);
+            self.lookup_once(&want)
         }
 
         /// Self-test: whether the listening socket on `listen` is visible and owned by us.
@@ -315,9 +404,12 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use std::io::{self, BufRead};
+    use std::sync::atomic::AtomicUsize;
+
     use super::procfs::{
-        ProcUidVerifier, STATE_LISTEN, TcpEntry, find_uid, parse_hex_socket_addr,
-        parse_status_euid, parse_tcp_line,
+        OVERFLOW_UID, ProcUidVerifier, STATE_LISTEN, TableSource, TcpEntry, find_uid,
+        parse_hex_socket_addr, parse_status_euid, parse_tcp_line, uid_caveat,
     };
     use super::*;
 
@@ -335,6 +427,135 @@ mod tests {
     const TCP6_HEADER: &str = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
     const TCP6_MAPPED_CLIENT_ROW: &str = "   0: 0000000000000000FFFF00000100007F:C351 0000000000000000FFFF00000100007F:A1B2 01 00000000:00000000 00:00000000 00000000  1002        0 41250 1 0000000000000000 20 4 30 10 -1";
     const TCP6_LOOPBACK_ROW: &str = "   1: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41260 1 0000000000000000 100 0 0 10 0";
+
+    // Rows from a real kernel (captured in a Linux container): a live client socket owned by
+    // uid 1234 connected to a forwarder on port 0xB663, and an orphaned socket in FIN_WAIT2
+    // whose owner wrote a request and closed it (uid and inode both reported as 0).
+    const REAL_CLIENT: &str = "127.0.0.1:54516"; // D4F4
+    const REAL_LISTEN: &str = "127.0.0.1:46691"; // B663
+    const REAL_ORPHAN: &str = "127.0.0.1:54892"; // D66C
+    const REAL_ORPHAN_LISTEN: &str = "127.0.0.1:43697"; // AAB1
+    const REAL_CLIENT_ROW: &str = "   7: 0100007F:D4F4 0100007F:B663 01 00000000:00000000 00:00000000 00000000  1234        0 327144 1 0000000000000000 20 4 30 10 -1";
+    const REAL_ORPHAN_ROW: &str = "   8: 0100007F:D66C 0100007F:AAB1 05 00000000:00000000 01:00000E9D 00000000     0        0 0 2 0000000000000000 20 4 30 10 -1";
+
+    /// In-memory tables; `tcp` is served empty for the first `misses` reads.
+    struct FakeTables {
+        tcp: String,
+        misses: usize,
+        tcp_reads: Arc<AtomicUsize>,
+    }
+
+    impl TableSource for FakeTables {
+        fn open(&self, name: &str) -> io::Result<Option<Box<dyn BufRead>>> {
+            if name != "tcp" {
+                return Ok(None);
+            }
+            let reads = self.tcp_reads.fetch_add(1, Ordering::SeqCst);
+            let body = if reads < self.misses {
+                TCP_HEADER.to_owned()
+            } else {
+                self.tcp.clone()
+            };
+            Ok(Some(Box::new(io::Cursor::new(body.into_bytes()))))
+        }
+    }
+
+    fn fake_verifier(
+        rows: &[&str],
+        misses: usize,
+        uid: u32,
+    ) -> (ProcUidVerifier, Arc<AtomicUsize>) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut table = vec![TCP_HEADER];
+        table.extend_from_slice(rows);
+        let source = FakeTables {
+            tcp: table.join("\n"),
+            misses,
+            tcp_reads: Arc::clone(&reads),
+        };
+        (ProcUidVerifier::with_source(Box::new(source), uid), reads)
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn parses_real_kernel_rows() {
+        assert_eq!(
+            parse_tcp_line(REAL_CLIENT_ROW),
+            Some(TcpEntry {
+                local: addr(REAL_CLIENT),
+                remote: addr(REAL_LISTEN),
+                state: STATE_ESTABLISHED,
+                uid: 1234,
+                inode: 327_144,
+            })
+        );
+        assert_eq!(
+            parse_tcp_line(REAL_ORPHAN_ROW),
+            Some(TcpEntry {
+                local: addr(REAL_ORPHAN),
+                remote: addr(REAL_ORPHAN_LISTEN),
+                state: 0x05,
+                uid: 0,
+                inode: 0,
+            })
+        );
+    }
+
+    /// An orphaned socket reports uid 0; a daemon running as root must not mistake it for
+    /// one of its own and forward the dead client's buffered request.
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn orphaned_socket_is_refused_even_for_root_daemon() {
+        for uid in [0, 1234] {
+            let (verifier, reads) = fake_verifier(&[REAL_ORPHAN_ROW, REAL_CLIENT_ROW], 0, uid);
+            let decision = verifier.verify(addr(REAL_ORPHAN), addr(REAL_ORPHAN_LISTEN));
+            assert!(
+                matches!(&decision, PeerDecision::Deny(r) if r.contains("not found")),
+                "uid {uid}: {decision:?}"
+            );
+            // A miss is re-read once before refusing.
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+        }
+        let (verifier, _) = fake_verifier(&[REAL_ORPHAN_ROW, REAL_CLIENT_ROW], 0, 1234);
+        assert_eq!(
+            verifier.verify(addr(REAL_CLIENT), addr(REAL_LISTEN)),
+            PeerDecision::Allow
+        );
+    }
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn row_skipped_by_one_read_is_found_on_retry() {
+        let (verifier, reads) = fake_verifier(&[REAL_CLIENT_ROW], 1, 1234);
+        assert_eq!(
+            verifier.verify(addr(REAL_CLIENT), addr(REAL_LISTEN)),
+            PeerDecision::Allow
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        // Only one retry: a row missing from two reads is refused.
+        let (verifier, reads) = fake_verifier(&[REAL_CLIENT_ROW], 2, 1234);
+        assert!(matches!(
+            verifier.verify(addr(REAL_CLIENT), addr(REAL_LISTEN)),
+            PeerDecision::Deny(_)
+        ));
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        // A hit on the first read does not re-read.
+        let (verifier, reads) = fake_verifier(&[REAL_CLIENT_ROW], 0, 1234);
+        assert_eq!(
+            verifier.verify(addr(REAL_CLIENT), addr(REAL_LISTEN)),
+            PeerDecision::Allow
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn root_and_overflow_uid_carry_a_caveat() {
+        assert!(uid_caveat(0).is_some_and(|c| c.contains("root")));
+        assert!(uid_caveat(OVERFLOW_UID).is_some_and(|c| c.contains("65534")));
+        assert_eq!(uid_caveat(1000), None);
+    }
 
     fn addr(s: &str) -> SocketAddr {
         s.parse()
@@ -395,6 +616,7 @@ mod tests {
                 remote: addr(LISTEN),
                 state: STATE_ESTABLISHED,
                 uid: 1001,
+                inode: 41_240,
             })
         );
         assert_eq!(
@@ -413,6 +635,9 @@ mod tests {
             "   1: 0100007F:C350 0100007F:A1B2 01 00000000:00000000 00:00000000 00000000",
             "   1: 0100007F:C350 0100007F:A1B2 01 00000000:00000000 00:00000000 00000000  -1",
             "   1: 0100007F:C350 0100007F:A1B2 01 00000000:00000000 00:00000000 00000000  99999999999",
+            "   1: 0100007F:C350 0100007F:A1B2 01 00000000:00000000 00:00000000 00000000  1001        0",
+            "   1: 0100007F:C350 0100007F:A1B2 01 00000000:00000000 00:00000000 00000000  1001        0 abc 1",
+            "   1: 0100007F:C350 0100007F:A1B2 01 00000000:00000000 00:00000000 00000000  1001        0 -5 1",
             "   1: 0100007F:C350 0100007F:A1B2 1 00000000:00000000 00:00000000 00000000  1001",
             "   1: 0100007F:C350 nonsense 01 00000000:00000000 00:00000000 00000000  1001",
         ] {
