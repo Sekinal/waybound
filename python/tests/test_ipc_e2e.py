@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from waybound import Page, Role, UnixSocketTransport, WayboundDaemonError
+from waybound import Page, Role, UnixSocketTransport, WayboundDaemonError, launch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DAEMON_BIN = REPO_ROOT / "target" / "debug" / "waybound-daemon"
@@ -55,3 +55,12 @@ def test_python_sdk_round_trip_with_rust_daemon() -> None:
         finally:
             proc.terminate()
             proc.wait(timeout=3.0)
+
+
+def test_ergonomic_launch_context_manager() -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    with launch(backend="mock", daemon_binary=DAEMON_BIN) as page:
+        page.get_by_role(Role.TEXTBOX, name="Origin").fill("NRT")
+        page.get_by_role(Role.BUTTON, name="Search").click()

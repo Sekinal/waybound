@@ -8,10 +8,12 @@ pub mod driver;
 pub mod error;
 pub mod input;
 pub mod locator;
+pub mod motion;
 pub mod protocol;
 
 pub use driver::{BackendKind, Driver, SessionConfig};
 pub use error::{Result, WayboundError};
 pub use input::{InputEvent, KeyCode, MouseButton, Point};
 pub use locator::{AccessibilityNode, Bounds, LocatorQuery, Role};
+pub use motion::{MotionConfig, MotionStep, plan_pointer_path};
 pub use protocol::{Request, Response};

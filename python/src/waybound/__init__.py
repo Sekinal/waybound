@@ -1,17 +1,21 @@
 """waybound: Ergonomic, out-of-band OS-level browser automation."""
 
 from waybound.client import Locator, Page
+from waybound.session import Session, launch
 from waybound.transport import UnixSocketTransport, WayboundDaemonError
-from waybound.types import BackendKind, Bounds, LocatorQuery, Role, Transport
+from waybound.types import AccessibilityNode, BackendKind, Bounds, LocatorQuery, Role, Transport
 
 __all__ = [
+    "AccessibilityNode",
     "BackendKind",
     "Bounds",
     "Locator",
     "LocatorQuery",
     "Page",
     "Role",
+    "Session",
     "Transport",
     "UnixSocketTransport",
     "WayboundDaemonError",
+    "launch",
 ]

@@ -45,6 +45,18 @@ class Bounds:
 
 
 @dataclass(frozen=True, slots=True)
+class AccessibilityNode:
+    """Single node captured from the OS accessibility tree."""
+
+    id: str
+    role: Role
+    name: str | None
+    value: str | None
+    bounds: Bounds
+    focused: bool
+
+
+@dataclass(frozen=True, slots=True)
 class LocatorQuery:
     """Semantic query resolved by the Rust control daemon."""
 
