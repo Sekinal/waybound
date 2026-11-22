@@ -48,7 +48,7 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut profile_dir = None;
     let mut ssl_keylog_file = None;
     let mut initial_url = None;
-    let mut proxy = None;
+    let mut proxy = env::var("WAYBOUND_PROXY").ok();
     let mut timezone = None;
     let mut locale = None;
     let mut no_motion = false;
@@ -195,63 +195,65 @@ fn main() -> ExitCode {
         }
     });
 
-    let (chrome_proxy_server, _proxy_forwarder) = match setup_proxy(cli.proxy) {
-        Ok(pair) => pair,
-        Err(msg) => {
-            tracing::error!(error = %msg, "failed to configure proxy");
+    // Keep `_launched` and `_proxy_forwarder` alive for the full lifetime of the daemon.
+    let (driver, use_motion, _launched, _proxy_forwarder): (
+        Arc<dyn Driver>,
+        bool,
+        Option<launcher::LaunchedChrome>,
+        Option<ProxyForwarder>,
+    ) = match cli.backend.as_str() {
+        "mock" => (Arc::new(MockDriver::sample_page()), false, None, None),
+        "macos" => {
+            let (target_pid, launched, fwd) = if cli.launch_chrome {
+                let (chrome_proxy_server, proxy_fwd) = match setup_proxy(cli.proxy) {
+                    Ok(pair) => pair,
+                    Err(msg) => {
+                        tracing::error!(error = %msg, "failed to configure proxy");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let opts = ChromeLaunchOptions {
+                    binary_path: None,
+                    profile_dir: cli.profile_dir,
+                    ssl_keylog_file: cli.ssl_keylog_file,
+                    initial_url: cli.initial_url,
+                    proxy_server: chrome_proxy_server,
+                    timezone: cli.timezone,
+                    locale: cli.locale,
+                };
+                match launch_chrome(&opts) {
+                    Ok(chrome) => {
+                        let pid = chrome.pid();
+                        (pid, Some(chrome), proxy_fwd)
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to launch Google Chrome");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else if let Some(pid) = cli.pid {
+                (pid, None, None)
+            } else {
+                tracing::error!("--backend macos requires either --pid <pid> or --launch-chrome");
+                return ExitCode::FAILURE;
+            };
+
+            tracing::info!(pid = target_pid, "starting macos native driver");
+            (
+                Arc::new(MacOsDriver::new(target_pid)),
+                !cli.no_motion,
+                launched,
+                fwd,
+            )
+        }
+        other => {
+            tracing::error!(
+                backend = other,
+                "unknown backend (expected 'mock' or 'macos')"
+            );
             return ExitCode::FAILURE;
         }
     };
-
-    // Keep `_launched` alive for the full lifetime of the daemon so Chrome is cleaned up on exit.
-    let (driver, use_motion, _launched): (Arc<dyn Driver>, bool, Option<launcher::LaunchedChrome>) =
-        match cli.backend.as_str() {
-            "mock" => (Arc::new(MockDriver::sample_page()), false, None),
-            "macos" => {
-                let (target_pid, launched) = if cli.launch_chrome {
-                    let opts = ChromeLaunchOptions {
-                        binary_path: None,
-                        profile_dir: cli.profile_dir,
-                        ssl_keylog_file: cli.ssl_keylog_file,
-                        initial_url: cli.initial_url,
-                        proxy_server: chrome_proxy_server,
-                        timezone: cli.timezone,
-                        locale: cli.locale,
-                    };
-                    match launch_chrome(&opts) {
-                        Ok(chrome) => {
-                            let pid = chrome.pid();
-                            (pid, Some(chrome))
-                        }
-                        Err(err) => {
-                            tracing::error!(error = %err, "failed to launch Google Chrome");
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                } else if let Some(pid) = cli.pid {
-                    (pid, None)
-                } else {
-                    tracing::error!(
-                        "--backend macos requires either --pid <pid> or --launch-chrome"
-                    );
-                    return ExitCode::FAILURE;
-                };
-
-                tracing::info!(pid = target_pid, "starting macos native driver");
-                (
-                    Arc::new(MacOsDriver::new(target_pid)),
-                    !cli.no_motion,
-                    launched,
-                )
-            }
-            other => {
-                tracing::error!(
-                    backend = other,
-                    "unknown backend (expected 'mock' or 'macos')"
-                );
-                return ExitCode::FAILURE;
-            }
-        };
 
     let options = ServerOptions { use_motion };
     if let Err(err) = server::serve_unix(&socket_path, &driver, responses, options) {

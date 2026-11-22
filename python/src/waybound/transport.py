@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import socket
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
@@ -39,6 +40,7 @@ class UnixSocketTransport:
     def __init__(self, socket_path: Path | str, *, timeout_s: float = 30.0) -> None:
         self._socket_path = Path(socket_path)
         self._base_timeout_s = timeout_s
+        self._lock = threading.Lock()
         self._sock: socket.socket | None = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._reader: TextIOWrapper | None = None
         self._writer: TextIOWrapper | None = None
@@ -121,20 +123,14 @@ class UnixSocketTransport:
     def wait_for(self, query: LocatorQuery, *, timeout_ms: int = 10_000) -> AccessibilityNode:
         """Poll until an element matching `query` appears or `timeout_ms` elapses."""
         clamped_ms = max(0, timeout_ms)
-        sock = self._sock
-        if sock is not None:
-            sock.settimeout(max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0))
-        try:
-            response = self._request(
-                {
-                    "method": "wait_for",
-                    "query": _encode_query(query),
-                    "timeout_ms": clamped_ms,
-                }
-            )
-        finally:
-            if self._sock is not None:
-                self._sock.settimeout(self._base_timeout_s)
+        response = self._request(
+            {
+                "method": "wait_for",
+                "query": _encode_query(query),
+                "timeout_ms": clamped_ms,
+            },
+            timeout_override_s=max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0),
+        )
         raw_node = response.get("node")
         if not isinstance(raw_node, dict):
             msg = f"unexpected wait_for response: {response!r}"
@@ -157,20 +153,14 @@ class UnixSocketTransport:
     def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
         """Wait until a passively captured HTTP response matches `url_contains`."""
         clamped_ms = max(0, timeout_ms)
-        sock = self._sock
-        if sock is not None:
-            sock.settimeout(max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0))
-        try:
-            response = self._request(
-                {
-                    "method": "wait_for_response",
-                    "url_contains": url_contains,
-                    "timeout_ms": clamped_ms,
-                }
-            )
-        finally:
-            if self._sock is not None:
-                self._sock.settimeout(self._base_timeout_s)
+        response = self._request(
+            {
+                "method": "wait_for_response",
+                "url_contains": url_contains,
+                "timeout_ms": clamped_ms,
+            },
+            timeout_override_s=max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0),
+        )
         raw_resp = response.get("response")
         if not isinstance(raw_resp, dict):
             msg = f"unexpected wait_for_response payload: {response!r}"
@@ -214,39 +204,52 @@ class UnixSocketTransport:
             msg = f"unexpected {op} response: {response!r}"
             raise WayboundDaemonError("protocol_error", msg)
 
-    def _request(self, payload: dict[str, object]) -> dict[str, object]:
-        if self._writer is None or self._reader is None:
-            raise WayboundDaemonError("closed", "transport is closed")
+    def _request(
+        self,
+        payload: dict[str, object],
+        *,
+        timeout_override_s: float | None = None,
+    ) -> dict[str, object]:
+        with self._lock:
+            if self._writer is None or self._reader is None or self._sock is None:
+                raise WayboundDaemonError("closed", "transport is closed")
 
-        try:
-            self._writer.write(json.dumps(payload) + "\n")
-            self._writer.flush()
-            raw_line = self._reader.readline()
-        except OSError as exc:
-            self.close()
-            raise WayboundDaemonError("io_error", str(exc)) from exc
+            if timeout_override_s is not None:
+                self._sock.settimeout(timeout_override_s)
+            try:
+                try:
+                    self._writer.write(json.dumps(payload) + "\n")
+                    self._writer.flush()
+                    raw_line = self._reader.readline()
+                except OSError as exc:
+                    self.close()
+                    raise WayboundDaemonError("io_error", str(exc)) from exc
 
-        if not raw_line:
-            self.close()
-            raise WayboundDaemonError("eof", "daemon closed connection unexpectedly")
+                if not raw_line:
+                    self.close()
+                    raise WayboundDaemonError("eof", "daemon closed connection unexpectedly")
 
-        try:
-            decoded: object = json.loads(raw_line)
-        except json.JSONDecodeError as exc:
-            self.close()
-            raise WayboundDaemonError("protocol_error", f"invalid JSON: {exc}") from exc
+                try:
+                    decoded: object = json.loads(raw_line)
+                except json.JSONDecodeError as exc:
+                    self.close()
+                    raise WayboundDaemonError("protocol_error", f"invalid JSON: {exc}") from exc
 
-        if not isinstance(decoded, dict):
-            self.close()
-            msg = f"expected JSON object from daemon, got {type(decoded).__name__}"
-            raise WayboundDaemonError("protocol_error", msg)
+                if not isinstance(decoded, dict):
+                    self.close()
+                    msg = f"expected JSON object from daemon, got {type(decoded).__name__}"
+                    raise WayboundDaemonError("protocol_error", msg)
 
-        if decoded.get("status") == "error":
-            code = str(decoded.get("code", "unknown"))
-            message = str(decoded.get("message", "unknown error"))
-            raise WayboundDaemonError(code, message)
+                if decoded.get("status") == "error":
+                    code = str(decoded.get("code", "unknown"))
+                    message = str(decoded.get("message", "unknown error"))
+                    raise WayboundDaemonError(code, message)
 
-        return decoded
+                return decoded
+            finally:
+                if timeout_override_s is not None and self._sock is not None:
+                    with contextlib.suppress(OSError):
+                        self._sock.settimeout(self._base_timeout_s)
 
 
 def _parse_role(raw: object) -> Role:

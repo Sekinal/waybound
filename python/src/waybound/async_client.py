@@ -108,7 +108,11 @@ class AsyncSession:
         self._session = Session(options)
 
     async def __aenter__(self) -> AsyncPage:
-        page = await asyncio.to_thread(self._session.__enter__)
+        try:
+            page = await asyncio.to_thread(self._session.__enter__)
+        except BaseException:
+            await asyncio.to_thread(self._session.close)
+            raise
         return AsyncPage(page)
 
     async def __aexit__(

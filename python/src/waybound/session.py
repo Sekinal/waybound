@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import shutil
 import subprocess
 import tempfile
@@ -123,8 +124,6 @@ class Session:
             cmd.extend(["--profile-dir", str(Path(opts.profile_dir))])
         if opts.ssl_keylog is not None:
             cmd.extend(["--ssl-keylog", str(Path(opts.ssl_keylog))])
-        if opts.proxy is not None:
-            cmd.extend(["--proxy", opts.proxy])
         if opts.timezone is not None:
             cmd.extend(["--timezone", opts.timezone])
         if opts.locale is not None:
@@ -132,12 +131,18 @@ class Session:
         if opts.no_motion:
             cmd.append("--no-motion")
 
+        child_env = os.environ.copy()
+        if opts.proxy is not None:
+            # Pass proxy via env var so credentials do not appear in process argv (`ps`).
+            child_env["WAYBOUND_PROXY"] = opts.proxy
+
         try:
             with stderr_log.open("wb") as stderr_file:
                 proc = subprocess.Popen(  # noqa: S603
                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=stderr_file,
+                    env=child_env,
                 )
             self._proc = proc
             transport = _connect_with_retry(socket_path, stderr_log, proc, opts.startup_timeout_s)
