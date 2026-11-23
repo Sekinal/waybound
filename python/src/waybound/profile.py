@@ -20,7 +20,7 @@ is counted against a budget derived from the manifest, and extended headers are 
 from __future__ import annotations
 
 import contextlib
-import gzip
+import glob
 import hashlib
 import importlib.metadata
 import io
@@ -57,8 +57,8 @@ DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024
 """Default cap on the total uncompressed size of a bundle's payload."""
 MAX_FILES = 200_000
 MAX_MANIFEST_BYTES = 32 * 1024 * 1024
-MAX_PAX_HEADER_BYTES = 64 * 1024
-"""Largest PAX extended header record accepted (they normally hold one long path)."""
+MAX_PAX_HEADER_BYTES = 4 * 1024
+"""Largest PAX extended header accepted per entry (normally one long path, < 1.1 KiB)."""
 MAX_PATH_LEN = 1024
 MAX_COMPONENT_BYTES = 255
 _BLOCK = 512
@@ -455,12 +455,15 @@ def _check_lock(root: Path, *, ignore_lock: bool) -> list[str]:
 _PREFIX_RE = re.compile(rb"^v[0-9]{2}$")
 
 
-def detect_cookie_encryption(profile_dir: Path | str) -> tuple[str, ...] | None:
+def detect_cookie_encryption(
+    profile_dir: Path | str, *, scratch_dir: Path | str | None = None
+) -> tuple[str, ...] | None:
     """Return the distinct version prefixes (`v10`, `v11`, `v20`) of encrypted cookies.
 
     Returns `()` when there are no encrypted cookies and `None` when a cookie database
     exists but cannot be read. Each database is copied, with its `-wal` and `-journal`
-    files, into a private temporary directory and opened there, so rows still in the WAL are
+    files, into a private (0700) temporary directory under `scratch_dir` (default: the
+    system temp dir), opened there and removed afterwards, so rows still in the WAL are
     seen and the source files are never touched. (`-shm` is not copied: SQLite rebuilds the
     WAL index from the `-wal` file.) Only the first three bytes of each `encrypted_value`
     are read; cookie names and values are never read or decrypted.
@@ -475,16 +478,16 @@ def detect_cookie_encryption(profile_dir: Path | str) -> tuple[str, ...] | None:
             path = entry / db
             if path.is_symlink() or not path.is_file():
                 continue
-            found = _read_prefixes(path)
+            found = _read_prefixes(path, scratch_dir)
             if found is None:
                 return None
             prefixes.update(found)
     return tuple(sorted(prefixes))
 
 
-def _read_prefixes(db: Path) -> set[str] | None:
+def _read_prefixes(db: Path, scratch_dir: Path | str | None) -> set[str] | None:
     found: set[str] = set()
-    with tempfile.TemporaryDirectory(prefix="waybound-cookies-") as tmp:
+    with tempfile.TemporaryDirectory(prefix=".waybound-cookies-", dir=scratch_dir) as tmp:
         copy = Path(tmp) / "Cookies"
         try:
             for suffix in _SQLITE_SIDECARS:
@@ -756,6 +759,25 @@ def export_profile(  # noqa: PLR0913
         msg = f"bundle already exists: {out} (pass overwrite=True / --force to replace it)"
         raise ProfileError(msg)
 
+    created = _make_private_parents(out.parent)
+    try:
+        manifest, manifest_bytes, skipped = _build_manifest(
+            root, out, include_credentials, password_store, warnings
+        )
+        _write_bundle(root, out, manifest, manifest_bytes)
+    except BaseException:
+        _remove_created(created)
+        raise
+    return ExportResult(out, manifest, tuple(skipped), tuple(warnings))
+
+
+def _build_manifest(
+    root: Path,
+    out: Path,
+    include_credentials: bool,
+    password_store: PasswordStoreKind | None,
+    warnings: list[str],
+) -> tuple[Manifest, bytes, list[str]]:
     rel_paths, skipped = _collect(root, include_credentials)
     if len(rel_paths) > MAX_FILES:
         msg = f"profile has {len(rel_paths)} files to export; the limit is {MAX_FILES}"
@@ -769,7 +791,8 @@ def export_profile(  # noqa: PLR0913
         files.append(ManifestFile(rel, size, digest))
 
     os_name = current_os()
-    prefixes = detect_cookie_encryption(root)
+    # The cookie database copy lives next to the bundle, not in a shared system temp dir.
+    prefixes = detect_cookie_encryption(root, scratch_dir=out.parent)
     manifest = Manifest(
         format_version=FORMAT_VERSION,
         waybound_version=_waybound_version(),
@@ -786,18 +809,11 @@ def export_profile(  # noqa: PLR0913
     if len(manifest_bytes) > MAX_MANIFEST_BYTES:
         msg = f"manifest would exceed {MAX_MANIFEST_BYTES} bytes; the profile has too many files"
         raise ProfileError(msg)
-
-    _write_bundle(root, out, manifest, manifest_bytes)
-    return ExportResult(out, manifest, tuple(skipped), tuple(warnings))
+    return manifest, manifest_bytes, skipped
 
 
 def _write_bundle(root: Path, out: Path, manifest: Manifest, manifest_bytes: bytes) -> None:
-    created = _make_private_parents(out.parent)
-    try:
-        fd, tmp_name = tempfile.mkstemp(prefix=".waybound-bundle-", suffix=".tmp", dir=out.parent)
-    except BaseException:
-        _remove_created(created)
-        raise
+    fd, tmp_name = tempfile.mkstemp(prefix=".waybound-bundle-", suffix=".tmp", dir=out.parent)
     tmp = Path(tmp_name)
     try:
         with (
@@ -815,7 +831,6 @@ def _write_bundle(root: Path, out: Path, manifest: Manifest, manifest_bytes: byt
         tmp.replace(out)
     except BaseException:
         tmp.unlink(missing_ok=True)
-        _remove_created(created)
         raise
 
 
@@ -950,9 +965,45 @@ class _Readable(Protocol):
     def close(self) -> None: ...
 
 
+class _GzipMember:
+    """Decompresses exactly one gzip member and rejects anything after it.
+
+    :class:`gzip.GzipFile` silently concatenates members; here the stream ends with the
+    first member, zlib verifies its CRC-32 and length trailer, and trailing bytes (another
+    member or garbage) are an error.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._fh = path.open("rb")
+        self._inflate = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+        self._buf = b""
+
+    def read(self, size: int = -1, /) -> bytes:
+        if size < 0:
+            msg = "unbounded reads are not supported"
+            raise ValueError(msg)
+        while len(self._buf) < size and not self._inflate.eof:
+            data = self._inflate.unconsumed_tail or self._fh.read(64 * 1024)
+            if not data:
+                msg = "bundle is truncated (the gzip stream ends early)"
+                raise BundleVerificationError(msg)
+            self._buf += self._inflate.decompress(data, size - len(self._buf))
+            self._reject_trailing_data()
+        out, self._buf = self._buf[:size], self._buf[size:]
+        return out
+
+    def _reject_trailing_data(self) -> None:
+        if self._inflate.eof and (self._inflate.unused_data or self._fh.read(1)):
+            msg = "unexpected data after the gzip stream (concatenated member or garbage)"
+            raise BundleVerificationError(msg)
+
+    def close(self) -> None:
+        self._fh.close()
+
+
 def _open_gzip(bundle: Path) -> _Readable:
     """Open the decompressed stream of a bundle (a seam for tests that count bytes)."""
-    return gzip.open(bundle, "rb")
+    return _GzipMember(bundle)
 
 
 class _BoundedStream:
@@ -962,6 +1013,7 @@ class _BoundedStream:
         self._raw = raw
         self.limit = limit
         self.consumed = 0
+        self.pax_bytes = 0
 
     def _reserve(self, n: int) -> None:
         if n < 0 or self.consumed + n > self.limit:
@@ -983,6 +1035,16 @@ class _BoundedStream:
     def read_exact(self, n: int) -> bytes:
         return b"".join(self.chunks(n))
 
+    def expect_end(self) -> None:
+        """After the first end-of-archive block: only zero padding may follow, then EOF."""
+        trailing = 0
+        while chunk := self._raw.read(_BLOCK):
+            trailing += len(chunk)
+            self._reserve(len(chunk))
+            if trailing > _MAX_TRAILER_BYTES or any(chunk):
+                msg = "unexpected data after the end of the archive"
+                raise BundleVerificationError(msg)
+
 
 @dataclass(frozen=True, slots=True)
 class _TarHeader:
@@ -992,7 +1054,18 @@ class _TarHeader:
 
 
 _REGULAR_TYPES = frozenset({b"0", b"\x00"})
-_OCTAL_RE = re.compile(rb"^[0-7]+$")
+_OCTAL_RE = re.compile(rb"[0-7]{1,22}")
+_DECIMAL_RE = re.compile(rb"[0-9]{1,20}")
+_MAX_TRAILER_BYTES = 2 * 20 * _BLOCK
+"""Zero padding accepted after the end marker (tar pads archives to 10 KiB records)."""
+
+_PAX_USED_KEYS = frozenset({"path", "size"})
+_PAX_IGNORED_KEYS = frozenset(
+    {"mtime", "atime", "ctime", "uid", "gid", "uname", "gname"}
+    | {"SCHILY.dev", "SCHILY.ino", "SCHILY.nlink", "SCHILY.fflags", "LIBARCHIVE.creationtime"}
+)
+_PAX_IGNORED_PREFIXES = ("SCHILY.xattr.", "LIBARCHIVE.xattr.")
+"""Metadata other tools write that does not change a regular file's name or content."""
 
 
 def _padded(n: int) -> int:
@@ -1003,7 +1076,7 @@ def _octal(field: bytes, what: str) -> int:
     text = field.split(b"\x00", 1)[0].strip(b" ")
     if not text:
         return 0
-    if not _OCTAL_RE.match(text):
+    if not _OCTAL_RE.fullmatch(text):
         raise _fail(f"tar header {what} is not an octal number")
     return int(text, 8)
 
@@ -1014,19 +1087,23 @@ def _parse_pax(data: bytes) -> dict[str, str]:
     while pos < len(data):
         space = data.find(b" ", pos)
         length_text = data[pos:space] if space > pos else b""
-        if not length_text.isdigit():
+        if not _DECIMAL_RE.fullmatch(length_text):
             raise _fail("malformed PAX extended header")
         length = int(length_text)
         record = data[pos : pos + length]
         if length <= len(length_text) + 1 or len(record) != length or not record.endswith(b"\n"):
             raise _fail("malformed PAX extended header")
-        key, eq, value = record[space - pos + 1 : -1].partition(b"=")
+        key_bytes, eq, value_bytes = record[space - pos + 1 : -1].partition(b"=")
         if not eq:
             raise _fail("malformed PAX extended header")
         try:
-            records[key.decode("utf-8")] = value.decode("utf-8")
+            key, value = key_bytes.decode("utf-8"), value_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise _fail("PAX extended header is not UTF-8") from exc
+        if key in _PAX_USED_KEYS:
+            records[key] = value
+        elif key not in _PAX_IGNORED_KEYS and not key.startswith(_PAX_IGNORED_PREFIXES):
+            raise _fail(f"unsupported PAX extended header key {key!r}")
         pos += length
     return records
 
@@ -1036,6 +1113,8 @@ def _read_header(stream: _BoundedStream) -> _TarHeader | None:
     while True:
         block = stream.read_exact(_BLOCK)
         if not any(block):
+            if pax is not None:
+                raise _fail("PAX extended header without a following entry")
             return None
         checksum = sum(block[:148]) + 8 * 0x20 + sum(block[156:])
         if _octal(block[148:156], "checksum") != checksum:
@@ -1071,9 +1150,10 @@ def _apply_pax(name: str, size: int, pax: dict[str, str] | None) -> tuple[str, i
     if pax is None:
         return name, size
     if "size" in pax:
-        if not pax["size"].isdigit():
+        raw = pax["size"].encode("ascii", errors="replace")
+        if not _DECIMAL_RE.fullmatch(raw):
             raise _fail("malformed PAX size")
-        size = int(pax["size"])
+        size = int(raw)
     return pax.get("path", name), size
 
 
@@ -1118,7 +1198,7 @@ def _copy_verified(stream: _BoundedStream, spec: ManifestFile, sink: _Sink | Non
 def _payload_budget(manifest: Manifest) -> int:
     per_member = 2 * _BLOCK + MAX_PAX_HEADER_BYTES
     body = sum(_padded(f.size) for f in manifest.files)
-    return body + len(manifest.files) * per_member + 2 * _BLOCK
+    return body + len(manifest.files) * per_member + _BLOCK + _MAX_TRAILER_BYTES
 
 
 def _scan_stream(
@@ -1155,6 +1235,7 @@ def _scan_stream(
         raise _fail(
             f"bundle is missing {len(missing)} file(s) listed in the manifest, e.g. {missing[0]!r}"
         )
+    stream.expect_end()
     return manifest
 
 
@@ -1178,7 +1259,7 @@ def _scan_bundle(
         stream = _BoundedStream(raw, MAX_MANIFEST_BYTES + MAX_PAX_HEADER_BYTES + 4 * _BLOCK)
         try:
             return _scan_stream(stream, max_bytes, sink, manifest_only=manifest_only)
-        except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+        except (EOFError, zlib.error, ValueError, OverflowError) as exc:
             msg = f"corrupt bundle: {exc}"
             raise BundleVerificationError(msg) from exc
 
@@ -1197,50 +1278,86 @@ def verify_bundle(bundle: Path | str, *, max_bytes: int = DEFAULT_MAX_BYTES) -> 
 # Import
 # --------------------------------------------------------------------------------------
 
+TargetState = Literal["absent", "empty", "empty_mount", "replace"]
+
+
+def _is_regular_file(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except OSError:
+        return False
+
 
 def _looks_like_profile(target: Path) -> bool:
+    default = target / "Default"
     return (
-        (target / "Local State").is_file()
-        or (target / "Default").is_dir()
-        or (target / IMPORT_MARKER).is_file()
+        _is_regular_file(target / "Local State")
+        or (not default.is_symlink() and _is_regular_file(default / "Preferences"))
+        or _is_regular_file(target / IMPORT_MARKER)
     )
 
 
-def _check_target(target: Path, *, force: bool, ignore_lock: bool) -> bool:
-    """Validate the destination; return True when it already exists."""
+def _target_state(
+    target: Path, *, force: bool, ignore_lock: bool, staging: Path | None = None
+) -> TargetState:
+    """Classify the destination, refusing unsafe ones (`staging` is ignored if inside)."""
     if target.is_symlink():
         msg = f"refusing to import into a symlink: {target}"
         raise ProfileError(msg)
     if not target.exists():
-        return False
+        return "absent"
     if not target.is_dir():
         msg = f"target exists and is not a directory: {target}"
         raise ProfileError(msg)
     resolved = target.resolve()
-    if (
-        resolved == Path(resolved.anchor)
-        or os.path.ismount(resolved)
-        or Path.home().resolve().is_relative_to(resolved)
-    ):
+    if resolved == Path(resolved.anchor) or Path.home().resolve().is_relative_to(resolved):
         msg = (
-            f"refusing to import into {resolved}: it is a filesystem root, a mount point, or "
-            "contains your home directory"
+            f"refusing to import into {resolved}: it is a filesystem root or contains your "
+            "home directory"
         )
         raise ProfileError(msg)
-    if any(target.iterdir()):
-        if not force:
-            msg = (
-                f"target directory is not empty: {target} (pass force=True / --force to replace it)"
-            )
-            raise ProfileError(msg)
-        if not _looks_like_profile(target):
-            msg = (
-                f"--force only replaces a Chrome user-data-dir (Local State or Default/ "
-                f"present) or a previous waybound import; {target} is neither"
-            )
-            raise ProfileError(msg)
-        _check_lock(target, ignore_lock=ignore_lock)
-    return True
+    is_mount = os.path.ismount(resolved)
+    entries = [e for e in target.iterdir() if staging is None or e.name != staging.name]
+    if not entries:
+        return "empty_mount" if is_mount else "empty"
+    if is_mount:
+        msg = (
+            f"refusing to replace the contents of mount point {resolved}; import into an empty "
+            "mount point or a directory inside it"
+        )
+        raise ProfileError(msg)
+    if not force:
+        msg = f"target directory is not empty: {target} (pass force=True / --force to replace it)"
+        raise ProfileError(msg)
+    if not _looks_like_profile(target):
+        msg = (
+            "--force only replaces a Chrome user-data-dir (a 'Local State' file or "
+            f"'Default/Preferences') or a previous waybound import; {target} is neither"
+        )
+        raise ProfileError(msg)
+    _check_lock(target, ignore_lock=ignore_lock)
+    return "replace"
+
+
+def _leftover_warnings(target: Path) -> list[str]:
+    """Report copies left by interrupted imports (they may hold live session cookies)."""
+    name = glob.escape(target.name)
+    found: list[Path] = []
+    with contextlib.suppress(OSError):
+        found += sorted(target.parent.glob(f".{name}.waybound-import-*"))
+        found += sorted(target.parent.glob(f".{name}.waybound-backup-*"))
+        if target.is_dir() and not target.is_symlink():
+            found += sorted(target.glob(".waybound-import-*"))
+    return [
+        f"found {path}, left by an interrupted import; it may hold live session cookies. "
+        + (
+            f"It is the previous profile: rename it to {target} to restore it, or delete it."
+            if ".waybound-backup-" in path.name
+            else "It is an unfinished or verified-but-unplaced import: delete it, or rename it "
+            "into place yourself."
+        )
+        for path in found
+    ]
 
 
 def _write_marker(staging: Path, manifest: Manifest) -> None:
@@ -1252,47 +1369,134 @@ def _write_marker(staging: Path, manifest: Manifest) -> None:
     (staging / IMPORT_MARKER).write_text(json.dumps(marker), encoding="utf-8")
 
 
-def _swap_into_place(staging: Path, target: Path, *, existing: bool) -> list[str]:
-    """Atomically replace `target` with the verified `staging` dir (same parent)."""
-    if not existing:
-        try:
-            staging.rename(target)
-        except OSError as exc:
-            msg = f"could not move the verified profile into place ({exc}); it is kept at {staging}"
-            raise ProfileError(msg) from exc
-        return []
+def _kept(staging: Path) -> str:
+    return f"the verified import (it holds live session cookies) is kept at {staging}"
+
+
+def _recheck(
+    staging: Path, target: Path, state: TargetState, *, force: bool, ignore_lock: bool
+) -> TargetState:
+    """Re-run every target check right before anything is moved."""
+    inner = staging if state == "empty_mount" else None
+    try:
+        now = _target_state(target, force=force, ignore_lock=ignore_lock, staging=inner)
+    except ProfileError as exc:
+        raise type(exc)(f"{exc}; nothing was replaced and {_kept(staging)}") from exc
+    if now != state and not (state == "absent" and now == "empty"):
+        msg = (
+            f"the target changed while the bundle was extracted ({state} -> {now}); nothing "
+            f"was replaced and {_kept(staging)}"
+        )
+        raise ProfileError(msg)
+    return now
+
+
+def _move_into_empty(staging: Path, target: Path, *, empty: bool) -> None:
+    try:
+        if empty and os.name == "nt":
+            target.rmdir()
+        # POSIX rename() replaces an empty directory atomically and fails (ENOTEMPTY or
+        # ENOTDIR) if anything appeared at the target in the meantime.
+        staging.rename(target)
+    except OSError as exc:
+        msg = f"could not move the verified profile into place ({exc}); {_kept(staging)}"
+        raise ProfileError(msg) from exc
+    except BaseException as exc:
+        exc.add_note(_kept(staging))
+        raise
+
+
+def _replace_existing(staging: Path, target: Path) -> list[str]:
     backup = target.with_name(f".{target.name}.waybound-backup-{secrets.token_hex(6)}")
     try:
         target.rename(backup)
     except OSError as exc:
         msg = (
-            f"could not move the existing profile aside ({exc}); nothing was changed and the "
-            f"verified import is kept at {staging}"
+            f"could not move the existing profile aside ({exc}); nothing was changed and "
+            f"{_kept(staging)}"
         )
         raise ProfileError(msg) from exc
+    except BaseException as exc:
+        exc.add_note(f"{_kept(staging)}; the existing profile may have been moved to {backup}")
+        raise
     try:
         staging.rename(target)
     except BaseException as exc:
         try:
             backup.rename(target)
-        except OSError as rollback_exc:
+        except BaseException as rollback_exc:
             msg = (
                 f"could not move the verified profile into place ({exc}) nor restore the old "
-                f"one ({rollback_exc}): old profile at {backup}, verified import at {staging}"
+                f"one ({rollback_exc}): old profile at {backup}, {_kept(staging)}"
             )
             raise ProfileError(msg) from exc
         if isinstance(exc, OSError):
             msg = (
                 f"could not move the verified profile into place ({exc}); the original was "
-                f"restored and the verified import is kept at {staging}"
+                f"restored and {_kept(staging)}"
             )
             raise ProfileError(msg) from exc
+        exc.add_note(f"the original profile was restored; {_kept(staging)}")
         raise
     try:
         shutil.rmtree(backup)
     except OSError as exc:
         return [f"the previous profile could not be fully removed ({exc}); it remains at {backup}"]
+    except BaseException as exc:
+        exc.add_note(f"the import finished, but the previous profile is partly left at {backup}")
+        raise
     return []
+
+
+def _fill_mount(staging: Path, target: Path) -> None:
+    """Move verified entries from `staging` (inside the mount) into `target`. Not atomic."""
+    moved: list[Path] = []
+    try:
+        for entry in sorted(staging.iterdir()):
+            dest = target / entry.name
+            if os.path.lexists(dest):
+                msg = f"{dest} appeared while the bundle was being imported"
+                raise ProfileError(msg)
+            entry.rename(dest)
+            moved.append(dest)
+        staging.rmdir()
+    except BaseException:
+        for path in reversed(moved):
+            with contextlib.suppress(OSError):
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _place(
+    staging: Path, target: Path, state: TargetState, *, force: bool, ignore_lock: bool
+) -> list[str]:
+    now = _recheck(staging, target, state, force=force, ignore_lock=ignore_lock)
+    if now == "empty_mount":
+        _fill_mount(staging, target)
+        return []
+    if now == "replace":
+        return _replace_existing(staging, target)
+    _move_into_empty(staging, target, empty=now == "empty")
+    return []
+
+
+def _assess(manifest: Manifest, allow_incompatible: bool) -> tuple[Compatibility, list[str]]:
+    compat = assess_compatibility(
+        manifest.source_os,
+        manifest.password_store,
+        current_os(),
+        prefixes=manifest.cookie_encryption_prefixes,
+    )
+    if compat.level == "incompatible":
+        if not allow_incompatible:
+            msg = f"{compat.message} (pass allow_incompatible=True to import anyway)"
+            raise IncompatibleBundleError(msg)
+        return compat, [f"importing anyway: {compat.message}"]
+    return compat, [] if compat.level == "portable" else [compat.message]
 
 
 def import_profile(  # noqa: PLR0913
@@ -1307,41 +1511,33 @@ def import_profile(  # noqa: PLR0913
     """Verify a bundle and restore it as a Chrome user-data-dir.
 
     Everything is extracted into a private sibling staging directory
-    (`.<name>.waybound-import-*`) and hash-checked before the target is touched. The
-    verified directory then replaces the target with renames: the old target is moved
-    aside, the new one moved in, and the old one deleted only after that succeeded (rolled
-    back if not). A non-empty target is replaced only with `force`, and only when it looks
-    like a Chrome user-data-dir or a previous import. Bundles whose cookies cannot decrypt on
-    this OS are refused unless `allow_incompatible`. Restored directories are 0700, files
-    0600.
+    (`.<name>.waybound-import-*`) and hash-checked before the target is touched. All target
+    checks are then repeated, and the verified directory is put in place with renames: an
+    absent or empty target is replaced in one `rename`; a non-empty one (only with `force`,
+    and only if it looks like a Chrome user-data-dir or a previous import) is moved aside,
+    the new one moved in, and the old one deleted only after that succeeded (rolled back if
+    not). An empty mount point is filled in place instead (staging inside the mount; not
+    atomic). Bundles whose cookies cannot decrypt on this OS are refused unless
+    `allow_incompatible`. Restored directories are 0700, files 0600.
     """
     src = Path(bundle)
     target = Path(os.path.abspath(profile_dir))  # noqa: PTH100 - normalizes '..'
     manifest = read_manifest(src, max_bytes=max_bytes)
+    compat, warnings = _assess(manifest, allow_incompatible)
+    warnings.extend(_leftover_warnings(target))
 
-    compat = assess_compatibility(
-        manifest.source_os,
-        manifest.password_store,
-        current_os(),
-        prefixes=manifest.cookie_encryption_prefixes,
-    )
-    warnings: list[str] = []
-    if compat.level == "incompatible":
-        if not allow_incompatible:
-            msg = f"{compat.message} (pass allow_incompatible=True to import anyway)"
-            raise IncompatibleBundleError(msg)
-        warnings.append(f"importing anyway: {compat.message}")
-    elif compat.level != "portable":
-        warnings.append(compat.message)
-
-    existing = _check_target(target, force=force, ignore_lock=ignore_lock)
+    state = _target_state(target, force=force, ignore_lock=ignore_lock)
+    in_mount = state == "empty_mount"
     try:
         created = _make_private_parents(target.parent)
         staging = Path(
-            tempfile.mkdtemp(prefix=f".{target.name}.waybound-import-", dir=target.parent)
+            tempfile.mkdtemp(
+                prefix=".waybound-import-" if in_mount else f".{target.name}.waybound-import-",
+                dir=target if in_mount else target.parent,
+            )
         )
     except OSError as exc:
-        msg = f"cannot create a staging directory next to {target}: {exc}"
+        msg = f"cannot create a staging directory for {target}: {exc}"
         raise ProfileError(msg) from exc
     try:
         staged = _scan_bundle(src, max_bytes, _Sink(staging))
@@ -1356,5 +1552,7 @@ def import_profile(  # noqa: PLR0913
             msg = f"could not extract the bundle: {exc}"
             raise ProfileError(msg) from exc
         raise
-    warnings.extend(_swap_into_place(staging, target, existing=existing))
+    warnings.extend(_place(staging, target, state, force=force, ignore_lock=ignore_lock))
+    if in_mount:
+        target.chmod(0o700)
     return ImportResult(target, manifest, compat, tuple(warnings))

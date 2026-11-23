@@ -252,6 +252,9 @@ def _run_profile(args: list[str]) -> int:
     except (ProfileError, OSError) as exc:
         sys.stderr.write(f"error: {exc}\n")
         return 1
+    except Exception as exc:  # last resort: never show a traceback
+        sys.stderr.write(f"error: unexpected {type(exc).__name__}: {exc}\n")
+        return 1
     return 0
 
 
