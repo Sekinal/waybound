@@ -106,6 +106,7 @@ jobs:
             at-spi2-core \
             dbus-x11 \
             gir1.2-atspi-2.0 \
+            openbox \
             python3-gi \
             scrot \
             xclip \
@@ -127,6 +128,7 @@ jobs:
           QT_ACCESSIBILITY: "1"
         run: |
           xvfb-run -a -s "-screen 0 1280x800x24" dbus-run-session -- bash -c '
+            openbox >/dev/null 2>&1 &
             if [ -x /usr/libexec/at-spi-bus-launcher ]; then
               /usr/libexec/at-spi-bus-launcher --launch-immediately >/dev/null 2>&1 &
             elif [ -x /usr/lib/at-spi2-core/at-spi-bus-launcher ]; then
