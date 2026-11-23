@@ -217,9 +217,18 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
                 Err(err) => Response::from(&err),
             }
         }
-        Request::CapturedResponses { url_contains } => Response::HttpResponses {
-            responses: state.responses.list(url_contains.as_deref()),
-        },
+        // A dead tshark tap is reported rather than a list that silently stops growing.
+        Request::CapturedResponses { url_contains } => state.responses.capture_error().map_or_else(
+            || Response::HttpResponses {
+                responses: state.responses.list(url_contains.as_deref()),
+            },
+            |reason| {
+                Response::from(&WayboundError::BackendUnavailable {
+                    backend: "net_tap".to_owned(),
+                    reason,
+                })
+            },
+        ),
         Request::CapturedWebsocketFrames {
             url_contains,
             limit,
@@ -1613,6 +1622,35 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn capture_calls_report_a_dead_tshark_tap() {
+        let driver = MockDriver::sample_page();
+        let state = state();
+        let listed = handle_request(
+            &driver,
+            &state,
+            Request::CapturedResponses { url_contains: None },
+        );
+        assert!(matches!(listed, Response::HttpResponses { .. }));
+
+        state
+            .responses
+            .mark_capture_failed("tshark capture on interface en0 stopped".to_owned());
+        for request in [
+            Request::CapturedResponses { url_contains: None },
+            Request::WaitForResponse {
+                url_contains: "/api".to_owned(),
+                timeout_ms: 5_000,
+            },
+        ] {
+            let response = handle_request(&driver, &state, request);
+            assert!(
+                matches!(response, Response::Error { ref code, .. } if code == "backend_unavailable"),
+                "{response:?}"
+            );
+        }
     }
 
     #[test]
