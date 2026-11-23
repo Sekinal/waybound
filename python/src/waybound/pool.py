@@ -13,6 +13,7 @@ Designed for Crawlee's `AutoscaledPool` and standalone concurrent crawlers:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import dataclasses
 import os
@@ -20,6 +21,7 @@ import select
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -32,7 +34,7 @@ from waybound.session import LaunchOptions, Session
 from waybound.transport import UnixSocketTransport, WayboundDaemonError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Callable, Sequence
     from collections.abc import Set as AbstractSet
     from types import TracebackType
 
@@ -50,12 +52,20 @@ _XVFB_POLL_INTERVAL_S = 0.05
 _ATSPI_SETTLE_DELAY_S = 0.2
 _CHILD_STOP_TIMEOUT_S = 2.0
 _CHILD_KILL_TIMEOUT_S = 1.0
+# Bounds every slot health check, so a hung daemon is recycled instead of blocking `acquire`
+# for the transport's 30 s default (the TypeScript pool uses a similar bounded ping).
+_HEALTH_CHECK_TIMEOUT_S = 5.0
 _ATSPI_LAUNCHER_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/libexec/at-spi-bus-launcher"),
     Path("/usr/lib/at-spi2-core/at-spi-bus-launcher"),
 )
 # X11 display lock files (`.X<N>-lock`) and sockets (`.X11-unix/X<N>`) are fixed by X11 spec.
 _X11_LOCK_DIR = Path("/tmp")  # noqa: S108
+
+# Display numbers reserved by any pool in this process, so two pools never pick the same one
+# in the moment before its Xvfb has written a lock file.
+_PROCESS_DISPLAYS_LOCK = threading.Lock()
+_PROCESS_RESERVED_DISPLAYS: set[int] = set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,22 +171,56 @@ def build_slot_env(
     return env
 
 
+def _read_lock_owner(lock_file: Path) -> int | None:
+    """Return the pid recorded in an X11 lock file, or `None` if absent or unparsable."""
+    try:
+        raw = lock_file.read_text(encoding="ascii", errors="replace").strip()
+    except OSError:
+        return None
+    return int(raw) if raw.isdigit() else None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # e.g. PermissionError: the process exists but belongs to someone else
+        return True
+    return True
+
+
+def _display_taken(candidate: int, lock_dir: Path) -> bool:
+    """A display is taken if it has a live lock, or a socket without a readable stale lock.
+
+    A lock whose owner pid is dead is stale (an Xvfb that was killed leaves it behind) and
+    does not count; `_IsolatedDisplayStack` then verifies that its own Xvfb took the lock.
+    """
+    lock_file = lock_dir / f".X{candidate}-lock"
+    x11_sock = lock_dir / ".X11-unix" / f"X{candidate}"
+    if lock_file.exists():
+        owner = _read_lock_owner(lock_file)
+        return owner is None or _pid_alive(owner)
+    return x11_sock.exists()
+
+
 def find_free_display_num(
     start: int = 100,
     *,
     reserved: AbstractSet[int] = frozenset(),
     lock_dir: Path = _X11_LOCK_DIR,
 ) -> int:
-    """Find the lowest X11 display number `>= start` not in `reserved` or locked on disk."""
+    """Find the lowest X11 display number `>= start` not in `reserved` or in use on disk.
+
+    A lock file whose owner process no longer exists is treated as free.
+    """
     if start < 0:
         msg = f"display_base must be non-negative, got {start}"
         raise ValueError(msg)
     for candidate in range(start, start + _MAX_DISPLAY_SCAN):
         if candidate in reserved:
             continue
-        lock_file = lock_dir / f".X{candidate}-lock"
-        x11_sock = lock_dir / ".X11-unix" / f"X{candidate}"
-        if not lock_file.exists() and not x11_sock.exists():
+        if not _display_taken(candidate, lock_dir):
             return candidate
     msg = f"no free X11 display numbers available starting from :{start}"
     raise RuntimeError(msg)
@@ -205,6 +249,33 @@ def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
             proc.wait(timeout=_CHILD_KILL_TIMEOUT_S)
 
 
+# Display stacks not yet closed, so an interpreter exit without `BrowserPool.close()` (an
+# unhandled exception or Ctrl-C) does not leave their Xvfb/D-Bus/openbox/AT-SPI behind.
+_LIVE_STACKS: set[_IsolatedDisplayStack] = set()
+_LIVE_STACKS_LOCK = threading.Lock()
+
+
+def _close_live_stacks() -> None:
+    with _LIVE_STACKS_LOCK:
+        stacks = list(_LIVE_STACKS)
+    for stack in stacks:
+        with contextlib.suppress(Exception):
+            stack.close()
+
+
+def _forget_stacks_after_fork() -> None:
+    """A forked child must not tear down its parent's display stacks at exit."""
+    global _LIVE_STACKS_LOCK, _PROCESS_DISPLAYS_LOCK  # noqa: PLW0603 - locks held at fork
+    _LIVE_STACKS_LOCK = threading.Lock()
+    _LIVE_STACKS.clear()
+    _PROCESS_DISPLAYS_LOCK = threading.Lock()
+
+
+atexit.register(_close_live_stacks)
+if sys.platform != "win32":
+    os.register_at_fork(after_in_child=_forget_stacks_after_fork)
+
+
 class _IsolatedDisplayStack:
     """Owns per-slot `Xvfb`, `dbus-daemon`, `openbox`, and `at-spi-bus-launcher` processes."""
 
@@ -219,6 +290,9 @@ class _IsolatedDisplayStack:
         self.display = f":{display_num}" if display_num is not None else None
         self.env = env
         self._processes = processes
+        self._owner_pid = os.getpid()
+        with _LIVE_STACKS_LOCK:
+            _LIVE_STACKS.add(self)
 
     @classmethod
     def start(cls, display_num: int) -> _IsolatedDisplayStack:
@@ -314,17 +388,28 @@ class _IsolatedDisplayStack:
 
     @staticmethod
     def _wait_for_xvfb(proc: subprocess.Popen[bytes], display_num: int) -> None:
+        # Ready only when *our* Xvfb owns the display: if another process already runs a
+        # server on this number, its socket exists too and ours is about to exit, and using
+        # the display would silently drive someone else's server.
         sock_path = _X11_LOCK_DIR / ".X11-unix" / f"X{display_num}"
+        lock_path = _X11_LOCK_DIR / f".X{display_num}-lock"
         deadline = time.monotonic() + _XVFB_READY_TIMEOUT_S
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 msg = f"Xvfb :{display_num} exited prematurely (code {proc.returncode})"
+                owner = _read_lock_owner(lock_path)
+                if owner is not None:
+                    msg += f"; display :{display_num} is owned by pid {owner}"
                 raise RuntimeError(msg)
-            if sock_path.exists():
+            if sock_path.exists() and _read_lock_owner(lock_path) == proc.pid:
                 return
             time.sleep(_XVFB_POLL_INTERVAL_S)
         if proc.poll() is not None:
             msg = f"Xvfb :{display_num} exited prematurely (code {proc.returncode})"
+            raise RuntimeError(msg)
+        owner = _read_lock_owner(lock_path)
+        if owner is not None and owner != proc.pid:
+            msg = f"Xvfb :{display_num} is owned by another process (pid {owner})"
             raise RuntimeError(msg)
 
     @staticmethod
@@ -371,8 +456,56 @@ class _IsolatedDisplayStack:
         """Terminate all spawned display/D-Bus/WM child processes in reverse order."""
         processes = self._processes
         self._processes = []
-        for proc in reversed(processes):
-            _terminate_process(proc)
+        try:
+            if self._owner_pid == os.getpid():  # never from a forked child
+                for proc in reversed(processes):
+                    _terminate_process(proc)
+        finally:
+            with _LIVE_STACKS_LOCK:
+                _LIVE_STACKS.discard(self)
+
+
+async def _run_detached[T](
+    fn: Callable[[], T], on_abandoned: Callable[[asyncio.Future[T]], None]
+) -> T:
+    """Run blocking `fn` in a thread without letting cancellation lose its result.
+
+    Cancelling the awaiting task cannot stop a running thread. Instead of dropping whatever
+    `fn` produces (a launched slot, a health verdict), `on_abandoned` receives its future once
+    it completes, so the caller can clean up or put the slot back.
+    """
+    future = asyncio.get_running_loop().run_in_executor(None, fn)
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        future.add_done_callback(on_abandoned)
+        raise
+
+
+def _check_parallel_input(options: LaunchOptions, *, isolated_displays: bool) -> None:
+    """Refuse local pools whose slots would share one pointer/keyboard (or one device)."""
+    backend = options.backend
+    if backend in ("macos", "windows"):
+        msg = (
+            f"size > 1 is not supported for backend={backend!r}: every slot would drive the "
+            "one real desktop pointer, keyboard and window focus, so parallel slots would steal "
+            "each other's clicks and keystrokes. Use size=1, remote_workers, or Linux with "
+            "isolated_displays=True."
+        )
+        raise ValueError(msg)
+    if backend == "linux" and not isolated_displays:
+        msg = (
+            "size > 1 with backend='linux' requires isolated_displays=True: otherwise every slot "
+            "shares one X display (or the daemon's single headless_xvfb display :99) and its "
+            "input."
+        )
+        raise ValueError(msg)
+    if backend == "android":
+        msg = (
+            "size > 1 with backend='android' is not supported locally: every slot would drive the "
+            "same adb device. Use remote_workers with one device per worker."
+        )
+        raise ValueError(msg)
 
 
 class _PoolSlot:
@@ -400,12 +533,23 @@ class _PoolSlot:
         self._remote_transport = remote_transport
         self._display_stack = display_stack
 
-    def ping(self) -> str:
-        """Verify that the slot's daemon connection is healthy."""
+    def ping(self) -> None:
+        """Verify that the slot is healthy; raise `RuntimeError` or `WayboundDaemonError` if not.
+
+        Healthy means the daemon (local or remote) answers a ping within
+        `_HEALTH_CHECK_TIMEOUT_S` and, when it launched the browser, reports the browser still
+        running (`browser_alive`); a local daemon must also still be running.
+        """
         if self._session is not None:
-            return self._session.ping()
+            if not self._session.is_healthy(timeout_s=_HEALTH_CHECK_TIMEOUT_S):
+                msg = "slot is unhealthy (daemon or browser gone, or ping timed out)"
+                raise RuntimeError(msg)
+            return
         if self._remote_transport is not None:
-            return self._remote_transport.ping()
+            if self._remote_transport.browser_alive(timeout_s=_HEALTH_CHECK_TIMEOUT_S) is False:
+                msg = "remote worker reports its browser is no longer running"
+                raise RuntimeError(msg)
+            return
         msg = "slot has neither local session nor remote transport"
         raise RuntimeError(msg)
 
@@ -447,7 +591,7 @@ def _parse_remote_workers(
 class BrowserPool:
     """Async pool of isolated local or remote `waybound` browser sessions."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0915
         self,
         *,
         size: int | None = None,
@@ -483,6 +627,8 @@ class BrowserPool:
                 "(multiple Chrome slots cannot share one --user-data-dir)"
             )
             raise ValueError(msg)
+        if not parsed_remotes and resolved_size > 1:
+            _check_parallel_input(resolved_options, isolated_displays=isolated_displays)
         if max_uses_per_slot is not None and max_uses_per_slot < 1:
             msg = f"max_uses_per_slot must be >= 1, got {max_uses_per_slot}"
             raise ValueError(msg)
@@ -509,6 +655,9 @@ class BrowserPool:
         self._idle: deque[_PoolSlot] = deque()
         self._active_slots: set[_PoolSlot] = set()
         self._reserved_displays: set[int] = set()
+        # Slot teardowns still running in threads (started by cancelled tasks or callbacks);
+        # `close()` waits for them so nothing outlives the pool.
+        self._background: set[asyncio.Future[None]] = set()
         self._proxy_cursor = 0
         self._slot_counter = 0
         self._started = False
@@ -592,19 +741,75 @@ class BrowserPool:
             return (proxy, False)
         return (self._launch_options.proxy, False)
 
+    def _reserve_display(self) -> int:
+        with _PROCESS_DISPLAYS_LOCK:
+            display_num = find_free_display_num(
+                self._display_base,
+                reserved=self._reserved_displays | _PROCESS_RESERVED_DISPLAYS,
+            )
+            _PROCESS_RESERVED_DISPLAYS.add(display_num)
+        self._reserved_displays.add(display_num)
+        return display_num
+
+    def _unreserve_display(self, display_num: int) -> None:
+        self._reserved_displays.discard(display_num)
+        with _PROCESS_DISPLAYS_LOCK:
+            _PROCESS_RESERVED_DISPLAYS.discard(display_num)
+
     def _release_slot_resources(self, slot: _PoolSlot) -> None:
         if slot.display_num is not None:
-            self._reserved_displays.discard(slot.display_num)
+            self._unreserve_display(slot.display_num)
             slot.display_num = None
         if slot.remote_worker is not None:
             self._available_remotes.append(slot.remote_worker)
             slot.remote_worker = None
 
-    async def _destroy_slot(self, slot: _PoolSlot) -> None:
+    def _destroy_in_background(self, slot: _PoolSlot) -> asyncio.Future[None]:
+        """Start tearing `slot` down in a thread; its resources are released when that ends."""
+        loop = asyncio.get_running_loop()
         try:
-            await asyncio.to_thread(slot.close)
-        finally:
+            future = loop.run_in_executor(None, slot.close)
+        except RuntimeError:
+            # The loop's executor is shutting down (e.g. `asyncio.run` unwinding after Ctrl-C
+            # while a cancelled launch was still finishing): close on a dedicated thread, which
+            # the interpreter waits for, instead of leaking the slot.
+            def _close_now() -> None:
+                try:
+                    slot.close()
+                finally:
+                    self._release_slot_resources(slot)
+
+            threading.Thread(target=_close_now, name="waybound-pool-teardown").start()
+            done: asyncio.Future[None] = loop.create_future()
+            done.set_result(None)
+            return done
+        self._background.add(future)
+
+        def _done(_: asyncio.Future[None]) -> None:
+            self._background.discard(future)
             self._release_slot_resources(slot)
+
+        future.add_done_callback(_done)
+        return future
+
+    async def _destroy_slot(self, slot: _PoolSlot) -> None:
+        # Shielded: cancelling the caller must not abandon a half-closed slot.
+        await asyncio.shield(self._destroy_in_background(slot))
+
+    def _health_check_abandoned(self, slot: _PoolSlot) -> Callable[[asyncio.Future[None]], None]:
+        """Callback for a health check whose caller was cancelled: keep or destroy the slot."""
+
+        def _settle(future: asyncio.Future[None]) -> None:
+            healthy = not future.cancelled() and future.exception() is None
+            if healthy and not self._is_closed():
+                self._idle.append(slot)
+                return
+            if not healthy:
+                self._failed += 1
+                self._recycled += 1
+            self._destroy_in_background(slot)
+
+        return _settle
 
     async def _pop_healthy_idle(self, proxy: str | None) -> _PoolSlot | None:
         while self._idle:
@@ -625,11 +830,13 @@ class BrowserPool:
                 slot = self._idle.popleft()
 
             try:
-                await asyncio.to_thread(slot.ping)
+                await _run_detached(slot.ping, self._health_check_abandoned(slot))
             except (OSError, WayboundDaemonError, RuntimeError):
                 self._failed += 1
                 self._recycled += 1
-                await self._destroy_slot(slot)
+                # Tear the dead slot down in the background (a hung daemon can take seconds
+                # to stop) so this acquire can launch a replacement right away.
+                self._destroy_in_background(slot)
                 continue
 
             if self._is_closed():
@@ -660,8 +867,16 @@ class BrowserPool:
                 raise
             return transport
 
+        def _abandoned(future: asyncio.Future[UnixSocketTransport]) -> None:
+            if not future.cancelled() and future.exception() is None:
+                with contextlib.suppress(OSError):
+                    future.result().close()
+            self._available_remotes.append(raw_worker)
+
         try:
-            transport = await asyncio.to_thread(_connect)
+            transport = await _run_detached(_connect, _abandoned)
+        except asyncio.CancelledError:
+            raise  # `_abandoned` returns the worker once the connection attempt finishes
         except BaseException:
             self._available_remotes.append(raw_worker)
             raise
@@ -682,11 +897,7 @@ class BrowserPool:
 
         display_num: int | None = None
         if use_isolated and not use_wayland:
-            display_num = find_free_display_num(
-                self._display_base,
-                reserved=self._reserved_displays,
-            )
-            self._reserved_displays.add(display_num)
+            display_num = self._reserve_display()
 
         def _start_local() -> _PoolSlot:
             display_stack: _IsolatedDisplayStack | None = None
@@ -733,11 +944,20 @@ class BrowserPool:
                         display_stack.close()
                 raise
 
+        def _abandoned(future: asyncio.Future[_PoolSlot]) -> None:
+            # The acquiring task was cancelled while the slot was starting: never leak it.
+            if not future.cancelled() and future.exception() is None:
+                self._destroy_in_background(future.result())
+            elif display_num is not None:
+                self._unreserve_display(display_num)
+
         try:
-            slot = await asyncio.to_thread(_start_local)
+            slot = await _run_detached(_start_local, _abandoned)
+        except asyncio.CancelledError:
+            raise  # `_abandoned` cleans up once the launch thread finishes
         except BaseException:
             if display_num is not None:
-                self._reserved_displays.discard(display_num)
+                self._unreserve_display(display_num)
             raise
 
         self._launched += 1
@@ -818,7 +1038,7 @@ class BrowserPool:
             return
 
         try:
-            await asyncio.to_thread(slot.ping)
+            await _run_detached(slot.ping, self._health_check_abandoned(slot))
         except (OSError, WayboundDaemonError, RuntimeError):
             self._failed += 1
             self._recycled += 1
@@ -847,8 +1067,9 @@ class BrowserPool:
         slots_to_close.extend(self._active_slots)
         self._active_slots.clear()
 
-        if slots_to_close:
-            await asyncio.gather(
-                *(self._destroy_slot(slot) for slot in slots_to_close),
-                return_exceptions=True,
-            )
+        for slot in slots_to_close:
+            self._destroy_in_background(slot)
+        # Also waits for teardowns started by cancelled acquires; shielded so that cancelling
+        # `close()` itself cannot leave them unfinished (they keep running in their threads).
+        while self._background:
+            await asyncio.shield(asyncio.gather(*self._background, return_exceptions=True))
