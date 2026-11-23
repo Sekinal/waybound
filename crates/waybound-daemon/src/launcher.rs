@@ -42,7 +42,22 @@ pub struct ChromeLaunchOptions {
     pub wayland_display: Option<(String, PathBuf)>,
     /// Whether to bring the launched browser window to the foreground on macOS.
     pub focus: bool,
+    /// Optional Linux `--password-store` backend (one of [`PASSWORD_STORES`]). `None` (the
+    /// default) passes no flag, so Chrome auto-detects the store exactly as before. `basic`
+    /// makes cookies use Chrome's fixed Linux key, which is what makes a profile portable
+    /// between Linux machines and containers. Chrome ignores the flag on macOS and Windows.
+    pub password_store: Option<String>,
 }
+
+/// Values Chrome accepts for `--password-store` on Linux.
+pub const PASSWORD_STORES: &[&str] = &[
+    "basic",
+    "gnome-libsecret",
+    "kwallet",
+    "kwallet5",
+    "kwallet6",
+    "detect",
+];
 
 /// RAII handle owning a spawned Google Chrome process.
 ///
@@ -100,12 +115,73 @@ impl fmt::Debug for BrowserProbe {
     }
 }
 
+/// How long Chrome gets to exit after the graceful signal before it is killed (Unix only).
+#[cfg(unix)]
+const GRACEFUL_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Signal that asks Chrome for an orderly shutdown.
+///
+/// In Chromium's `chrome/browser/chrome_browser_main_posix.cc`, Linux maps `SIGINT` and
+/// `SIGHUP` to `Exit()` (`chrome::AttemptExit()`, the normal browser shutdown) but `SIGTERM`
+/// to `chrome::SessionEnding()`, which commits prefs and Local State and then calls
+/// `TerminateCurrentProcessImmediately` without flushing the cookie store or releasing
+/// `SingletonLock` (`application_lifetime_desktop.cc`, `browser_process_impl.cc`). Other
+/// POSIX platforms, macOS included, map every handled signal to `Exit()`. `SIGKILL`, the
+/// fallback, skips shutdown entirely and can lose cookies written in the last ~30 seconds.
+#[cfg(target_os = "linux")]
+const GRACEFUL_SIGNAL: rustix::process::Signal = rustix::process::Signal::INT;
+#[cfg(all(unix, not(target_os = "linux")))]
+const GRACEFUL_SIGNAL: rustix::process::Signal = rustix::process::Signal::TERM;
+
+/// Sends [`GRACEFUL_SIGNAL`] in-process (safe `rustix` wrapper, no helper binary). Returns
+/// whether the signal was delivered and logs a warning when it was not.
+#[cfg(unix)]
+fn request_graceful_exit(pid: i32) -> bool {
+    let Some(target) = (pid > 0)
+        .then(|| rustix::process::Pid::from_raw(pid))
+        .flatten()
+    else {
+        tracing::warn!(pid, "invalid Chrome pid; cannot request a graceful exit");
+        return false;
+    };
+    match rustix::process::kill_process(target, GRACEFUL_SIGNAL) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(pid, error = %err, "could not send Chrome its graceful-exit signal");
+            false
+        }
+    }
+}
+
+impl LaunchedChrome {
+    /// Stops Chrome: graceful signal and a bounded wait on Unix, then `SIGKILL`.
+    fn terminate(&self) {
+        let Ok(mut child) = self.child.lock() else {
+            return;
+        };
+        #[cfg(unix)]
+        if request_graceful_exit(self.pid) {
+            let deadline = std::time::Instant::now() + GRACEFUL_EXIT_TIMEOUT;
+            while std::time::Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    Err(_) => break,
+                }
+            }
+            tracing::warn!(
+                pid = self.pid,
+                "Chrome did not exit after the graceful signal; killing it"
+            );
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 impl Drop for LaunchedChrome {
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.terminate();
         if let Some(dir) = self.temp_profile.take() {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -196,6 +272,17 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
         }
     })?;
 
+    if let Some(store) = &options.password_store
+        && !PASSWORD_STORES.contains(&store.as_str())
+    {
+        return Err(WayboundError::BackendUnavailable {
+            backend: "chrome_launcher".to_owned(),
+            reason: format!(
+                "unsupported password store {store:?} (expected one of {PASSWORD_STORES:?})"
+            ),
+        });
+    }
+
     let mut cmd = waybound_core::process::command(&binary);
     let _ = cmd
         .arg("--force-renderer-accessibility")
@@ -242,6 +329,9 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
     }
     if let Some(locale) = &options.locale {
         let _ = cmd.env("LANG", locale).env("LC_ALL", locale);
+    }
+    if let Some(store) = &options.password_store {
+        let _ = cmd.arg(format!("--password-store={store}"));
     }
     if let Some(url) = &options.initial_url {
         let _ = cmd.arg(url);
@@ -309,6 +399,7 @@ mod tests {
             focus: false,
             display: None,
             wayland_display: None,
+            password_store: None,
         }
     }
 
@@ -322,22 +413,28 @@ mod tests {
         script
     }
 
-    fn recorded_profile_dir(script: &Path) -> Option<PathBuf> {
+    fn recorded_args(script: &Path) -> Option<Vec<String>> {
         let args_file = PathBuf::from(format!("{}.args", script.display()));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Ok(args) = std::fs::read_to_string(&args_file)
-                && let Some(dir) = args
+                && args
                     .lines()
-                    .find_map(|line| line.strip_prefix("--user-data-dir="))
+                    .any(|line| line.starts_with("--user-data-dir="))
             {
-                return Some(PathBuf::from(dir));
+                return Some(args.lines().map(str::to_owned).collect());
             }
             if Instant::now() >= deadline {
                 return None;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn recorded_profile_dir(script: &Path) -> Option<PathBuf> {
+        recorded_args(script)?
+            .iter()
+            .find_map(|line| line.strip_prefix("--user-data-dir=").map(PathBuf::from))
     }
 
     /// Retries `launch_chrome` briefly on Linux `ETXTBSY`: another test thread in the same
@@ -495,6 +592,110 @@ mod tests {
         );
 
         drop(launched);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn password_store_flag_is_absent_by_default_and_passed_when_set() {
+        let scratch = create_temp_profile_dir().unwrap_or_default();
+        assert!(scratch.is_dir(), "could not create scratch dir");
+
+        let default_script = fake_browser(&scratch);
+        let launched = launch_test_browser(&options(&default_script, Some(scratch.join("p1"))));
+        assert!(
+            launched.is_ok(),
+            "launch_chrome failed: {:?}",
+            launched.as_ref().err()
+        );
+        let args = recorded_args(&default_script).unwrap_or_default();
+        assert!(!args.is_empty(), "browser arguments were not recorded");
+        assert!(!args.iter().any(|a| a.starts_with("--password-store")));
+        drop(launched);
+
+        let basic_dir = scratch.join("basic");
+        assert!(std::fs::create_dir_all(&basic_dir).is_ok());
+        let basic_script = fake_browser(&basic_dir);
+        let mut opts = options(&basic_script, Some(scratch.join("p2")));
+        opts.password_store = Some("basic".to_owned());
+        let launched = launch_test_browser(&opts);
+        assert!(
+            launched.is_ok(),
+            "launch_chrome failed: {:?}",
+            launched.as_ref().err()
+        );
+        let args = recorded_args(&basic_script).unwrap_or_default();
+        assert!(args.iter().any(|a| a == "--password-store=basic"));
+        drop(launched);
+
+        opts.password_store = Some("plaintext; rm -rf".to_owned());
+        assert!(launch_chrome(&opts).is_err());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn drop_sends_graceful_signal_and_waits_for_a_clean_exit() {
+        let scratch = create_temp_profile_dir().unwrap_or_default();
+        assert!(scratch.is_dir(), "could not create scratch dir");
+        let script = scratch.join("trap-chrome.sh");
+        let body = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n\
+                    trap 'sleep 0.3; echo int > \"$0.term\"; exit 0' INT\n\
+                    trap 'sleep 0.3; echo term > \"$0.term\"; exit 0' TERM\n\
+                    while :; do sleep 0.05; done\n";
+        assert!(std::fs::write(&script, body).is_ok());
+        assert!(std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).is_ok());
+
+        let launched = launch_test_browser(&options(&script, Some(scratch.join("p"))));
+        assert!(
+            launched.is_ok(),
+            "launch_chrome failed: {:?}",
+            launched.as_ref().err()
+        );
+        assert!(
+            recorded_args(&script).is_some(),
+            "fake browser did not start"
+        );
+        drop(launched);
+        let marker = PathBuf::from(format!("{}.term", script.display()));
+        assert_eq!(
+            std::fs::read_to_string(&marker).ok().as_deref(),
+            Some(if cfg!(target_os = "linux") {
+                "int\n"
+            } else {
+                "term\n"
+            }),
+            "the browser did not get the graceful signal, or was killed before its handler ran"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn drop_kills_a_browser_that_ignores_the_graceful_signal() {
+        let scratch = create_temp_profile_dir().unwrap_or_default();
+        assert!(scratch.is_dir(), "could not create scratch dir");
+        let script = scratch.join("stubborn-chrome.sh");
+        let body = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n\
+                    trap '' INT TERM\nwhile :; do sleep 0.05; done\n";
+        assert!(std::fs::write(&script, body).is_ok());
+        assert!(std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).is_ok());
+
+        let launched = launch_test_browser(&options(&script, Some(scratch.join("p"))));
+        assert!(
+            launched.is_ok(),
+            "launch_chrome failed: {:?}",
+            launched.as_ref().err()
+        );
+        assert!(
+            recorded_args(&script).is_some(),
+            "fake browser did not start"
+        );
+        let started = Instant::now();
+        drop(launched);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= GRACEFUL_EXIT_TIMEOUT,
+            "did not wait for a graceful exit"
+        );
+        assert!(elapsed < GRACEFUL_EXIT_TIMEOUT + Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 BackendName = Literal["mock", "macos", "linux", "windows", "android"]
 BLOCK_PRESETS: frozenset[str] = frozenset({"analytics", "ads", "media"})
+PasswordStore = Literal["basic", "gnome-libsecret", "kwallet", "kwallet5", "kwallet6", "detect"]
 _MIN_WORKSPACE_PARENTS = 4
 
 
@@ -70,6 +71,10 @@ class LaunchOptions:
     use_tcp: bool = False
     daemon_binary: Path | str | None = None
     startup_timeout_s: float = 5.0
+    password_store: PasswordStore | None = None
+    """Linux Chrome `--password-store`. `None` (default) lets Chrome auto-detect. Use
+    `"basic"` to create a profile whose cookies stay readable on other Linux machines and
+    containers (see `docs/profile-portability.md`). Ignored by Chrome on macOS and Windows."""
 
     def __post_init__(self) -> None:
         if self.headless_xvfb and self.headless_wayland:
@@ -398,6 +403,7 @@ class Session:
             ("--ssl-keylog", str(Path(opts.ssl_keylog)) if opts.ssl_keylog is not None else None),
             ("--timezone", opts.timezone),
             ("--locale", opts.locale),
+            ("--password-store", opts.password_store),
         )
         for flag, val in pairs:
             if val is not None:

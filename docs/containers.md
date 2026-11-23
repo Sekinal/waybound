@@ -60,6 +60,10 @@ podman run --rm \
   python3 your_script.py
 ```
 
+## Reusing a Logged-In Session
+
+Mount a session bundle read-only and restore it with `waybound profile import` before launching Chrome. Only bundles created by a Linux Chrome using the `basic` password store (`LaunchOptions(password_store="basic")`) decrypt inside the container; see [profile-portability.md](profile-portability.md).
+
 ## Debugging Accessibility Snapshots
 
 Snapshots walk Chrome's AT-SPI2 tree with pipelined D-Bus calls. To rule that out when a

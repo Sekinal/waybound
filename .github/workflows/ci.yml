@@ -55,6 +55,8 @@ jobs:
       - name: Build daemon for end-to-end tests
         run: cargo build -p waybound-daemon --features replay
         working-directory: .
+      - name: Install bsdtar for the foreign-archive import tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libarchive-tools
       - name: Sync dependencies
         run: uv sync --dev
       - name: Ruff format check
