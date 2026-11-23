@@ -41,6 +41,14 @@ export {
   type ReleaseOptions,
   type RemoteWorkerEndpoint,
 } from "./pool.js";
+export {
+  type CloneProfileOptions,
+  DEFAULT_MAX_SNAPSHOT_BYTES,
+  EXCLUDED_PROFILE_NAMES,
+  type ImportSnapshotOptions,
+  ProfileStore,
+  validateProfileName,
+} from "./profiles.js";
 export { type BackendName, type LaunchOptions, launch, Session } from "./session.js";
 export {
   DEFAULT_TIMEOUT_MS,
