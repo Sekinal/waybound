@@ -15,7 +15,7 @@ access. Cookie values are never decrypted, read or printed.
 | Where you logged in | Where you restore | Expected result |
 | --- | --- | --- |
 | Any machine | **The same machine and OS user** | Expected to work (not verified with a real Chrome) |
-| Linux, `password_store="basic"` (including any container) | Any Linux Chrome, including Podman/Docker containers | **Expected to work** (not verified with a real Chrome) |
+| Linux, `password_store="basic"` (including any container) | Any Linux Chrome, including Podman/Docker containers | **Works** with Debian Chromium in this repo's container (tested once, see below); expected for Google Chrome, not tested |
 | Linux desktop with GNOME Keyring / KWallet (Chrome's default there) | Another machine or container, or Chromium instead of Chrome on the same machine | No: cookies are encrypted with a key held in that desktop's keyring |
 | macOS | Another Mac, Linux, a container, Windows | No: the key is in the source user's login Keychain |
 | Windows | Anything else (and usually even another Windows user) | No: DPAPI and App-Bound Encryption tie the key to the user and machine |
@@ -27,8 +27,8 @@ that bundle in later container runs.
 
 Every "expected" above comes from reading Chromium's synchronous `os_crypt` code at one pinned
 commit (see the end of this page). Newer Chrome versions route encryption through
-`os_crypt_async`, whose Linux behaviour was not checked. Nobody has yet run a real logged-in
-profile through this round trip as part of this project's tests.
+`os_crypt_async`, whose Linux behaviour was not checked. One real round trip was run by hand
+(not part of the automated tests): see [What was tested on real Linux](#what-was-tested-on-real-linux).
 
 ## Workflow
 
@@ -69,11 +69,15 @@ basic store, but setting it explicitly removes the guesswork.
 ### 2. Close the session, wait, then export
 
 Leave the `with waybound.launch(...)` block (or call `Session.close()`) and let it return
-before exporting. On Linux and macOS the daemon stops Chrome with `SIGTERM` and waits up to
-5 seconds before resorting to `SIGKILL`; Chromium handles `SIGTERM` with its normal shutdown,
-which is expected to write batched cookie changes to disk (Chrome delays them by up to about
-30 seconds) and remove `SingletonLock`. A hard kill, a crashed container or pulling the plug
-can lose a login made just before the end and leave the lock behind.
+before exporting. The daemon asks Chrome to shut down with a signal sent in-process (no
+`kill` binary needed), waits up to 5 seconds, and only then uses `SIGKILL`. It sends `SIGINT`
+on Linux and `SIGTERM` on macOS, because in Chromium's `chrome_browser_main_posix.cc` (commit
+`913eaefa55be`) Linux maps `SIGINT`/`SIGHUP` to `Exit()` (`chrome::AttemptExit()`, the normal
+shutdown) but `SIGTERM` to `chrome::SessionEnding()`, which commits prefs and Local State and
+then calls `TerminateCurrentProcessImmediately` without flushing the cookie store or removing
+`SingletonLock`; other platforms map every handled signal to `Exit()`. Chrome batches cookie
+writes for up to about 30 seconds, so a hard kill, a crashed container or pulling the plug can
+lose a login made just before the end and leave the lock behind.
 
 Chrome must not be running against the profile: its SQLite databases may have unflushed
 journals and the leveldb stores are locked. `export` refuses while `SingletonLock` (or
@@ -195,8 +199,8 @@ from the profile's `Last Version` file. `password_store` is inferred from the ve
 of the encrypted cookie values: on Linux `v10` means the basic store and `v11` a keyring; on
 macOS it is the Keychain; on Windows `v20` means App-Bound Encryption, otherwise DPAPI. To
 see rows that are still only in the SQLite write-ahead log, the cookie database and its
-`-wal`/`-journal` files are copied into a private temporary directory and opened there; the
-source files are never opened for writing, and only the first three bytes of each value are
+`-wal`/`-journal` files are copied into a private (`0700`) temporary directory next to the
+output bundle, opened there and removed afterwards; the source files are never opened for writing, and only the first three bytes of each value are
 read. `cookie_encryption_prefixes` is `[]` when there are no encrypted cookies and `null`
 when the database could not be read.
 
@@ -214,8 +218,15 @@ profile directory. It is limited to 200 000 files.
 Bundles are read with a small, strict tar reader rather than Python's `tarfile`, because
 `tarfile` loads a whole extended (PAX/GNU) header into memory before any check can run, so a
 1 MB bundle can ask for gigabytes. The reader counts every decompressed byte against a budget
-derived from the manifest, caps PAX headers at 64 KiB, and refuses GNU long-name/long-link and
-global headers. `inspect` uses the same reader and honours `--max-bytes`.
+derived from the manifest and caps each PAX header at 4 KiB (one long path needs about 1 KiB).
+Only the PAX `path` and `size` keys are used; timestamps, ownership, `SCHILY.dev`/`ino`/`nlink`
+/`fflags`, `LIBARCHIVE.creationtime` and extended attributes (written by GNU tar and bsdtar)
+are ignored, and any other key is refused, as are GNU long-name/long-link and global headers.
+Numbers must be plain ASCII digits of bounded length. The gzip stream must be a single member
+whose CRC and length check out; concatenated members, trailing bytes, and anything but zero
+padding after the tar end marker are refused. Bundles written by `tarfile` (PAX and ustar) and
+by `bsdtar` (pax, ustar, gnutar) with the manifest first are accepted. `inspect` uses the same
+reader and honours `--max-bytes`.
 
 Before anything in the target is touched, `import`:
 
@@ -233,11 +244,15 @@ Before anything in the target is touched, `import`:
 - enforces a size cap (`--max-bytes`, default 2 GiB uncompressed, must be positive) and at
   most 200 000 files;
 - refuses a non-empty target unless `--force`; with `--force`, refuses anything that does not
-  look like a Chrome user-data-dir (`Local State` or `Default/` present) or a previous import
-  (which carries a `.waybound-import.json` marker);
-- refuses a target that is a symlink, a filesystem root, a mount point, your home directory
-  or any of its ancestors, and a target where Chrome appears to be running (`--ignore-lock`
-  accepts a lock from another host, as for export);
+  look like a Chrome user-data-dir (a regular `Local State` file or `Default/Preferences`) or
+  a previous import (which carries a `.waybound-import.json` marker);
+- refuses a target that is a symlink, a filesystem root, your home directory or any of its
+  ancestors, a non-empty mount point, and a target where Chrome appears to be running
+  (`--ignore-lock` accepts a lock from another host, as for export);
+- warns about `.<name>.waybound-import-*` and `.<name>.waybound-backup-*` directories left
+  next to the target by an earlier interrupted import (they may hold live session cookies; a
+  `-backup-` directory is the previous profile and can be renamed back). They are never
+  deleted automatically;
 - refuses a bundle whose cookies cannot decrypt on this OS (see below) unless
   `--allow-incompatible`, and prints a loud warning when they only decrypt on the original
   machine or the key store is unknown. A bundle without any encrypted cookies is not refused
@@ -247,12 +262,26 @@ Before anything in the target is touched, `import`:
 Files are extracted with `O_EXCL | O_NOFOLLOW` into a new private (`0700`) staging directory
 **next to** the target (`.<name>.waybound-import-*`, same file system), every digest is
 verified, and permissions are set to `0700` for directories and `0600` for files without
-following symlinks. Only then is the target replaced, by renames: the existing target is
-renamed to `.<name>.waybound-backup-*`, the staging directory is renamed to the target, and
-the backup is deleted last. If the second rename fails (or is interrupted), the backup is
-renamed back. A verified staging directory is never deleted after a late failure: the error
-says where it is. If the old profile cannot be fully deleted, the import still succeeds and a
-warning says where the rest of it is. Deleting the backup never follows symlinks.
+following symlinks. Then every target check above is run again, because the target may have
+changed during extraction, and the verified directory is put in place:
+
+- an absent or still-empty target is replaced with a single `rename` (on POSIX this replaces
+  an empty directory atomically and fails if anything appeared in the meantime; on Windows the
+  empty directory is removed first);
+- a non-empty target (`--force`) is renamed to `.<name>.waybound-backup-*`, the staging
+  directory is renamed to the target, and the backup is deleted last. If the second rename
+  fails or is interrupted, the backup is renamed back. Deleting the backup never follows
+  symlinks; if it cannot be fully deleted, the import still succeeds and a warning names it;
+- an **empty mount point** (the usual container volume) cannot be renamed, so it is filled in
+  place: staging happens in `.waybound-import-*` inside the mount, and after verification the
+  entries are moved in one by one. This path is **not atomic**; on failure only the entries it
+  moved and its staging directory are removed.
+
+A verified staging directory is not deleted after a late failure. When the failure is an
+error raised by `import`, the message names the staging (and, if relevant, backup) directory;
+on Ctrl-C the same locations are attached as notes to the `KeyboardInterrupt`. If the process
+is killed outright, nothing can report them, which is why the next import warns about
+leftovers.
 
 ## Why portability depends on the OS (and what was checked)
 
@@ -292,16 +321,17 @@ key is portable.
 
 ### Not verified / caveats
 
-- Chromium's `SIGTERM` handling was read in `chrome/browser/chrome_browser_main_posix.cc` at
-  the same pinned commit (on Linux it calls `chrome::SessionEnding()`). That it flushes the
-  cookie database before exiting was not verified.
+- Chromium's signal handling was read in `chrome_browser_main_posix.cc`,
+  `lifetime/application_lifetime_desktop.cc` and `browser_process_impl.cc` at the same pinned
+  commit, and the Linux `SIGTERM`/`SIGINT` difference was observed on real Chromium (below).
+  Behaviour of Google Chrome, and of Chromium versions other than the one tested, is assumed.
 
-- These behaviours were checked against Chromium source at one commit and public docs, and the
-  feature was tested with synthetic profiles. A round trip of a real logged-in Chrome profile
-  between two Linux containers has not been run as part of the test suite.
-- The `arm64` image uses Debian Chromium rather than Google Chrome. Chromium uses the same
-  `v10` basic-store key, so a basic-store bundle is expected to work across the two, but that
-  combination was not tested.
+- The automated tests use synthetic profiles only. The real-browser check below was run once
+  by hand and is not part of CI.
+- Only Debian Chromium on `arm64` was tested. Google Chrome (the `amd64` image) uses the same
+  `v10` basic-store key, so a basic-store bundle is expected to work with it and across the
+  two browsers, but that was not tested. A real website login (with server-side checks) was
+  not tested either; the test used a local page's cookie.
 - Importing a `v10` bundle into a Linux desktop Chrome that uses a keyring is expected to work
   (Chrome selects the key by prefix), but was not tested. New cookies will then be written
   with the keyring key.
@@ -325,4 +355,28 @@ between machines, with caches deliberately left out. The names do not overlap (`
 `export_profile`, `import_profile`, `waybound profile ...`). A future `ProfileStore` could reuse
 the safe import path (staging, hash checks, atomic swap) and the lock checks here, but it
 would need a wider include policy for warm caches.
+
+## What was tested on real Linux
+
+Run by hand on 2026-11-23 in this repository's `localhost/waybound:local` image (Debian
+Chromium 156.0.8078.79, `arm64`, `--network none`), with the daemon built from this branch and a
+local HTTP page that sets a persistent cookie (`Max-Age=86400`) and shows whether the browser
+sent it back:
+
+1. **Signals, stock Chromium, no waybound.** Load the page, wait 6 s, send a signal:
+   - `SIGTERM`: exited in 0.03 s, the cookie was **not** in the `Cookies` database afterwards,
+     and `SingletonLock` was left behind;
+   - `SIGINT`: exited in 0.12 s, the cookie row was there (`v10`), and `SingletonLock` was
+     removed.
+2. **waybound session**, `LaunchOptions(backend="linux", headless_xvfb=True,
+   launch_chrome=True, password_store="basic")`: the page showed "cookie absent"; closing the
+   session took 0.12 s with no `SIGKILL` fallback logged, no Chromium process left,
+   `SingletonLock` gone, and one `v10` cookie row in the profile.
+3. `waybound profile export` then `waybound profile import` into a fresh directory in the same
+   container: 15 files, key store detected as `basic`, cookie row present after import.
+   Relaunching on the imported profile showed "cookie present".
+4. The same bundle imported in a **second container with a different hostname**: relaunching
+   showed "cookie present", and the session again closed cleanly.
+
+Only the cookie's name and the 3-byte encryption prefix were read, never its value.
 
