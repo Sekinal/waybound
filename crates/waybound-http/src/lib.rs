@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod base64;
+
 use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -24,11 +26,33 @@ use wreq::http2::{
     Http2Options, PseudoId, PseudoOrder, SettingId, SettingsOrder, StreamDependency, StreamId,
 };
 use wreq::tls::compress::{CertificateCompressionAlgorithm, CertificateCompressor, Codec};
+use wreq::tls::session::LruTlsSessionCache;
 use wreq::tls::{AlpnProtocol, AlpsProtocol, TlsOptions, TlsVersion};
 use wreq::{Client, Emulation, Group, Method, Proxy, Uri};
 
+/// Maximum HTTP request body accepted per request (16 MiB).
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
 /// Maximum HTTP response body buffered per request (16 MiB).
-const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default per-host TLS session cache capacity for `BoringSSL` session resumption.
+const TLS_SESSION_CACHE_PER_HOST: usize = 16;
+
+/// Idle timeout for pooled keep-alive HTTP/1.1 and HTTP/2 connections.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Maximum idle keep-alive connections retained per host in the pool.
+const POOL_MAX_IDLE_PER_HOST: usize = 16;
+
+/// TCP keep-alive probe interval for warm pooled sockets.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// HTTP/2 PING keep-alive interval for warm multiplexed connections.
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// HTTP/2 PING keep-alive response timeout.
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Errors returned by [`HandoffClient`].
 #[derive(Debug, Error)]
@@ -85,6 +109,11 @@ pub struct HandoffResponse {
     pub status: u16,
     /// Response headers in received order.
     pub headers: Vec<(String, String)>,
+    /// Raw, lossless response body bytes.
+    #[serde(skip)]
+    pub body_bytes: Vec<u8>,
+    /// RFC 4648 Base64-encoded exact raw response body bytes.
+    pub body_base64: String,
     /// UTF-8 decoded response body (lossy for binary payloads).
     pub body: String,
 }
@@ -213,6 +242,23 @@ const fn map_tls_version(ver: u16) -> Option<TlsVersion> {
     }
 }
 
+/// Default [`wreq::tls::TlsOptions`] with `BoringSSL` session ticket + PSK resumption enabled.
+fn default_tls_options() -> TlsOptions {
+    TlsOptions::builder()
+        .session_ticket(true)
+        .pre_shared_key(true)
+        .build()
+}
+
+/// Default [`wreq::http2::Http2Options`] with warm HTTP/2 keep-alive pings enabled.
+fn default_http2_options() -> Http2Options {
+    Http2Options::builder()
+        .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
+        .build()
+}
+
 /// Dynamically builds [`wreq::tls::TlsOptions`] from a live captured [`TlsFingerprint`].
 #[must_use]
 #[allow(clippy::similar_names)]
@@ -223,6 +269,7 @@ pub fn build_tls_options(fp: &TlsFingerprint) -> TlsOptions {
         .enable_ocsp_stapling(fp.has_status_request)
         .enable_signed_cert_timestamps(fp.has_signed_cert_timestamp)
         .session_ticket(fp.has_session_ticket)
+        .pre_shared_key(true)
         .renegotiation(fp.has_renegotiation_info)
         .psk_dhe_ke(fp.psk_key_exchange_modes.contains(&1))
         .enable_ech_grease(fp.has_ech);
@@ -407,7 +454,11 @@ pub fn build_http2_options(fp: &Http2Fingerprint) -> Http2Options {
         ));
     }
 
-    builder.build()
+    builder
+        .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
+        .build()
 }
 
 fn build_headers(entries: &[HeaderEntry]) -> (HeaderMap, OrigHeaderMap) {
@@ -480,13 +531,19 @@ impl HandoffClient {
         fingerprint: SessionFingerprint,
         options: &HandoffOptions,
     ) -> Result<Self, HandoffError> {
-        let mut emu_builder = Emulation::builder();
-        if let Some(ref tls_fp) = fingerprint.tls {
-            emu_builder = emu_builder.tls_options(build_tls_options(tls_fp));
-        }
-        if let Some(ref h2_fp) = fingerprint.http2 {
-            emu_builder = emu_builder.http2_options(build_http2_options(h2_fp));
-        }
+        let mut emu_builder = Emulation::builder()
+            .tls_options(
+                fingerprint
+                    .tls
+                    .as_ref()
+                    .map_or_else(default_tls_options, build_tls_options),
+            )
+            .http2_options(
+                fingerprint
+                    .http2
+                    .as_ref()
+                    .map_or_else(default_http2_options, build_http2_options),
+            );
         let (headers, orig_headers) = build_headers(&fingerprint.default_headers);
         if !headers.is_empty() {
             emu_builder = emu_builder.headers(headers).orig_headers(orig_headers);
@@ -499,6 +556,10 @@ impl HandoffClient {
         let mut builder = Client::builder()
             .emulation(emulation)
             .cookie_provider(jar)
+            .tls_session_cache(LruTlsSessionCache::new(TLS_SESSION_CACHE_PER_HOST))
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+            .tcp_keepalive(TCP_KEEPALIVE)
             .timeout(Duration::from_millis(options.timeout_ms.max(1000)));
 
         if !options.follow_redirects {
@@ -538,14 +599,14 @@ impl HandoffClient {
     ///
     /// # Errors
     ///
-    /// Returns [`HandoffError::InvalidInput`] for an invalid method or header, or
-    /// [`HandoffError::Request`] if the network request fails.
+    /// Returns [`HandoffError::InvalidInput`] for an invalid method, header, or oversized
+    /// request body, or [`HandoffError::Request`] if the network request fails.
     pub async fn request(
         &self,
         method: &str,
         url: &str,
         extra_headers: &[(String, String)],
-        body: Option<String>,
+        body: Option<Vec<u8>>,
     ) -> Result<HandoffResponse, HandoffError> {
         let http_method = Method::from_bytes(method.trim().to_ascii_uppercase().as_bytes())
             .map_err(|e| {
@@ -562,6 +623,11 @@ impl HandoffClient {
             req = req.header(name, val);
         }
         if let Some(payload) = body {
+            if payload.len() > MAX_REQUEST_BYTES {
+                return Err(HandoffError::InvalidInput(format!(
+                    "request body exceeded {MAX_REQUEST_BYTES}-byte limit"
+                )));
+            }
             req = req.body(payload);
         }
 
@@ -623,12 +689,15 @@ impl HandoffClient {
             }
             bytes.extend_from_slice(&chunk);
         }
+        let body_base64 = base64::encode(&bytes);
         let body_str = String::from_utf8_lossy(&bytes).into_owned();
 
         Ok(HandoffResponse {
             url: final_url,
             status,
             headers,
+            body_bytes: bytes,
+            body_base64,
             body: body_str,
         })
     }
@@ -723,5 +792,158 @@ mod tests {
         if let Ok(c) = client {
             assert_eq!(c.cookies().len(), 1);
         }
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let n = stream.read(&mut chunk)?;
+            if n == 0 {
+                return Ok(None);
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+
+        let header_text = String::from_utf8_lossy(&buf[..header_end]);
+        let content_length = header_text
+            .lines()
+            .find_map(|line| {
+                let (name, val) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    val.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let total_needed = header_end + content_length;
+        while buf.len() < total_needed {
+            let n = stream.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+
+        Ok(Some(buf[header_end..total_needed.min(buf.len())].to_vec()))
+    }
+
+    fn empty_fingerprint() -> SessionFingerprint {
+        SessionFingerprint {
+            tls: None,
+            http2: None,
+            default_headers: Vec::new(),
+            api_headers: Vec::new(),
+            cookies: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_request_and_response_roundtrip_is_lossless()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept()
+                && let Ok(Some(body)) = read_http_request(&mut stream)
+            {
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+
+        let client = HandoffClient::new(empty_fingerprint(), &HandoffOptions::default())?;
+        let payload: Vec<u8> = (0..=u8::MAX).collect();
+        let resp = client
+            .request(
+                "POST",
+                &format!("http://{addr}/binary"),
+                &[(
+                    "content-type".to_owned(),
+                    "application/octet-stream".to_owned(),
+                )],
+                Some(payload.clone()),
+            )
+            .await?;
+
+        let _ = server.join();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body_bytes, payload);
+        assert_eq!(base64::decode(&resp.body_base64), Ok(payload));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_request_body() -> Result<(), Box<dyn std::error::Error>> {
+        let client = HandoffClient::new(empty_fingerprint(), &HandoffOptions::default())?;
+        let oversized = vec![0u8; MAX_REQUEST_BYTES + 1];
+        let res = client
+            .request("POST", "http://127.0.0.1:1/oversized", &[], Some(oversized))
+            .await;
+        assert!(matches!(res, Err(HandoffError::InvalidInput(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reuses_pooled_keep_alive_connection_across_requests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        listener.set_nonblocking(false)?;
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let accepted_srv = Arc::clone(&accepted);
+        let request_count_srv = Arc::clone(&request_count);
+
+        let server = std::thread::spawn(move || {
+            while request_count_srv.load(Ordering::SeqCst) < 3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = accepted_srv.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                while request_count_srv.load(Ordering::SeqCst) < 3 {
+                    match read_http_request(&mut stream) {
+                        Ok(Some(_)) => {
+                            let _ = request_count_srv.fetch_add(1, Ordering::SeqCst);
+                            let reply = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+                            if stream.write_all(reply).is_err() || stream.flush().is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+            }
+        });
+
+        let client = HandoffClient::new(empty_fingerprint(), &HandoffOptions::default())?;
+        let url = format!("http://{addr}/ping");
+        for _ in 0..3 {
+            let resp = client.request("GET", &url, &[], None).await?;
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body_bytes, b"ok");
+        }
+        drop(client);
+
+        let _ = server.join();
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 }

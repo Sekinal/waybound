@@ -178,18 +178,18 @@ def _extract_request_headers(request: Request) -> list[tuple[str, str]]:
     return pairs
 
 
-def _extract_request_body(request: Request) -> str | None:
-    """Decode non-empty Scrapy `Request.body` bytes to `str`."""
+def _extract_request_body(request: Request) -> bytes | None:
+    """Return raw Scrapy `Request.body` bytes, or `None` if empty."""
     if not request.body:
         return None
-    return request.body.decode(request.encoding, errors="replace")
+    return bytes(request.body)
 
 
 def _build_handoff_response(request: Request, handoff: HandoffResponse) -> Response:
     """Convert a `HandoffResponse` into the appropriate Scrapy `Response` subclass."""
     url = handoff.url or request.url
     headers = list(handoff.headers)
-    body = handoff.body.encode("utf-8")
+    body = handoff.content
     content_type = (handoff.header("content-type") or "").lower()
 
     if "html" in content_type:
