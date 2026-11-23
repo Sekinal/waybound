@@ -4,6 +4,7 @@
 //! client SDKs over a local Unix domain socket.
 
 mod launcher;
+mod lifetime;
 mod mock_driver;
 mod net_tap;
 mod peer;
@@ -20,8 +21,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use tracing_subscriber::EnvFilter;
 use waybound_compositor::{CompositorConfig, HeadlessCompositor};
@@ -32,6 +31,7 @@ use waybound_driver_macos::MacOsDriver;
 use waybound_driver_windows::WindowsDriver;
 
 use crate::launcher::{ChromeLaunchOptions, launch_chrome};
+use crate::lifetime::{Lifetime, ParentWatch, parse_parent_watch, parse_pgid};
 use crate::mock_driver::MockDriver;
 use crate::net_tap::{ResponseStore, start_passive_tap};
 use crate::proxy::{PassiveTapConfig, ProxyForwarder, UpstreamProxy};
@@ -68,40 +68,6 @@ struct CliArgs {
     no_motion: bool,
     replay: bool,
     exit_with_parent: ParentWatch,
-}
-
-/// Which process `--exit-with-parent` / `WAYBOUND_EXIT_WITH_PARENT` watches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParentWatch {
-    /// Not requested.
-    Off,
-    /// Watch whatever the parent is when the watchdog starts (`--exit-with-parent`, or a
-    /// non-pid value such as `1` in the environment variable).
-    Current,
-    /// Watch this pid (the SDK passes its own pid, so a parent that died before the watchdog
-    /// started is still noticed).
-    Pid(u32),
-}
-
-/// Parses the `WAYBOUND_EXIT_WITH_PARENT` value.
-fn parse_parent_watch(raw: Option<&str>) -> ParentWatch {
-    match raw.map(str::trim) {
-        None | Some("" | "0") => ParentWatch::Off,
-        Some(value) => match value.parse::<u32>() {
-            Ok(pid) if pid > 1 => ParentWatch::Pid(pid),
-            _ => ParentWatch::Current,
-        },
-    }
-}
-
-/// Parses `WAYBOUND_REAP_PGID`: a process group the SDK started for this daemon's helpers
-/// (a pool slot's Xvfb, D-Bus and AT-SPI2), to be stopped when the daemon shuts down. Only a
-/// positive group id other than 0, 1 and the daemon's own group (the SDK makes the daemon a
-/// session leader, so its group id is its pid) is accepted.
-fn parse_reap_pgid(raw: Option<&str>, own_pid: u32) -> Option<i32> {
-    let pgid = raw?.trim().parse::<i32>().ok()?;
-    let valid = pgid > 1 && u32::try_from(pgid).is_ok_and(|p| p != own_pid);
-    valid.then_some(pgid)
 }
 
 fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -560,44 +526,6 @@ fn build_backend(
     }
 }
 
-/// How often `--exit-with-parent` checks whether the process that started the daemon is gone.
-const PARENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
-
-/// With `--exit-with-parent` (or `WAYBOUND_EXIT_WITH_PARENT=<pid>`), request the normal
-/// graceful shutdown (the same path as `SIGTERM`: held buttons released, Chrome and Xvfb
-/// stopped) as soon as the watched parent is no longer our parent, i.e. the SDK process that
-/// launched the daemon died, however it died (`SIGKILL` included). The SDK starts the daemon
-/// in its own process group, so signals sent to the caller's group no longer reach it.
-#[cfg(unix)]
-fn watch_parent(shutdown: Arc<AtomicBool>, watch: ParentWatch) {
-    let original = match watch {
-        ParentWatch::Off => return,
-        ParentWatch::Current => std::os::unix::process::parent_id(),
-        ParentWatch::Pid(pid) => pid,
-    };
-    let spawned = thread::Builder::new()
-        .name("waybound-parent-watch".to_owned())
-        .spawn(move || {
-            while !shutdown.load(Ordering::Acquire) {
-                if std::os::unix::process::parent_id() != original {
-                    tracing::info!(original, "parent process exited; shutting down");
-                    shutdown.store(true, Ordering::Release);
-                    break;
-                }
-                thread::sleep(PARENT_POLL_INTERVAL);
-            }
-        });
-    if let Err(err) = spawned {
-        tracing::warn!(error = %err, "failed to start the parent watchdog");
-    }
-}
-
-/// Windows has no reparenting to observe; `--exit-with-parent` is accepted and ignored.
-#[cfg(not(unix))]
-fn watch_parent(_shutdown: Arc<AtomicBool>, _watch: ParentWatch) {
-    tracing::warn!("--exit-with-parent is not supported on this platform; ignoring it");
-}
-
 #[cfg(unix)]
 const TERMINATION_SIGNALS: &[i32] = &[
     signal_hook::consts::SIGTERM,
@@ -621,61 +549,20 @@ fn run_replay_mode() -> ExitCode {
     }
 }
 
-/// Grace period between `SIGTERM` and `SIGKILL` when stopping `WAYBOUND_REAP_PGID`.
-const REAP_GRACE: Duration = Duration::from_secs(2);
+/// Runs [`Lifetime::finish`] when `main` returns, after every RAII guard created later in
+/// `main` (Chrome, Xvfb, the socket) has been dropped: locals drop in reverse order.
+struct LifetimeGuard(Option<Lifetime>);
 
-/// Sends `signal` (a `kill` name such as `TERM`, or `0` to probe) to every process in `pgid`.
-/// The daemon forbids `unsafe`, so this goes through the `kill` utility.
-#[cfg(unix)]
-fn signal_group(signal: &str, pgid: i32) -> bool {
-    waybound_core::process::command("kill")
-        .arg(format!("-{signal}"))
-        .arg("--")
-        .arg(format!("-{pgid}"))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-/// Stops the helper process group named by `WAYBOUND_REAP_PGID`: `SIGTERM` (Xvfb then removes
-/// its lock file), then `SIGKILL` for whatever is left after a short grace period.
-#[cfg(unix)]
-fn reap_process_group(pgid: i32) {
-    if !signal_group("TERM", pgid) {
-        return; // the group is already gone (or `kill` is unavailable)
-    }
-    let deadline = Instant::now() + REAP_GRACE;
-    while Instant::now() < deadline {
-        if !signal_group("0", pgid) {
-            tracing::info!(pgid, "stopped helper process group");
-            return;
+impl Drop for LifetimeGuard {
+    fn drop(&mut self) {
+        if let Some(lifetime) = self.0.take() {
+            lifetime.finish();
         }
-        thread::sleep(Duration::from_millis(50));
     }
-    tracing::warn!(pgid, "helper process group ignored SIGTERM; killing it");
-    let _ = signal_group("KILL", pgid);
-}
-
-#[cfg(not(unix))]
-fn reap_process_group(_pgid: i32) {}
-
-fn main() -> ExitCode {
-    // Read before `run` so it applies however `run` returns; validated against our own pid.
-    let reap_pgid = parse_reap_pgid(
-        env::var("WAYBOUND_REAP_PGID").ok().as_deref(),
-        std::process::id(),
-    );
-    let code = run();
-    if let Some(pgid) = reap_pgid {
-        reap_process_group(pgid);
-    }
-    code
 }
 
 #[allow(clippy::too_many_lines)]
-fn run() -> ExitCode {
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -716,9 +603,13 @@ fn run() -> ExitCode {
         }
     }
 
-    if cli.exit_with_parent != ParentWatch::Off {
-        watch_parent(Arc::clone(&shutdown), cli.exit_with_parent);
-    }
+    // Started before any child process is spawned; `finish` runs after the graceful shutdown
+    // (when `_lifetime` is dropped at the end of `main`, see `LifetimeGuard`).
+    let _lifetime = LifetimeGuard(Some(Lifetime::start(
+        &shutdown,
+        cli.exit_with_parent,
+        parse_pgid(env::var("WAYBOUND_REAP_PGID").ok().as_deref()),
+    )));
 
     let responses = Arc::new(ResponseStore::default());
     let inflight = InflightCounter::default();
@@ -850,40 +741,18 @@ mod tests {
     }
 
     #[test]
-    fn parent_watch_and_reap_pgid_are_validated() {
+    fn parent_watch_and_pgid_are_parsed() {
         assert_eq!(parse_parent_watch(None), ParentWatch::Off);
         assert_eq!(parse_parent_watch(Some("0")), ParentWatch::Off);
         assert_eq!(parse_parent_watch(Some("1")), ParentWatch::Current);
         assert_eq!(parse_parent_watch(Some("yes")), ParentWatch::Current);
         assert_eq!(parse_parent_watch(Some(" 4242 ")), ParentWatch::Pid(4242));
-
-        assert_eq!(parse_reap_pgid(None, 10), None);
-        assert_eq!(parse_reap_pgid(Some("0"), 10), None);
-        assert_eq!(parse_reap_pgid(Some("1"), 10), None);
-        assert_eq!(parse_reap_pgid(Some("-5"), 10), None);
-        assert_eq!(parse_reap_pgid(Some("10"), 10), None); // our own group
-        assert_eq!(parse_reap_pgid(Some("x"), 10), None);
-        assert_eq!(parse_reap_pgid(Some("777"), 10), Some(777));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn reap_process_group_stops_every_member() {
-        use std::os::unix::process::CommandExt;
-
-        let leader = waybound_core::process::command("sh")
-            .args(["-c", "sleep 30 & sleep 30"])
-            .process_group(0)
-            .spawn();
-        assert!(leader.is_ok());
-        if let Ok(mut leader) = leader {
-            let pgid = i32::try_from(leader.id()).unwrap_or(0);
-            thread::sleep(Duration::from_millis(200));
-            assert!(signal_group("0", pgid));
-            reap_process_group(pgid);
-            let _ = leader.wait();
-            assert!(!signal_group("0", pgid), "group members survived");
-        }
+        assert_eq!(parse_pgid(None), None);
+        assert_eq!(parse_pgid(Some("0")), None);
+        assert_eq!(parse_pgid(Some("1")), None);
+        assert_eq!(parse_pgid(Some("-5")), None);
+        assert_eq!(parse_pgid(Some("x")), None);
+        assert_eq!(parse_pgid(Some("777")), Some(777));
     }
 
     #[test]

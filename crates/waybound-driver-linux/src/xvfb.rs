@@ -37,21 +37,14 @@ fn x11_socket_path(display_num: u16) -> PathBuf {
 
 /// Sends `SIGTERM` to `child` and waits up to `grace` for it to exit; `false` if it did not.
 ///
-/// This crate forbids `unsafe`, so the signal is sent by the `kill` utility (through
-/// [`waybound_core::process::command`]). `child` has not been reaped, so its pid cannot have
-/// been reused. Returns `false` (caller falls back to `SIGKILL`) if `kill` is unavailable.
+/// The signal is sent with `rustix` (this crate forbids `unsafe`). `child` has not been
+/// reaped, so its pid cannot have been reused. Returns `false` (the caller falls back to
+/// `SIGKILL`) where `SIGTERM` is unavailable or could not be sent.
 fn terminate_gracefully(child: &mut Child, grace: Duration) -> bool {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return true;
     }
-    let sent = waybound_core::process::command("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if !sent {
+    if !send_sigterm(child) {
         return false;
     }
     let deadline = Instant::now() + grace;
@@ -62,6 +55,23 @@ fn terminate_gracefully(child: &mut Child, grace: Duration) -> bool {
             Err(_) => return false,
         }
     }
+    false
+}
+
+/// Sends `SIGTERM` to `child` (unreaped, so its pid cannot have been reused).
+#[cfg(unix)]
+fn send_sigterm(child: &Child) -> bool {
+    i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .is_some_and(|pid| {
+            rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok()
+        })
+}
+
+/// No `SIGTERM` elsewhere: the caller falls back to killing the child.
+#[cfg(not(unix))]
+const fn send_sigterm(_child: &Child) -> bool {
     false
 }
 

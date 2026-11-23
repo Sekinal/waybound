@@ -2439,6 +2439,7 @@ version = "0.6.0"
 dependencies = [
  "brotli 8.0.4",
  "flate2",
+ "rustix",
  "serde",
  "serde_json",
  "signal-hook",
@@ -2468,6 +2469,7 @@ name = "waybound-driver-linux"
 version = "0.6.0"
 dependencies = [
  "png",
+ "rustix",
  "serde",
  "serde_json",
  "tracing",
