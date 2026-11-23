@@ -153,6 +153,8 @@ fn parse_node_attributes(attrs: &str, index: usize) -> Option<AccessibilityNode>
         disabled: raw.disabled,
         // `uiautomator dump` does not expose an expanded/collapsed state.
         expanded: None,
+        // `uiautomator dump` does not expose link href URLs.
+        url: None,
     })
 }
 

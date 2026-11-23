@@ -270,6 +270,14 @@ class Page:
         """Return a snapshot of the live web-content accessibility tree."""
         return self.snapshot_tree_with_meta(max_nodes=max_nodes).nodes
 
+    def links(self, *, max_nodes: int | None = None) -> list[AccessibilityNode]:
+        """Return all link nodes on the current page that expose a non-empty target URL."""
+        return [
+            node
+            for node in self.snapshot_tree(max_nodes=max_nodes)
+            if node.role is Role.LINK and node.url is not None and node.url != ""
+        ]
+
     def snapshot_tree_with_meta(self, *, max_nodes: int | None = None) -> TreeSnapshot:
         """Return a `TreeSnapshot` with `nodes` and `truncated` metadata."""
         if max_nodes is not None and max_nodes < 1:

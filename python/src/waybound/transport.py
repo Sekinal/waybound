@@ -516,6 +516,7 @@ def _parse_node(item: dict[object, object]) -> AccessibilityNode:
     checked = _parse_optional_bool(item.get("checked"))
     disabled = item.get("disabled") is True
     expanded = _parse_optional_bool(item.get("expanded"))
+    url = _opt_str(item.get("url"))
 
     raw_bounds = item.get("bounds")
     if isinstance(raw_bounds, dict):
@@ -538,6 +539,7 @@ def _parse_node(item: dict[object, object]) -> AccessibilityNode:
         checked=checked,
         disabled=disabled,
         expanded=expanded,
+        url=url,
     )
 
 

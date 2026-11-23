@@ -635,6 +635,7 @@ export function parseNode(item: JsonObject): AccessibilityNode {
     value: typeof item.value === "string" ? item.value : null,
     bounds,
     focused: Boolean(item.focused ?? false),
+    url: typeof item.url === "string" ? item.url : null,
   };
 }
 

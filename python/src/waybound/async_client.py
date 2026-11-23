@@ -198,6 +198,10 @@ class AsyncPage:
         """Return a snapshot of the live web-content accessibility tree."""
         return await asyncio.to_thread(self._inner.snapshot_tree, max_nodes=max_nodes)
 
+    async def links(self, *, max_nodes: int | None = None) -> list[AccessibilityNode]:
+        """Return all link nodes on the current page that expose a non-empty target URL."""
+        return await asyncio.to_thread(self._inner.links, max_nodes=max_nodes)
+
     async def snapshot_tree_with_meta(self, *, max_nodes: int | None = None) -> TreeSnapshot:
         """Return a `TreeSnapshot` with `nodes` and `truncated` metadata."""
         return await asyncio.to_thread(self._inner.snapshot_tree_with_meta, max_nodes=max_nodes)

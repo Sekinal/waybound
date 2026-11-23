@@ -132,6 +132,11 @@ pub struct AccessibilityNode {
     /// `None` when the node cannot be expanded or collapsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expanded: Option<bool>,
+    /// Resolved target URL (`href`) for link nodes, when exposed by the OS accessibility API.
+    ///
+    /// `None` for non-link nodes or links whose URL is not available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 // `skip_serializing_if` passes the field by reference.
@@ -141,7 +146,7 @@ const fn is_false(value: &bool) -> bool {
 }
 
 impl AccessibilityNode {
-    /// Creates a node with no checked/expanded state, enabled, and not focused.
+    /// Creates a node with no checked/expanded state, no URL, enabled, and not focused.
     #[must_use]
     pub const fn new(
         id: String,
@@ -160,6 +165,7 @@ impl AccessibilityNode {
             checked: None,
             disabled: false,
             expanded: None,
+            url: None,
         }
     }
 }
@@ -378,6 +384,7 @@ mod tests {
             checked: None,
             disabled: false,
             expanded: None,
+            url: None,
         };
 
         let query = LocatorQuery::by_role(Role::Button, Some("search".to_owned()));
@@ -405,6 +412,7 @@ mod tests {
                 checked: None,
                 disabled: false,
                 expanded: None,
+                url: None,
             },
             AccessibilityNode {
                 id: "settings-dialog".to_owned(),
@@ -421,6 +429,7 @@ mod tests {
                 checked: None,
                 disabled: false,
                 expanded: None,
+                url: None,
             },
             AccessibilityNode {
                 id: "dialog-save".to_owned(),
@@ -437,6 +446,7 @@ mod tests {
                 checked: None,
                 disabled: false,
                 expanded: None,
+                url: None,
             },
         ];
 
@@ -475,6 +485,7 @@ mod tests {
             assert_eq!(node.checked, None);
             assert!(!node.disabled);
             assert_eq!(node.expanded, None);
+            assert_eq!(node.url, None);
             assert!(node.focused);
         }
     }
@@ -497,6 +508,7 @@ mod tests {
         assert!(!json.contains("checked"));
         assert!(!json.contains("disabled"));
         assert!(!json.contains("expanded"));
+        assert!(!json.contains("url"));
     }
 
     #[test]
@@ -505,6 +517,7 @@ mod tests {
             checked: Some(true),
             disabled: true,
             expanded: Some(false),
+            url: Some("https://example.com/about".to_owned()),
             ..AccessibilityNode::new(
                 "cb".to_owned(),
                 Role::CheckBox,
@@ -522,6 +535,7 @@ mod tests {
         assert!(json.contains(r#""checked":true"#));
         assert!(json.contains(r#""disabled":true"#));
         assert!(json.contains(r#""expanded":false"#));
+        assert!(json.contains(r#""url":"https://example.com/about""#));
         let back: Result<AccessibilityNode, _> = serde_json::from_str(&json);
         assert!(matches!(back, Ok(ref parsed) if *parsed == node));
     }

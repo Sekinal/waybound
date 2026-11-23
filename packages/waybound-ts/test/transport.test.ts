@@ -531,11 +531,75 @@ describe("wire encoding helpers", () => {
     assert.equal(node.role, Role.UNKNOWN);
     assert.equal(node.name, null);
     assert.equal(node.focused, true);
+    assert.equal(node.url, null);
     assert.deepEqual(node.bounds.center, [0, 0]);
+    const link = parseNode({ id: "l1", role: "link", name: "About", url: "https://example.com/a" });
+    assert.equal(link.role, Role.LINK);
+    assert.equal(link.url, "https://example.com/a");
+    const badUrl = parseNode({ id: "l2", role: "link", url: 123 });
+    assert.equal(badUrl.url, null);
     assert.throws(
       () => parseNode({ bounds: { x: "1" } }),
       (err: unknown) => err instanceof WayboundDaemonError && err.code === "protocol_error",
     );
+  });
+
+  it("filters page.links() to link nodes with non-empty URLs", async () => {
+    const d = await fakeDaemon((req, sock) => {
+      assert.equal(req.method, "snapshot_tree");
+      reply(sock, {
+        status: "tree",
+        nodes: [
+          {
+            id: "l1",
+            role: "link",
+            name: "About",
+            value: null,
+            bounds: { x: 0, y: 0, width: 80, height: 20 },
+            focused: false,
+            url: "https://example.com/about",
+          },
+          {
+            id: "l2",
+            role: "link",
+            name: "No URL",
+            value: null,
+            bounds: { x: 0, y: 20, width: 80, height: 20 },
+            focused: false,
+          },
+          {
+            id: "l3",
+            role: "link",
+            name: "Empty URL",
+            value: null,
+            bounds: { x: 0, y: 40, width: 80, height: 20 },
+            focused: false,
+            url: "",
+          },
+          {
+            id: "b1",
+            role: "button",
+            name: "Not a link",
+            value: null,
+            bounds: { x: 0, y: 60, width: 80, height: 20 },
+            focused: false,
+            url: "https://example.com/ignored",
+          },
+        ],
+      });
+    });
+    const t = await Transport.connect(d.endpoint);
+    try {
+      const page = new Page(t);
+      const links = await page.links();
+      assert.deepEqual(
+        links.map((n) => [n.id, n.url]),
+        [["l1", "https://example.com/about"]],
+      );
+    } finally {
+      t.close();
+      await d.close();
+    }
   });
 
   it("parses captured responses leniently", () => {

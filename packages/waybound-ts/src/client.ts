@@ -11,14 +11,14 @@ import {
   type SnapshotTreeOptions,
   type Transport,
 } from "./transport.js";
-import type {
-  AccessibilityNode,
-  CapturedResponse,
-  KeyModifier,
-  LocatorQuery,
-  NamedKey,
+import {
+  type AccessibilityNode,
+  type CapturedResponse,
+  type KeyModifier,
+  type LocatorQuery,
+  type NamedKey,
   Role,
-  TreeSnapshot,
+  type TreeSnapshot,
 } from "./types.js";
 
 const URL_POLL_INTERVAL_MS = 75;
@@ -298,6 +298,14 @@ export class Page {
   /** Snapshot of the live accessibility tree. */
   async snapshotTree(options: SnapshotTreeOptions = {}): Promise<AccessibilityNode[]> {
     return (await this.snapshotTreeWithMeta(options)).nodes;
+  }
+
+  /** All link nodes on the current page that expose a non-empty target URL. */
+  async links(options: SnapshotTreeOptions = {}): Promise<AccessibilityNode[]> {
+    const nodes = await this.snapshotTree(options);
+    return nodes.filter(
+      (node) => node.role === Role.LINK && typeof node.url === "string" && node.url.length > 0,
+    );
   }
 
   /** Snapshot of the live accessibility tree along with truncation metadata. */

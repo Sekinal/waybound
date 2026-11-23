@@ -201,6 +201,9 @@ struct RawAtspiNode {
     /// Raw AT-SPI2 state-set words; when present they override `focused`.
     #[serde(default)]
     states: Option<Vec<u32>>,
+    /// Resolved hyperlink URI (`org.a11y.atspi.Hyperlink.GetURI(0)`), when present.
+    #[serde(default)]
+    url: Option<String>,
 }
 
 const fn is_valid_bounds(bounds: &Bounds) -> bool {
@@ -277,6 +280,7 @@ pub fn parse_atspi_snapshot_json_limited(raw: &str, max_nodes: usize) -> Result<
             checked: states.checked,
             disabled: states.disabled,
             expanded: states.expanded,
+            url: clean_optional_string(raw_node.url),
         });
     }
 
@@ -493,6 +497,22 @@ while queue and len(nodes) < MAX_NODES:
     elif current_url is None and role_name == "entry" and name == "Address and search bar" and value:
         current_url = str(value)
 
+    link_url = None
+    if role_name.strip().lower() == "link":
+        try:
+            hl = acc.get_hyperlink()
+            if hl is not None:
+                uri = hl.get_uri(0)
+                if uri:
+                    link_url = str(uri)
+        except Exception:
+            try:
+                uri = acc.queryHyperlink().getURI(0)
+                if uri:
+                    link_url = str(uri)
+            except Exception:
+                pass
+
     nodes.append({
         "id": f"atspi-{len(nodes)}",
         "role": role_name,
@@ -501,6 +521,7 @@ while queue and len(nodes) < MAX_NODES:
         "bounds": {"x": bx, "y": by, "width": bw, "height": bh},
         "focused": focused,
         "states": state_words,
+        "url": link_url if link_url else None,
     })
 
     try:
@@ -825,6 +846,46 @@ mod tests {
         assert!(snap.nodes[1].focused);
         assert_eq!(snap.nodes[1].checked, None);
         assert!(!snap.nodes[1].disabled);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_json_populates_and_cleans_link_url() -> Result<()> {
+        let raw = r#"{
+            "nodes": [
+                {
+                    "id": "atspi-0",
+                    "role": "link",
+                    "name": "Page Two",
+                    "url": "  http://127.0.0.1:8080/page2  ",
+                    "bounds": {"x": 0.0, "y": 0.0, "width": 80.0, "height": 20.0},
+                    "focused": false
+                },
+                {
+                    "id": "atspi-1",
+                    "role": "link",
+                    "name": "Empty",
+                    "url": "   ",
+                    "bounds": {"x": 0.0, "y": 24.0, "width": 80.0, "height": 20.0},
+                    "focused": false
+                },
+                {
+                    "id": "atspi-2",
+                    "role": "push button",
+                    "name": "Submit",
+                    "bounds": {"x": 0.0, "y": 48.0, "width": 80.0, "height": 20.0},
+                    "focused": false
+                }
+            ]
+        }"#;
+        let snap = parse_atspi_snapshot_json(raw)?;
+        assert_eq!(snap.nodes.len(), 3);
+        assert_eq!(
+            snap.nodes[0].url.as_deref(),
+            Some("http://127.0.0.1:8080/page2")
+        );
+        assert_eq!(snap.nodes[1].url, None);
+        assert_eq!(snap.nodes[2].url, None);
         Ok(())
     }
 

@@ -85,6 +85,7 @@ class AccessibilityNode:
     checked: bool | None = None
     disabled: bool = False
     expanded: bool | None = None
+    url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
