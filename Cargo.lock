@@ -2471,6 +2471,7 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "png",
+ "rustix",
  "serde",
  "serde_json",
  "tracing",

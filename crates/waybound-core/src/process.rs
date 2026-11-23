@@ -17,7 +17,14 @@ use std::ffi::OsStr;
 use std::process::Command;
 
 /// Environment variables that carry secrets and must never reach a child process.
-pub const SCRUBBED_ENV_VARS: &[&str] = &["WAYBOUND_PROXY"];
+///
+/// `WAYBOUND_EXIT_WITH_PARENT` and `WAYBOUND_REAP_PGID` are not secrets, but they are addressed
+/// to the daemon alone: a browser or helper inheriting them must not act on them.
+pub const SCRUBBED_ENV_VARS: &[&str] = &[
+    "WAYBOUND_PROXY",
+    "WAYBOUND_EXIT_WITH_PARENT",
+    "WAYBOUND_REAP_PGID",
+];
 
 /// Creates a [`Command`] for `program` that does not inherit [`SCRUBBED_ENV_VARS`].
 ///

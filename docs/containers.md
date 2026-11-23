@@ -73,7 +73,7 @@ logs which walk ran. See [ARCHITECTURE.md](../ARCHITECTURE.md#linux-at-spi2-tree
 
 ## Compose
 
-[`compose.yaml`](../compose.yaml) builds the image and runs `waybound doctor` with the capture capabilities added. The entrypoint only starts a D-Bus session and the AT-SPI2 bus; Xvfb is started by the daemon for sessions with `headless_xvfb=True`, always on display `:99`, so run one such session per container.
+[`compose.yaml`](../compose.yaml) builds the image and runs `waybound doctor` with the capture capabilities added. The entrypoint only starts a D-Bus session and the AT-SPI2 bus; Xvfb is started by the daemon for sessions with `headless_xvfb=True`, on display `:99` unless `display=":N"` selects another number. To run several sessions in one container use `BrowserPool(display_backend="wayland")` (one in-process headless compositor per slot) or `BrowserPool(isolated_displays=True)`, which starts a separate Xvfb (from `:100`), D-Bus session, openbox and AT-SPI2 bus per slot; budget several hundred MB of RAM and enough `--shm-size` per slot.
 
 ```bash
 podman compose up --build
