@@ -7,6 +7,7 @@ import {
   type AccessibilityNode,
   Bounds,
   CapturedResponse,
+  type HttpHeader,
   type KeyModifier,
   type LocatorQuery,
   NAMED_KEYS,
@@ -662,14 +663,36 @@ function parseNodes(response: JsonObject, op: string): AccessibilityNode[] {
   return response.nodes.filter(isObject).map(parseNode);
 }
 
+function parseHeaders(raw: unknown): HttpHeader[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: HttpHeader[] = [];
+  for (const entry of raw) {
+    if (isObject(entry) && typeof entry.name === "string" && typeof entry.value === "string") {
+      out.push({ name: entry.name, value: entry.value });
+    }
+  }
+  return out;
+}
+
 /** Parse one captured HTTP response leniently, as the Python SDK does. */
 export function parseHttpResponse(item: JsonObject): CapturedResponse {
   const status = Number.isInteger(item.status) ? (item.status as number) : 0;
+  const capturedAtMs =
+    typeof item.captured_at_ms === "number" && Number.isFinite(item.captured_at_ms)
+      ? Math.trunc(item.captured_at_ms)
+      : null;
   return new CapturedResponse(
     item.url === undefined || item.url === null ? "" : String(item.url),
     status,
     typeof item.content_type === "string" ? item.content_type : null,
     typeof item.body === "string" ? item.body : null,
+    parseHeaders(item.headers),
+    typeof item.request_method === "string" ? item.request_method : null,
+    parseHeaders(item.request_headers),
+    typeof item.request_body === "string" ? item.request_body : null,
+    capturedAtMs,
   );
 }
 

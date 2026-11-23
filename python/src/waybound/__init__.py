@@ -11,6 +11,12 @@ from waybound.profiles import (
     validate_profile_name,
 )
 from waybound.session import LaunchOptions, Session, launch
+from waybound.trace import (
+    REDACTED_VALUE,
+    SENSITIVE_HEADERS,
+    TraceRecorder,
+    responses_to_har,
+)
 from waybound.transport import UnixSocketTransport, WayboundDaemonError
 from waybound.types import (
     AccessibilityNode,
@@ -41,6 +47,8 @@ from waybound.types import (
 __all__ = [
     "DEFAULT_MAX_SNAPSHOT_BYTES",
     "EXCLUDED_PROFILE_NAMES",
+    "REDACTED_VALUE",
+    "SENSITIVE_HEADERS",
     "AccessibilityNode",
     "AsyncHandoffHttpClient",
     "AsyncLocator",
@@ -74,6 +82,7 @@ __all__ = [
     "SupportsTreeSnapshot",
     "SupportsWebSocketFrames",
     "TlsFingerprint",
+    "TraceRecorder",
     "Transport",
     "TreeSnapshot",
     "UnixSocketTransport",
@@ -82,5 +91,6 @@ __all__ = [
     "WebSocketOpcode",
     "launch",
     "launch_async",
+    "responses_to_har",
     "validate_profile_name",
 ]
