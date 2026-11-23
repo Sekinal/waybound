@@ -206,6 +206,7 @@ class HandoffHttpClient:
         proxy: str | None = None,
         timeout_ms: int = 30_000,
         follow_redirects: bool = True,
+        http3: bool = False,
         daemon_binary: Path | str | None = None,
         on_refresh: Callable[[], SessionFingerprint] | None = None,
         refresh_statuses: tuple[int, ...] = (403,),
@@ -216,6 +217,7 @@ class HandoffHttpClient:
         self._proxy = proxy
         self._timeout_ms = timeout_ms
         self._follow_redirects = follow_redirects
+        self._http3 = http3
         self._on_refresh = on_refresh
         self._refresh_statuses = refresh_statuses
         self._lock = threading.Lock()
@@ -244,6 +246,7 @@ class HandoffHttpClient:
         proxy: str | None = None,
         timeout_ms: int = 30_000,
         follow_redirects: bool = True,
+        http3: bool = False,
         daemon_binary: Path | str | None = None,
         on_refresh: Callable[[], SessionFingerprint] | None = None,
         refresh_statuses: tuple[int, ...] = (403,),
@@ -259,6 +262,7 @@ class HandoffHttpClient:
             proxy=proxy,
             timeout_ms=timeout_ms,
             follow_redirects=follow_redirects,
+            http3=http3,
             daemon_binary=daemon_binary,
             on_refresh=on_refresh,
             refresh_statuses=refresh_statuses,
@@ -289,6 +293,7 @@ class HandoffHttpClient:
                     "proxy": self._proxy,
                     "timeout_ms": self._timeout_ms,
                     "follow_redirects": self._follow_redirects,
+                    "http3": self._http3,
                 },
             }
         )
@@ -548,6 +553,7 @@ class AsyncHandoffHttpClient:
         proxy: str | None = None,
         timeout_ms: int = 30_000,
         follow_redirects: bool = True,
+        http3: bool = False,
         daemon_binary: Path | str | None = None,
         on_refresh: Callable[[], Awaitable[SessionFingerprint]] | None = None,
         refresh_statuses: tuple[int, ...] = (403,),
@@ -557,6 +563,7 @@ class AsyncHandoffHttpClient:
             proxy=proxy,
             timeout_ms=timeout_ms,
             follow_redirects=follow_redirects,
+            http3=http3,
             daemon_binary=daemon_binary,
         )
         self._async_on_refresh = on_refresh

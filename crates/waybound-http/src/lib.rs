@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod base64;
+pub mod h3_client;
 
 use std::borrow::Cow;
 use std::io::{Read, Write};
@@ -80,6 +81,10 @@ pub struct HandoffOptions {
     /// Whether to follow HTTP 3xx redirects automatically (default: `true`).
     #[serde(default = "default_follow_redirects")]
     pub follow_redirects: bool,
+    /// Opt-in HTTP/3 (QUIC) transport for direct `https://` requests, with transparent
+    /// fallback to `BoringSSL` HTTP/2 when QUIC/H3 is unavailable (default: `false`).
+    #[serde(default)]
+    pub http3: bool,
 }
 
 const fn default_timeout_ms() -> u64 {
@@ -96,6 +101,7 @@ impl Default for HandoffOptions {
             proxy: None,
             timeout_ms: default_timeout_ms(),
             follow_redirects: default_follow_redirects(),
+            http3: false,
         }
     }
 }
@@ -501,12 +507,15 @@ fn populate_cookie_jar(jar: &Jar, cookies: &[CapturedCookie]) {
     }
 }
 
-/// `BoringSSL` + HTTP/2 client dynamically configured from a live browser [`SessionFingerprint`].
+/// `BoringSSL` + HTTP/2 client dynamically configured from a live browser [`SessionFingerprint`],
+/// with optional opt-in HTTP/3 (QUIC) transport and transparent fallback.
 #[derive(Clone)]
 pub struct HandoffClient {
     client: Client,
     fingerprint: SessionFingerprint,
+    options: HandoffOptions,
     cookies: Arc<Mutex<Vec<CapturedCookie>>>,
+    h3_client: Option<h3_client::Http3Client>,
 }
 
 impl std::fmt::Debug for HandoffClient {
@@ -514,6 +523,7 @@ impl std::fmt::Debug for HandoffClient {
         f.debug_struct("HandoffClient")
             .field("has_tls", &self.fingerprint.tls.is_some())
             .field("has_http2", &self.fingerprint.http2.is_some())
+            .field("http3", &self.options.http3)
             .field("headers", &self.fingerprint.default_headers.len())
             .finish_non_exhaustive()
     }
@@ -525,11 +535,30 @@ impl HandoffClient {
     ///
     /// # Errors
     ///
-    /// Returns [`HandoffError::ClientBuild`] if the proxy URL or BoringSSL/HTTP2 configuration
-    /// is invalid.
+    /// Returns [`HandoffError::ClientBuild`] if the proxy URL, BoringSSL/HTTP2, or HTTP/3
+    /// configuration is invalid.
     pub fn new(
         fingerprint: SessionFingerprint,
         options: &HandoffOptions,
+    ) -> Result<Self, HandoffError> {
+        Self::build_internal(fingerprint, options, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_h3_custom_roots(
+        fingerprint: SessionFingerprint,
+        options: &HandoffOptions,
+        custom_roots: &[rustls::pki_types::CertificateDer<'static>],
+    ) -> Result<Self, HandoffError> {
+        Self::build_internal(fingerprint, options, Some(custom_roots))
+    }
+
+    fn build_internal(
+        fingerprint: SessionFingerprint,
+        options: &HandoffOptions,
+        #[cfg_attr(not(test), allow(unused_variables))] custom_h3_roots: Option<
+            &[rustls::pki_types::CertificateDer<'static>],
+        >,
     ) -> Result<Self, HandoffError> {
         let mut emu_builder = Emulation::builder()
             .tls_options(
@@ -553,14 +582,15 @@ impl HandoffClient {
         let jar = Arc::new(Jar::default());
         populate_cookie_jar(&jar, &fingerprint.cookies);
 
+        let timeout = Duration::from_millis(options.timeout_ms.max(1000));
         let mut builder = Client::builder()
             .emulation(emulation)
-            .cookie_provider(jar)
+            .cookie_provider(Arc::clone(&jar))
             .tls_session_cache(LruTlsSessionCache::new(TLS_SESSION_CACHE_PER_HOST))
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
             .tcp_keepalive(TCP_KEEPALIVE)
-            .timeout(Duration::from_millis(options.timeout_ms.max(1000)));
+            .timeout(timeout);
 
         if !options.follow_redirects {
             builder = builder.redirect(wreq::redirect::Policy::none());
@@ -576,10 +606,45 @@ impl HandoffClient {
             .map_err(|e| HandoffError::ClientBuild(e.to_string()))?;
 
         let cookies = Arc::new(Mutex::new(fingerprint.cookies.clone()));
+        let h3_client = if options.http3 && options.proxy.is_none() {
+            #[cfg(test)]
+            let h3 = if let Some(roots) = custom_h3_roots {
+                h3_client::Http3Client::with_custom_roots(
+                    roots,
+                    fingerprint.default_headers.clone(),
+                    Arc::clone(&cookies),
+                    Arc::clone(&jar),
+                    timeout,
+                    options.follow_redirects,
+                )?
+            } else {
+                h3_client::Http3Client::new(
+                    fingerprint.default_headers.clone(),
+                    Arc::clone(&cookies),
+                    Arc::clone(&jar),
+                    timeout,
+                    options.follow_redirects,
+                )?
+            };
+            #[cfg(not(test))]
+            let h3 = h3_client::Http3Client::new(
+                fingerprint.default_headers.clone(),
+                Arc::clone(&cookies),
+                Arc::clone(&jar),
+                timeout,
+                options.follow_redirects,
+            )?;
+            Some(h3)
+        } else {
+            None
+        };
+
         Ok(Self {
             client,
             fingerprint,
+            options: options.clone(),
             cookies,
+            h3_client,
         })
     }
 
@@ -595,6 +660,40 @@ impl HandoffClient {
         self.cookies.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
+    async fn try_http3(
+        &self,
+        method: &str,
+        url: &str,
+        extra_headers: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> Option<Result<HandoffResponse, HandoffError>> {
+        if !(self.options.http3
+            && self.options.proxy.is_none()
+            && url
+                .as_bytes()
+                .get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://")))
+        {
+            return None;
+        }
+        let h3 = self.h3_client.as_ref()?;
+        match h3.send(method, url, extra_headers, body).await {
+            Ok(resp) => Some(Ok(resp)),
+            Err(h3_client::H3AttemptError::Fallback(reason)) => {
+                tracing::debug!(
+                    url,
+                    reason = %reason,
+                    "HTTP/3 attempt failed; falling back to BoringSSL HTTP/2"
+                );
+                None
+            }
+            Err(h3_client::H3AttemptError::InvalidInput(msg)) => {
+                Some(Err(HandoffError::InvalidInput(msg)))
+            }
+            Err(h3_client::H3AttemptError::Request(msg)) => Some(Err(HandoffError::Request(msg))),
+        }
+    }
+
     /// Executes an HTTP request replaying the captured browser fingerprint and cookies.
     ///
     /// # Errors
@@ -608,6 +707,13 @@ impl HandoffClient {
         extra_headers: &[(String, String)],
         body: Option<Vec<u8>>,
     ) -> Result<HandoffResponse, HandoffError> {
+        if let Some(res) = self
+            .try_http3(method, url, extra_headers, body.as_deref())
+            .await
+        {
+            return res;
+        }
+
         let http_method = Method::from_bytes(method.trim().to_ascii_uppercase().as_bytes())
             .map_err(|e| {
                 HandoffError::InvalidInput(format!("invalid HTTP method {method:?}: {e}"))
