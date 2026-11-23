@@ -252,7 +252,7 @@ class Session:
     """Context manager that starts `waybound-daemon`, connects, and cleans up on exit.
 
     On POSIX the daemon is started in a new session (its own process group) and told to exit
-    when this process does (`WAYBOUND_EXIT_WITH_PARENT=1`): it runs its normal graceful
+    when this process does (`WAYBOUND_EXIT_WITH_PARENT=<our pid>`): it runs its normal graceful
     shutdown as soon as its parent is gone, however the parent died (SIGINT, SIGTERM, SIGHUP
     or SIGKILL). `close` (also run by the ``with`` block and, for sessions still open, by an
     `atexit` hook) shuts the daemon down gracefully and then, only as a backstop once the
@@ -280,6 +280,9 @@ class Session:
         self._pgid: int | None = None
         self._transport: UnixSocketTransport | None = None
         self._owner_pid = os.getpid()
+        # Single-flight `close`: a pool and a borrower (or two threads) closing at once must
+        # not run two shutdown sequences against one daemon.
+        self._close_lock = threading.Lock()
 
     def _build_daemon_cmd(
         self,
@@ -359,7 +362,9 @@ class Session:
         detach = sys.platform != "win32"
         if detach:
             # Read by daemons that support it; older daemons ignore unknown variables.
-            child_env["WAYBOUND_EXIT_WITH_PARENT"] = "1"
+            # The pid to watch, so a parent that dies before the daemon's watchdog starts is
+            # still noticed. Older daemons ignore the variable.
+            child_env["WAYBOUND_EXIT_WITH_PARENT"] = str(os.getpid())
 
         try:
             with _LIVE_SESSIONS_LOCK:
@@ -455,14 +460,25 @@ class Session:
     def close(self) -> None:
         """Gracefully shut down the daemon (unwinding browser & socket guards) and clean up.
 
-        Idempotent. Escalation: `shutdown` request, then SIGTERM after 8 s, then SIGKILL after
+        Idempotent and thread-safe: concurrent callers run one shutdown; the others wait for it
+        and return. Escalation: `shutdown` request, then SIGTERM after 8 s, then SIGKILL after
         another 8 s. Once the daemon has exited (and before it is reaped, so its process-group
         id cannot have been reused), anything left in its process group is killed as a
         backstop. In a forked child this only drops the child's references.
+
+        This normally takes well under a second, but can take up to about 46 s: if a page call
+        abandoned in another thread still holds the connection, the `shutdown` request waits
+        for it (up to the transport's 30 s timeout) before the 8 s + 8 s escalation.
         """
         if self._owner_pid != os.getpid():
+            # Checked before taking the lock: a lock held by another thread at fork time
+            # would never be released in the child.
             self._abandon_inherited()
             return
+        with self._close_lock:
+            self._close_locked()
+
+    def _close_locked(self) -> None:
         proc = self._proc
         shutdown_sent = False
         try:

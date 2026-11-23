@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -237,3 +238,55 @@ def test_has_exited_does_not_reap() -> None:
         time.sleep(0.01)
     assert proc.returncode is None  # still a zombie: its pid (and group id) stays reserved
     assert proc.wait(timeout=5) == 0
+
+
+@pytest.mark.usefixtures("daemon")
+def test_concurrent_close_runs_one_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = Session(MOCK)
+    session.__enter__()
+    transport = session._transport
+    assert transport is not None
+    calls: list[int] = []
+    original = transport.shutdown
+
+    def counting_shutdown() -> None:
+        calls.append(1)
+        time.sleep(0.2)  # widen the window for a second, concurrent close()
+        original()
+
+    monkeypatch.setattr(transport, "shutdown", counting_shutdown)
+    threads = [threading.Thread(target=session.close) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert calls == [1]
+    assert session.daemon_pid is None
+
+
+@pytest.mark.usefixtures("daemon")
+def test_daemon_is_told_our_pid_and_reaps_the_given_process_group(tmp_path: Path) -> None:
+    seen = tmp_path / "env.txt"
+    wrapper = tmp_path / "daemon-env.sh"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s %s\\n" "$WAYBOUND_EXIT_WITH_PARENT" "$WAYBOUND_REAP_PGID" > "{seen}"\n'
+        f'exec "{DAEMON_BIN}" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    # Stands in for a pool slot's Xvfb/D-Bus stack: its own process group.
+    helper = subprocess.Popen(["/bin/sleep", "60"], process_group=0)
+    try:
+        session = Session(
+            replace(MOCK, daemon_binary=wrapper),
+            extra_env={"WAYBOUND_REAP_PGID": str(helper.pid)},
+        )
+        with session:
+            pass
+        assert seen.read_text().split() == [str(os.getpid()), str(helper.pid)]
+        # The daemon stopped the helper group at the end of its graceful shutdown.
+        helper.wait(timeout=10)
+    finally:
+        if helper.poll() is None:
+            helper.kill()
+            helper.wait()
