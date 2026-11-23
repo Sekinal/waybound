@@ -9,13 +9,24 @@ description = "Dynamic BoringSSL + HTTP/2 browser-to-HTTP handoff client replayi
 
 [dependencies]
 brotli.workspace = true
+bytes = "1"
 flate2.workspace = true
 futures-util = "0.3"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tracing.workspace = true
 waybound-core.workspace = true
+webpki-roots = "1"
 wreq = { version = "6.0.0-rc.31", features = ["cookies", "gzip", "brotli", "deflate", "zstd", "socks", "stream"] }
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
 
 [lints]
 workspace = true

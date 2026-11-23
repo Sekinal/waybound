@@ -278,3 +278,38 @@ def test_handoff_multipart_form_upload(local_http_url: str) -> None:
 
         with pytest.raises(ValueError, match="specify at most one"):
             client.post(f"{local_http_url}/multipart", body=b"abc", files={"raw": b"def"})
+
+
+def test_handoff_http3_option_forwarding_and_default(
+    monkeypatch: pytest.MonkeyPatch,
+    local_http_url: str,
+) -> None:
+    fp = SessionFingerprint(tls=None, http2=None, default_headers=(), cookies=())
+    captured_init_options: list[dict[str, object]] = []
+
+    orig_rpc = HandoffHttpClient._rpc
+
+    def spy_rpc(self: HandoffHttpClient, payload: dict[str, object]) -> dict[str, object]:
+        if payload.get("method") == "init":
+            opts = payload.get("options")
+            if isinstance(opts, dict):
+                captured_init_options.append(dict(opts))
+        return orig_rpc(self, payload)
+
+    monkeypatch.setattr(HandoffHttpClient, "_rpc", spy_rpc)
+
+    # Default http3 is False
+    with HandoffHttpClient(fp) as client:
+        resp = client.get(f"{local_http_url}/echo")
+        assert resp.status == 200
+
+    # Explicit http3=True via constructor and from_json
+    with HandoffHttpClient(fp, http3=True) as client:
+        resp = client.get(f"{local_http_url}/echo")
+        assert resp.status == 200
+
+    with HandoffHttpClient.from_json(fp.to_json(), http3=True) as client:
+        resp = client.get(f"{local_http_url}/echo")
+        assert resp.status == 200
+
+    assert [opts.get("http3") for opts in captured_init_options] == [False, True, True]
