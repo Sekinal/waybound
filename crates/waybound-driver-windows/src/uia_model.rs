@@ -207,37 +207,6 @@ pub fn select_web_root(documents: &[(f64, f64, f64, f64)]) -> Option<(usize, Opt
     }
 }
 
-/// `(x, y, width, height)` of an element.
-pub type XywhRect = (f64, f64, f64, f64);
-
-/// Like [`select_web_root`], over documents found in the raw view, each with its
-/// `IsControlElement` flag.
-///
-/// Documents that are control elements are considered first, so whenever the control view
-/// has a document the choice is exactly [`select_web_root`]'s over those. Only when none of
-/// them is a control element are the raw-only documents considered. (Chrome's web document
-/// can be missing from the control view right after launch while its content is already
-/// there; walking the browser window instead returned the browser's own UI.)
-#[must_use]
-pub fn select_web_root_preferring_control(
-    documents: &[(XywhRect, bool)],
-) -> Option<(usize, Option<Bounds>)> {
-    let control: Vec<usize> = (0..documents.len())
-        .filter(|&i| documents.get(i).is_some_and(|(_, is_control)| *is_control))
-        .collect();
-    let pool: Vec<usize> = if control.is_empty() {
-        (0..documents.len()).collect()
-    } else {
-        control
-    };
-    let rects: Vec<(f64, f64, f64, f64)> = pool
-        .iter()
-        .filter_map(|&i| documents.get(i).map(|(rect, _)| *rect))
-        .collect();
-    let (picked, bounds) = select_web_root(&rects)?;
-    pool.get(picked).map(|&idx| (idx, bounds))
-}
-
 /// Process names the walker accepts when no target pid is configured, in priority order.
 ///
 /// PowerShell's `Get-Process -Name 'chrome','msedge','chromium'` returns the matching
@@ -641,28 +610,6 @@ mod tests {
             select_web_root(&[(f64::NAN, 0.0, 10.0, 10.0)]),
             Some((0, None))
         );
-    }
-
-    #[test]
-    fn web_root_prefers_control_view_documents() {
-        let big = (0.0, 80.0, 1280.0, 720.0);
-        let small = (0.0, 80.0, 100.0, 100.0);
-        // A control-view document wins over a larger raw-only one.
-        assert_eq!(
-            select_web_root_preferring_control(&[(big, false), (small, true)]).map(|r| r.0),
-            Some(1)
-        );
-        // No control-view document: the raw-only ones are used.
-        assert_eq!(
-            select_web_root_preferring_control(&[(small, false), (big, false)]).map(|r| r.0),
-            Some(1)
-        );
-        // Only zero-sized control documents: the first of them, without viewport.
-        assert_eq!(
-            select_web_root_preferring_control(&[(big, false), ((0.0, 0.0, 0.0, 0.0), true)]),
-            Some((1, None))
-        );
-        assert_eq!(select_web_root_preferring_control(&[]), None);
     }
 
     #[test]
