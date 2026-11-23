@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/waybound-compositor",
   "crates/waybound-core",
   "crates/waybound-daemon",
   "crates/waybound-driver-android",
@@ -29,6 +30,7 @@ serde_json = "1.0"
 signal-hook = { version = "0.3", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+waybound-compositor = { path = "crates/waybound-compositor" }
 waybound-core = { path = "crates/waybound-core" }
 waybound-driver-android = { path = "crates/waybound-driver-android" }
 waybound-driver-linux = { path = "crates/waybound-driver-linux" }

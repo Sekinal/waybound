@@ -138,6 +138,22 @@ jobs:
             uv run python ../scripts/linux_live_smoke.py
           '
 
+  linux-wayland-compositor-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Ensure Chrome/Chromium is available
+        run: |
+          if ! command -v google-chrome >/dev/null 2>&1 && ! command -v chromium >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends chromium-browser
+          fi
+      - name: Run pure-Rust Wayland compositor live Chrome smoke test
+        run: cargo run --example wayland_chrome_smoke -p waybound-compositor
+
   typescript:
     strategy:
       fail-fast: false
