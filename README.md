@@ -99,8 +99,8 @@ from waybound import LaunchOptions, Role, launch_async
 async def main() -> None:
     async with launch_async(
         LaunchOptions(
-            backend="linux",            # or "macos", "windows", "android"
-            headless_wayland=True,      # pure-Rust Wayland compositor (zero Xvfb)
+            backend="linux",  # or "macos", "windows", "android"
+            headless_wayland=True,  # pure-Rust Wayland compositor (zero Xvfb)
             launch_chrome=True,
             url="https://en.wikipedia.org/wiki/Main_Page",
             profile_dir=Path("/tmp/my-chrome-profile"),
