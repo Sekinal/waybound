@@ -335,6 +335,13 @@ fn read_string_attr(element: &OwnedCf, attr_name: &str) -> Option<String> {
     cf_to_string(&val)
 }
 
+fn read_url_attr(element: &OwnedCf) -> Option<String> {
+    let val = copy_attr(element, "AXURL")?;
+    let raw = cf_to_url_string(&val)?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
 fn read_bounds(element: &OwnedCf) -> Bounds {
     let mut point = CgPoint::default();
     let mut has_pos = false;
@@ -588,6 +595,9 @@ fn walk_node(
     if role != Role::Unknown || name.is_some() {
         let disabled = is_control(role) && read_bool_attr(element, "AXEnabled") == Some(false);
         let expanded = read_expanded(element, role, expanded_key);
+        let url = (role == Role::Link)
+            .then(|| read_url_attr(element))
+            .flatten();
         let id = format!("ax-{}", out.len());
         out.push(AccessibilityNode {
             id,
@@ -599,6 +609,7 @@ fn walk_node(
             checked,
             disabled,
             expanded,
+            url,
         });
     }
 

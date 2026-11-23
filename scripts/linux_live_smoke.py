@@ -124,6 +124,18 @@ def main() -> int:
                 sys.stdout.write(f"6. Passive captured_responses count: {len(responses)}\n")
                 assert isinstance(responses, list)
 
+                links = page.links()
+                sys.stdout.write(f"6b. Page links with URL: {[(n.name, n.url) for n in links]}\n")
+                page2_links = [n for n in links if n.name == "Go to Page Two"]
+                assert len(page2_links) == 1, (
+                    f"expected 1 'Go to Page Two' link, got {page2_links!r}"
+                )
+                page2_url = page2_links[0].url
+                assert page2_url is not None, "expected non-None url for 'Go to Page Two' link"
+                assert page2_url.endswith("/page2"), (
+                    f"expected link url ending with '/page2', got {page2_url!r}"
+                )
+
                 link = page.get_by_role(waybound.Role.LINK, name="Go to Page Two", strict=True)
                 link.click()
                 page2 = page.get_by_role(waybound.Role.HEADING, name="Page Two").wait_for(

@@ -22,6 +22,7 @@ const REGISTRY_ROOT: &str = "/org/a11y/atspi/accessible/root";
 const IFACE_ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
 const IFACE_COMPONENT: &str = "org.a11y.atspi.Component";
 const IFACE_DOCUMENT: &str = "org.a11y.atspi.Document";
+const IFACE_HYPERLINK: &str = "org.a11y.atspi.Hyperlink";
 const IFACE_TEXT: &str = "org.a11y.atspi.Text";
 const IFACE_PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
@@ -301,6 +302,12 @@ impl AtspiClient {
                     })
             };
 
+            let url = if role == Role::Link {
+                self.get_hyperlink_uri(&bus, path.as_str())
+            } else {
+                None
+            };
+
             if bounds.width >= 0.0 && bounds.height >= 0.0 {
                 nodes.push(AccessibilityNode {
                     id: format!("atspi-{}", nodes.len()),
@@ -312,6 +319,7 @@ impl AtspiClient {
                     checked: states.checked,
                     disabled: states.disabled,
                     expanded: states.expanded,
+                    url,
                 });
             }
 
@@ -417,6 +425,16 @@ impl AtspiClient {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
+    }
+
+    fn get_hyperlink_uri(&self, bus: &str, path: &str) -> Option<String> {
+        let msg = self
+            .conn
+            .call_method(Some(bus), path, Some(IFACE_HYPERLINK), "GetURI", &(0i32,))
+            .ok()?;
+        let uri = msg.body().deserialize::<String>().ok()?;
+        let trimmed = uri.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
     }
 
     fn read_text(&self, bus: &str, path: &str) -> Option<String> {

@@ -133,6 +133,9 @@ struct RawUiaNode {
     /// (`0` collapsed, `1` expanded, `2` partially expanded, `3` leaf), if supported.
     #[serde(default)]
     expand_state: Option<i64>,
+    /// Resolved target URL (`href`) for hyperlink nodes (`ValuePattern.Current.Value`).
+    #[serde(default)]
+    url: Option<String>,
 }
 
 /// Derives the checked state from UIA patterns for checkable roles.
@@ -263,6 +266,7 @@ pub fn parse_uia_snapshot_json_limited(raw: &str, max_nodes: usize) -> Result<Ui
             checked: uia_checked(role, raw_node.toggle_state, raw_node.selected),
             disabled: raw_node.enabled == Some(false),
             expanded: uia_expanded(raw_node.expand_state),
+            url: normalize_non_empty(raw_node.url),
         });
     }
 
@@ -456,6 +460,11 @@ while ($queue.Count -gt 0 -and $nodes.Count -lt $maxNodes) {
             $viewportBounds = @{ x = $x; y = $y; width = $w; height = $h }
         }
 
+        $linkUrl = $null
+        if ($ct -eq 'ControlType.Hyperlink' -and $val -and $val.Trim() -ne '') {
+            $linkUrl = $val.Trim()
+        }
+
         $nodes.Add(@{
             id = $idStr
             control_type = $ct
@@ -471,6 +480,7 @@ while ($queue.Count -gt 0 -and $nodes.Count -lt $maxNodes) {
             toggle_state = $toggleState
             selected = $selected
             expand_state = $expandState
+            url = $linkUrl
         })
 
         $child = $walker.GetFirstChild($el)
@@ -782,6 +792,24 @@ mod tests {
         assert_eq!(uia_expanded(Some(2)), Some(true));
         assert_eq!(uia_expanded(Some(3)), None);
         assert_eq!(uia_expanded(None), None);
+    }
+
+    #[test]
+    fn parses_link_url_field_and_omits_empty() -> Result<()> {
+        let json = r#"{"nodes":[
+            {"id":"l1","control_type":"ControlType.Hyperlink","name":"About","url":"  https://example.com/about  ","x":0,"y":0,"width":50,"height":20},
+            {"id":"l2","control_type":"ControlType.Hyperlink","name":"Blank","url":"   ","x":0,"y":20,"width":50,"height":20},
+            {"id":"b1","control_type":"ControlType.Button","name":"Go","x":0,"y":40,"width":50,"height":20}
+        ]}"#;
+        let snapshot = parse_uia_snapshot_json(json)?;
+        assert_eq!(snapshot.nodes.len(), 3);
+        assert_eq!(
+            snapshot.nodes[0].url.as_deref(),
+            Some("https://example.com/about")
+        );
+        assert_eq!(snapshot.nodes[1].url, None);
+        assert_eq!(snapshot.nodes[2].url, None);
+        Ok(())
     }
 
     #[test]

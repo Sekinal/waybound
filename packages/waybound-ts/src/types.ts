@@ -94,6 +94,7 @@ export interface AccessibilityNode {
   readonly value: string | null;
   readonly bounds: Bounds;
   readonly focused: boolean;
+  readonly url?: string | null;
 }
 
 /** Passively decrypted HTTP/1.1, HTTP/2, or HTTP/3 response. */

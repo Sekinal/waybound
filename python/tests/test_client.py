@@ -555,7 +555,98 @@ def test_parse_node_state_fields_are_optional_and_tolerant() -> None:
     assert full.disabled is True
     assert full.expanded is False
 
-    junk = _parse_node({**base, "checked": "yes", "disabled": 1, "expanded": None})
+    junk = _parse_node({**base, "checked": "yes", "disabled": 1, "expanded": None, "url": 42})
     assert junk.checked is None
     assert junk.disabled is False
     assert junk.expanded is None
+    assert junk.url is None
+
+    link = _parse_node({**base, "role": "link", "url": "https://example.com/about"})
+    assert link.role is Role.LINK
+    assert link.url == "https://example.com/about"
+
+
+class TreeTransport(FakeTransport):
+    """Fake transport returning a fixed accessibility tree snapshot."""
+
+    def __init__(self, nodes: list[AccessibilityNode]) -> None:
+        super().__init__()
+        self._nodes = nodes
+
+    def snapshot_tree(self) -> list[AccessibilityNode]:
+        return list(self._nodes)
+
+
+def test_page_links_returns_only_links_with_non_empty_url() -> None:
+    bounds = Bounds(0.0, 0.0, 80.0, 20.0)
+    nodes = [
+        AccessibilityNode(
+            id="l1",
+            role=Role.LINK,
+            name="About",
+            value=None,
+            bounds=bounds,
+            focused=False,
+            url="https://example.com/about",
+        ),
+        AccessibilityNode(
+            id="l2",
+            role=Role.LINK,
+            name="No href",
+            value=None,
+            bounds=bounds,
+            focused=False,
+            url=None,
+        ),
+        AccessibilityNode(
+            id="l3",
+            role=Role.LINK,
+            name="Empty href",
+            value=None,
+            bounds=bounds,
+            focused=False,
+            url="",
+        ),
+        AccessibilityNode(
+            id="b1",
+            role=Role.BUTTON,
+            name="Not a link",
+            value=None,
+            bounds=bounds,
+            focused=False,
+            url="https://example.com/ignored",
+        ),
+    ]
+    page = Page(TreeTransport(nodes))
+    found = page.links()
+    assert [n.id for n in found] == ["l1"]
+    assert found[0].url == "https://example.com/about"
+
+
+async def test_async_page_links_returns_only_links_with_non_empty_url() -> None:
+    from waybound import AsyncPage  # noqa: PLC0415
+
+    bounds = Bounds(0.0, 0.0, 80.0, 20.0)
+    nodes = [
+        AccessibilityNode(
+            id="l1",
+            role=Role.LINK,
+            name="Docs",
+            value=None,
+            bounds=bounds,
+            focused=False,
+            url="https://example.com/docs",
+        ),
+        AccessibilityNode(
+            id="l2",
+            role=Role.LINK,
+            name="Missing",
+            value=None,
+            bounds=bounds,
+            focused=False,
+        ),
+    ]
+    async_page = AsyncPage(Page(TreeTransport(nodes)))
+    found = await async_page.links()
+    assert [n.id for n in found] == ["l1"]
+    assert found[0].url == "https://example.com/docs"
