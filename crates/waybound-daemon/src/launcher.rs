@@ -10,7 +10,7 @@ use std::fs::DirBuilder;
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -150,7 +150,7 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
         }
     })?;
 
-    let mut cmd = Command::new(&binary);
+    let mut cmd = waybound_core::process::command(&binary);
     let _ = cmd
         .arg("--force-renderer-accessibility")
         .stdin(Stdio::null())
@@ -225,7 +225,7 @@ fn focus_macos_pid(pid: i32) {
         .name("waybound-focus".to_owned())
         .spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(600));
-            let _ = Command::new("/usr/bin/osascript")
+            let _ = waybound_core::process::command("/usr/bin/osascript")
                 .args(["-e", &script])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

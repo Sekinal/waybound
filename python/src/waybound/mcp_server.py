@@ -188,6 +188,9 @@ def _tool_snapshot(page: Page, _args: dict[str, object]) -> dict[str, object]:
             "role": n.role.value,
             "name": n.name,
             "value": n.value,
+            "checked": n.checked,
+            "disabled": n.disabled,
+            "expanded": n.expanded,
             "bounds": {
                 "x": n.bounds.x,
                 "y": n.bounds.y,

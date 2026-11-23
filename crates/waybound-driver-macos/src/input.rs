@@ -29,23 +29,12 @@ pub fn dispatch_cg_event(event: &InputEvent, last_cursor: &mut Point) -> Result<
             post_mouse(CgEventType::MouseMoved, *to, CgMouseButton::Left)
         }
         InputEvent::MouseClick { button, hold_ms } => {
-            let (down, up, cg_button) = match button {
-                MouseButton::Left => (
-                    CgEventType::LeftMouseDown,
-                    CgEventType::LeftMouseUp,
-                    CgMouseButton::Left,
-                ),
-                MouseButton::Right => (
-                    CgEventType::RightMouseDown,
-                    CgEventType::RightMouseUp,
-                    CgMouseButton::Right,
-                ),
-                MouseButton::Middle => (
-                    CgEventType::OtherMouseDown,
-                    CgEventType::OtherMouseUp,
-                    CgMouseButton::Center,
-                ),
-            };
+            let ButtonEvents {
+                down,
+                up,
+                button: cg_button,
+                ..
+            } = button_events(*button);
             // Click where the pointer really is; the tracked position is only a fallback.
             if let Some(actual) = current_cursor_position() {
                 *last_cursor = actual;
@@ -62,6 +51,59 @@ pub fn dispatch_cg_event(event: &InputEvent, last_cursor: &mut Point) -> Result<
             modifiers,
             hold_ms,
         } => post_key(key, modifiers, *hold_ms),
+        InputEvent::MouseDown { button } => {
+            let events = button_events(*button);
+            if let Some(actual) = current_cursor_position() {
+                *last_cursor = actual;
+            }
+            post_mouse(events.down, *last_cursor, events.button)
+        }
+        InputEvent::MouseUp { button } => {
+            let events = button_events(*button);
+            if let Some(actual) = current_cursor_position() {
+                *last_cursor = actual;
+            }
+            post_mouse(events.up, *last_cursor, events.button)
+        }
+        InputEvent::PointerDrag { to, button } => {
+            // While a button is held, AppKit and Chrome only treat motion as a drag when it
+            // arrives as `*MouseDragged`; a plain `MouseMoved` would never start one.
+            let events = button_events(*button);
+            *last_cursor = *to;
+            post_mouse(events.dragged, *to, events.button)
+        }
+    }
+}
+
+/// The CoreGraphics event types and button constant used for one logical mouse button.
+#[derive(Debug, Clone, Copy)]
+struct ButtonEvents {
+    down: CgEventType,
+    up: CgEventType,
+    dragged: CgEventType,
+    button: CgMouseButton,
+}
+
+const fn button_events(button: MouseButton) -> ButtonEvents {
+    match button {
+        MouseButton::Left => ButtonEvents {
+            down: CgEventType::LeftMouseDown,
+            up: CgEventType::LeftMouseUp,
+            dragged: CgEventType::LeftMouseDragged,
+            button: CgMouseButton::Left,
+        },
+        MouseButton::Right => ButtonEvents {
+            down: CgEventType::RightMouseDown,
+            up: CgEventType::RightMouseUp,
+            dragged: CgEventType::RightMouseDragged,
+            button: CgMouseButton::Right,
+        },
+        MouseButton::Middle => ButtonEvents {
+            down: CgEventType::OtherMouseDown,
+            up: CgEventType::OtherMouseUp,
+            dragged: CgEventType::OtherMouseDragged,
+            button: CgMouseButton::Center,
+        },
     }
 }
 
@@ -290,6 +332,16 @@ fn post_key_event(keycode: u16, down: bool, flags: u64, unicode: Option<char>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drags_use_the_dragged_event_type_for_each_button() {
+        assert_eq!(button_events(MouseButton::Left).dragged as u32, 6);
+        assert_eq!(button_events(MouseButton::Right).dragged as u32, 7);
+        assert_eq!(button_events(MouseButton::Middle).dragged as u32, 27);
+        assert_eq!(button_events(MouseButton::Left).down as u32, 1);
+        assert_eq!(button_events(MouseButton::Left).up as u32, 2);
+        assert_eq!(button_events(MouseButton::Middle).button as u32, 2);
+    }
 
     #[test]
     fn reads_a_finite_cursor_position_without_permissions() {

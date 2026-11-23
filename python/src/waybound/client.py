@@ -106,6 +106,49 @@ class Locator:
         """Fill the resolved input element using native keyboard events."""
         self._transport.fill(self.query, text)
 
+    def drag_to(self, target: Locator, *, timeout_ms: int = 5_000) -> None:
+        """Drag this element onto `target` with a native press, pointer path, and release.
+
+        Waits up to `timeout_ms` for each of the two elements to appear. The mouse button
+        is always released, even when the drag fails part-way.
+        """
+        self._transport.drag_to(self.query, target.query, timeout_ms=timeout_ms)
+
+    def check(self) -> None:
+        """Ensure the checkbox/radio/switch is checked, clicking only if it is not.
+
+        Waits for the element to appear and, if a click is needed, to become enabled. Raises
+        `WayboundDaemonError` with code `element_disabled` if it stays disabled, or
+        `invalid_element_state` if the element has no checked state or the click did not
+        check it.
+        """
+        self._transport.set_checked(self.query, checked=True)
+
+    def uncheck(self) -> None:
+        """Ensure the checkbox/switch is unchecked, clicking only if it is checked.
+
+        A mixed (indeterminate) checkbox counts as unchecked, so it is left mixed without a
+        click. Radio buttons cannot be unchecked (`invalid_element_state`); check another
+        option instead. Errors are otherwise the same as for `check()`.
+        """
+        self._transport.set_checked(self.query, checked=False)
+
+    def is_checked(self, *, timeout_ms: int = 5_000) -> bool:
+        """Return whether the element is checked (a mixed checkbox is not checked).
+
+        Raises `WayboundDaemonError` with code `invalid_element_state` if the element has
+        no checked state.
+        """
+        node = self.wait_for(timeout_ms=timeout_ms)
+        if node.checked is None:
+            msg = f"element {node.name!r} (role {node.role.value}) has no checked state"
+            raise WayboundDaemonError("invalid_element_state", msg)
+        return node.checked
+
+    def is_enabled(self, *, timeout_ms: int = 5_000) -> bool:
+        """Return `True` unless the element is disabled."""
+        return not self.wait_for(timeout_ms=timeout_ms).disabled
+
 
 class Page:
     """High-level semantic interface to a controlled browser session."""
@@ -118,15 +161,29 @@ class Page:
         return self._transport.current_url()
 
     def wait_for_url(self, url_contains: str, *, timeout_ms: int = 10_000) -> str:
-        """Poll until the active tab URL contains `url_contains` or `timeout_ms` elapses."""
+        """Poll until the active tab URL contains `url_contains` or `timeout_ms` elapses.
+
+        Transient backend failures (daemon error code ``transient``, for example an
+        Android UI dump taken mid-animation) count as "not there yet"; any other error
+        is raised at once. On timeout the message includes the last transient error.
+        """
         needle = url_contains.lower()
         deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+        last_transient: WayboundDaemonError | None = None
         while True:
-            current = self._transport.current_url()
+            try:
+                current = self._transport.current_url()
+            except WayboundDaemonError as exc:
+                if exc.code != "transient":
+                    raise
+                last_transient = exc
+                current = None
             if current is not None and needle in current.lower():
                 return current
             if time.monotonic() >= deadline:
                 msg = f"timed out after {timeout_ms}ms waiting for URL containing {url_contains!r}"
+                if last_transient is not None:
+                    msg += f"; last backend error: {last_transient}"
                 raise WayboundDaemonError("timeout", msg)
             time.sleep(0.075)
 
@@ -211,7 +268,10 @@ class Page:
         self._transport.wait_for_network_idle(idle_ms=idle_ms, timeout_ms=timeout_ms)
 
     def screenshot(self, path: Path | str | None = None) -> bytes:
-        """Capture a native OS PNG screenshot of the browser window and return PNG bytes."""
+        """Capture a native OS PNG screenshot and return PNG bytes.
+
+        macOS captures the browser window; the other backends capture the whole screen.
+        """
         if path is not None:
             out_path = Path(path).resolve()
             self._transport.screenshot(str(out_path))

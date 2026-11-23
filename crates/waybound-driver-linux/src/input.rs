@@ -108,10 +108,20 @@ fn xdotool_keysym(ch: char) -> String {
 #[must_use]
 pub fn build_xdotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
     match event {
-        InputEvent::PointerMove { to } => vec![vec![
+        // `xdotool mousemove` goes through XTEST, which tracks held buttons itself, so a
+        // move during a drag needs no special form.
+        InputEvent::PointerMove { to } | InputEvent::PointerDrag { to, .. } => vec![vec![
             "mousemove".to_owned(),
             format_coord(to.x),
             format_coord(to.y),
+        ]],
+        InputEvent::MouseDown { button } => vec![vec![
+            "mousedown".to_owned(),
+            xdotool_button(*button).to_owned(),
+        ]],
+        InputEvent::MouseUp { button } => vec![vec![
+            "mouseup".to_owned(),
+            xdotool_button(*button).to_owned(),
         ]],
         InputEvent::MouseClick { button, hold_ms } => {
             let btn = xdotool_button(*button).to_owned();
@@ -276,18 +286,88 @@ const fn linux_char_keycode(ch: char) -> Option<u16> {
     }
 }
 
+/// Builds a `ydotool click` that only presses (`down`) or only releases `button`.
+fn ydotool_button_command(button: MouseButton, down: bool) -> Vec<String> {
+    let (_, down_code, up_code) = ydotool_button_codes(button);
+    let code = if down { down_code } else { up_code };
+    vec!["click".to_owned(), code.to_owned()]
+}
+
+/// Rounds a logical coordinate to the whole pixel `ydotool` is given.
+#[allow(clippy::cast_possible_truncation)]
+fn coord_px(value: f64) -> i32 {
+    if !value.is_finite() {
+        return 0;
+    }
+    value.round().clamp(-1_000_000.0, 1_000_000.0) as i32
+}
+
 /// Builds the sequence of `ydotool` argument vectors for an [`InputEvent`].
-#[must_use]
-pub fn build_ydotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
+///
+/// `cursor` is the pointer position (whole pixels) the previous commands left the pointer
+/// at. `ydotool mousemove --absolute` is implemented as a jump to the `(0, 0)` corner
+/// followed by a relative move, so it is only used for plain moves; moves with a button
+/// held ([`InputEvent::PointerDrag`]) are relative to `cursor`, or else the drag would be
+/// dragged through the top-left corner (and could trip GNOME's hot corner). Relative moves
+/// go through the compositor's pointer acceleration, so with an accelerated profile the
+/// drop can land short of or past the target.
+///
+/// # Errors
+///
+/// Returns [`WayboundError::BackendUnavailable`] for a drag move while the pointer
+/// position is unknown (no absolute move was sent yet).
+pub fn build_ydotool_commands(
+    event: &InputEvent,
+    cursor: &mut Option<(i32, i32)>,
+) -> Result<Vec<Vec<String>>> {
     match event {
-        InputEvent::PointerMove { to } => vec![vec![
-            "mousemove".to_owned(),
-            "--absolute".to_owned(),
-            "-x".to_owned(),
-            format_coord(to.x),
-            "-y".to_owned(),
-            format_coord(to.y),
-        ]],
+        InputEvent::PointerMove { to } => {
+            let (x, y) = (coord_px(to.x), coord_px(to.y));
+            *cursor = Some((x, y));
+            Ok(vec![vec![
+                "mousemove".to_owned(),
+                "--absolute".to_owned(),
+                "-x".to_owned(),
+                x.to_string(),
+                "-y".to_owned(),
+                y.to_string(),
+            ]])
+        }
+        InputEvent::PointerDrag { to, .. } => {
+            let Some((from_x, from_y)) = *cursor else {
+                return Err(WayboundError::BackendUnavailable {
+                    backend: BACKEND_NAME.to_owned(),
+                    reason: "ydotool drag needs a known pointer position; move the pointer \
+                             before pressing"
+                        .to_owned(),
+                });
+            };
+            let (x, y) = (coord_px(to.x), coord_px(to.y));
+            *cursor = Some((x, y));
+            let (dx, dy) = (x - from_x, y - from_y);
+            if dx == 0 && dy == 0 {
+                // Already there: nothing to move.
+                return Ok(Vec::new());
+            }
+            Ok(vec![vec![
+                "mousemove".to_owned(),
+                "-x".to_owned(),
+                dx.to_string(),
+                "-y".to_owned(),
+                dy.to_string(),
+            ]])
+        }
+        other => Ok(ydotool_stateless_commands(other)),
+    }
+}
+
+/// `ydotool` commands for events that do not depend on the pointer position.
+fn ydotool_stateless_commands(event: &InputEvent) -> Vec<Vec<String>> {
+    match event {
+        // Pointer moves need the tracked position; see `build_ydotool_commands`.
+        InputEvent::PointerMove { .. } | InputEvent::PointerDrag { .. } => Vec::new(),
+        InputEvent::MouseDown { button } => vec![ydotool_button_command(*button, true)],
+        InputEvent::MouseUp { button } => vec![ydotool_button_command(*button, false)],
         InputEvent::MouseClick { button, hold_ms } => {
             let (click_code, down_code, up_code) = ydotool_button_codes(*button);
             if *hold_ms == 0 {
@@ -384,11 +464,11 @@ pub fn build_ydotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
 /// Returns `Ok(true)` if `xclip` succeeded, or `Ok(false)` if `xclip` is unavailable.
 pub(crate) fn try_paste_unicode_x11(ch: char, display: Option<&str>) -> Result<bool> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::thread;
     use std::time::Duration;
 
-    let mut cmd = Command::new("xclip");
+    let mut cmd = waybound_core::process::command("xclip");
     let _ = cmd
         .args(["-selection", "clipboard"])
         .stdin(Stdio::piped())
@@ -450,6 +530,9 @@ pub(crate) fn try_paste_unicode_x11(ch: char, display: Option<&str>) -> Result<b
 
 /// Dispatches an [`InputEvent`] via `xdotool` (X11/Xvfb) or `ydotool` (Wayland).
 ///
+/// `ydotool_cursor` carries the pointer position between `ydotool` calls (see
+/// [`build_ydotool_commands`]).
+///
 /// # Errors
 ///
 /// Returns [`WayboundError::BackendUnavailable`] if the input binary is missing or
@@ -458,6 +541,7 @@ pub fn dispatch_input(
     event: &InputEvent,
     server: DisplayServer,
     display: Option<&str>,
+    ydotool_cursor: &mut Option<(i32, i32)>,
 ) -> Result<()> {
     if server == DisplayServer::X11
         && let InputEvent::KeyPress {
@@ -473,9 +557,11 @@ pub fn dispatch_input(
         return Ok(());
     }
 
+    let mut next_cursor = *ydotool_cursor;
     let (program, commands) = match server {
         DisplayServer::X11 => ("xdotool", build_xdotool_commands(event)),
-        DisplayServer::Wayland => ("ydotool", build_ydotool_commands(event)),
+        // Plan against a copy: the tracked position only advances once the move succeeded.
+        DisplayServer::Wayland => ("ydotool", build_ydotool_commands(event, &mut next_cursor)?),
     };
 
     let mut envs: Vec<(&str, &str)> = Vec::new();
@@ -507,6 +593,7 @@ pub fn dispatch_input(
         }
     }
 
+    *ydotool_cursor = next_cursor;
     Ok(())
 }
 
@@ -515,6 +602,11 @@ mod tests {
     use waybound_core::Point;
 
     use super::*;
+
+    /// Builds `ydotool` commands from an unknown starting pointer position.
+    fn ydo(event: &InputEvent) -> Vec<Vec<String>> {
+        build_ydotool_commands(event, &mut None).unwrap_or_default()
+    }
 
     #[test]
     fn detects_display_server_from_environment_vars() {
@@ -600,14 +692,14 @@ mod tests {
     #[test]
     fn builds_ydotool_commands_for_pointer_click_scroll_and_keys() {
         assert_eq!(
-            build_ydotool_commands(&InputEvent::PointerMove {
+            ydo(&InputEvent::PointerMove {
                 to: Point { x: 300.0, y: 500.0 },
             }),
             vec![vec!["mousemove", "--absolute", "-x", "300", "-y", "500"]]
         );
 
         assert_eq!(
-            build_ydotool_commands(&InputEvent::MouseClick {
+            ydo(&InputEvent::MouseClick {
                 button: MouseButton::Left,
                 hold_ms: 0,
             }),
@@ -615,7 +707,7 @@ mod tests {
         );
 
         assert_eq!(
-            build_ydotool_commands(&InputEvent::MouseClick {
+            ydo(&InputEvent::MouseClick {
                 button: MouseButton::Middle,
                 hold_ms: 150,
             }),
@@ -623,7 +715,7 @@ mod tests {
         );
 
         assert_eq!(
-            build_ydotool_commands(&InputEvent::Scroll {
+            ydo(&InputEvent::Scroll {
                 delta_x: 2.0,
                 delta_y: 4.0,
             }),
@@ -631,7 +723,7 @@ mod tests {
         );
 
         assert_eq!(
-            build_ydotool_commands(&InputEvent::KeyPress {
+            ydo(&InputEvent::KeyPress {
                 key: KeyCode::Char('l'),
                 modifiers: vec![KeyModifier::Control],
                 hold_ms: 0,
@@ -640,12 +732,102 @@ mod tests {
         );
 
         assert_eq!(
-            build_ydotool_commands(&InputEvent::KeyPress {
+            ydo(&InputEvent::KeyPress {
                 key: KeyCode::Char('z'),
                 modifiers: Vec::new(),
                 hold_ms: 0,
             }),
             vec![vec!["type", "--key-delay", "0", "--", "z"]]
+        );
+    }
+
+    #[test]
+    fn builds_press_drag_and_release_commands() {
+        let down = InputEvent::MouseDown {
+            button: MouseButton::Left,
+        };
+        let drag = InputEvent::PointerDrag {
+            to: Point { x: 410.4, y: 88.6 },
+            button: MouseButton::Left,
+        };
+        let up = InputEvent::MouseUp {
+            button: MouseButton::Left,
+        };
+
+        assert_eq!(build_xdotool_commands(&down), vec![vec!["mousedown", "1"]]);
+        assert_eq!(
+            build_xdotool_commands(&drag),
+            vec![vec!["mousemove", "410", "89"]]
+        );
+        assert_eq!(build_xdotool_commands(&up), vec![vec!["mouseup", "1"]]);
+
+        assert_eq!(ydo(&down), vec![vec!["click", "0x40"]]);
+        assert_eq!(ydo(&up), vec![vec!["click", "0x80"]]);
+        assert_eq!(
+            ydo(&InputEvent::MouseUp {
+                button: MouseButton::Right,
+            }),
+            vec![vec!["click", "0x81"]]
+        );
+    }
+
+    #[test]
+    fn ydotool_drag_moves_are_relative_to_the_tracked_pointer() {
+        let mut cursor = None;
+        let left = MouseButton::Left;
+        let drag_to = |x: f64, y: f64| InputEvent::PointerDrag {
+            to: Point { x, y },
+            button: left,
+        };
+
+        // Without a known position a drag cannot be placed, and says so.
+        assert!(build_ydotool_commands(&drag_to(5.0, 5.0), &mut cursor).is_err());
+
+        // One absolute move positions the pointer before the press.
+        let positioned = build_ydotool_commands(
+            &InputEvent::PointerMove {
+                to: Point { x: 200.4, y: 100.6 },
+            },
+            &mut cursor,
+        );
+        assert_eq!(
+            positioned.ok(),
+            Some(vec![
+                vec!["mousemove", "--absolute", "-x", "200", "-y", "101"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            ])
+        );
+        assert_eq!(cursor, Some((200, 101)));
+
+        // Held moves are relative deltas and never go through `--absolute`.
+        let first = build_ydotool_commands(&drag_to(210.0, 101.0), &mut cursor).ok();
+        assert_eq!(
+            first,
+            Some(vec![
+                vec!["mousemove", "-x", "10", "-y", "0"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            ])
+        );
+        let second = build_ydotool_commands(&drag_to(150.2, 60.0), &mut cursor).ok();
+        assert_eq!(
+            second,
+            Some(vec![
+                vec!["mousemove", "-x", "-60", "-y", "-41"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            ])
+        );
+        assert_eq!(cursor, Some((150, 60)));
+
+        // Repeating the position sends nothing.
+        assert_eq!(
+            build_ydotool_commands(&drag_to(150.0, 60.0), &mut cursor).ok(),
+            Some(Vec::new())
         );
     }
 
@@ -671,7 +853,7 @@ mod tests {
         );
 
         assert_eq!(
-            build_ydotool_commands(&InputEvent::Scroll {
+            ydo(&InputEvent::Scroll {
                 delta_x: 0.0,
                 delta_y: f64::NAN,
             })

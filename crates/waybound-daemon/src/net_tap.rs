@@ -2,26 +2,25 @@
 //!
 //! Decrypts HTTP/1.1, HTTP/2, and HTTP/3 responses off the wire without MITM
 //! certificates, proxies, or CDP, automatically decompressing `gzip`, `deflate`,
-//! and `br` (Brotli) payloads.
+//! `br` (Brotli), and `zstd` payloads.
 
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use flate2::read::{GzDecoder, ZlibDecoder};
 use waybound_core::{CapturedResponse, CapturedWebSocketFrame, Result, WayboundError};
+use waybound_net::decode_body_bytes;
 
 const MAX_CAPTURED_RESPONSES: usize = 500;
 /// Maximum retained WebSocket messages across all connections (oldest dropped first).
 const MAX_CAPTURED_WS_FRAMES: usize = 1_000;
 const MAX_PENDING_STREAMS: usize = 1_000;
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
-const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_WAIT_MS: u64 = 120_000;
 /// A matched response is returned once its body has stopped growing for this long.
@@ -370,51 +369,6 @@ impl StreamCorrelator {
     }
 }
 
-/// Decodes raw HTTP response bytes into UTF-8 text, transparently decompressing
-/// `gzip`, `deflate`, or `br` (Brotli) up to [`MAX_DECOMPRESSED_BYTES`].
-fn decode_body_bytes(raw: &[u8], encoding: Option<&str>) -> Option<String> {
-    if raw.is_empty() {
-        return None;
-    }
-
-    let enc = encoding.map(str::to_ascii_lowercase);
-    let decompressed: Vec<u8> = match enc.as_deref().map(str::trim) {
-        Some("gzip" | "x-gzip") => {
-            let mut out = Vec::new();
-            let mut decoder = GzDecoder::new(raw).take(MAX_DECOMPRESSED_BYTES);
-            // Retain decompressed prefix even on UnexpectedEof (e.g. streaming SSE / truncated frames).
-            let _ = decoder.read_to_end(&mut out);
-            if out.is_empty() { raw.to_vec() } else { out }
-        }
-        Some("deflate") => {
-            let mut out = Vec::new();
-            let mut decoder = ZlibDecoder::new(raw).take(MAX_DECOMPRESSED_BYTES);
-            let _ = decoder.read_to_end(&mut out);
-            if out.is_empty() { raw.to_vec() } else { out }
-        }
-        Some("br") => {
-            let mut out = Vec::new();
-            let mut decoder = brotli::Decompressor::new(raw, 4096).take(MAX_DECOMPRESSED_BYTES);
-            let _ = decoder.read_to_end(&mut out);
-            if out.is_empty() { raw.to_vec() } else { out }
-        }
-        _ => raw.to_vec(),
-    };
-
-    match String::from_utf8(decompressed) {
-        Ok(s) => Some(s),
-        Err(err) => {
-            let valid_up_to = err.utf8_error().valid_up_to();
-            if valid_up_to > 0 {
-                let bytes = err.into_bytes();
-                String::from_utf8(bytes[..valid_up_to].to_vec()).ok()
-            } else {
-                None
-            }
-        }
-    }
-}
-
 fn build_stream_key(
     tcp_stream: &str,
     udp_stream: &str,
@@ -572,7 +526,7 @@ pub fn start_passive_tap(ssl_keylog: &Path, store: Arc<ResponseStore>) -> Result
     })?;
 
     let iface = default_interface();
-    let mut cmd = Command::new(&tshark);
+    let mut cmd = waybound_core::process::command(&tshark);
     let _ = cmd
         .args([
             "-l",

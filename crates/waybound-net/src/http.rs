@@ -1,8 +1,8 @@
 //! Pure-Rust HTTP/1.1 and HTTP/2 + HPACK plaintext stream correlator.
 //!
 //! Consumes decrypted client->server and server->client byte streams from
-//! [`crate::tls13::PassiveTls13Decoder`], correlates request URLs with response
-//! statuses, headers, and full bodies (with streaming `gzip`/`deflate`/`br`
+//! [`crate::tls::PassiveTlsDecoder`], correlates request URLs with response
+//! statuses, headers, and full bodies (with streaming `gzip`/`deflate`/`br`/`zstd`
 //! decompression), and tracks exact inflight request counts for `networkidle`.
 
 use std::collections::{HashMap, VecDeque};
@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flate2::read::{GzDecoder, ZlibDecoder};
 use fluke_hpack::Decoder as HpackDecoder;
+use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 use waybound_core::{CapturedResponse, CapturedWebSocketFrame, HttpHeader, WebSocketDirection};
 
 use crate::chunked::{ChunkStatus, ChunkedDecoder};
@@ -34,6 +36,21 @@ const H2_FLAG_PRIORITY: u8 = 0x20;
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum decompressed UTF-8 body size (16 MiB).
 const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest `zstd` window a response may request (RFC 9659 caps HTTP `zstd` at 8 MiB).
+const ZSTD_MAX_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+/// `zstd` frame magic number (RFC 8878 §3.1.1) as it appears on the wire.
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+/// Wire bytes 1..4 of a skippable frame magic (`0x184D2A5?`, RFC 8878 §3.1.2).
+const ZSTD_SKIPPABLE_MAGIC_TAIL: [u8; 3] = [0x2A, 0x4D, 0x18];
+/// Size of a `zstd` block header (RFC 8878 §3.1.1.2).
+const ZSTD_BLOCK_HEADER_BYTES: usize = 3;
+/// Size of the optional `zstd` content checksum that ends a frame.
+const ZSTD_CHECKSUM_BYTES: usize = 4;
+/// Empty raw block flagged `Last_Block`, followed by a placeholder content
+/// checksum. Fed to the decoder in place of a block that has not fully arrived,
+/// so the frame ends and the decoder releases the output held in its window.
+const ZSTD_SYNTHETIC_FRAME_END: [u8; ZSTD_BLOCK_HEADER_BYTES + ZSTD_CHECKSUM_BYTES] =
+    [0x01, 0, 0, 0, 0, 0, 0];
 /// Maximum buffered framing bytes per direction.
 const MAX_FRAME_BUFFER: usize = 4 * 1024 * 1024;
 /// Maximum request body bytes retained per request, both raw and after decompression (1 MiB).
@@ -1241,7 +1258,7 @@ fn truncate_utf8(mut text: String, limit: usize) -> String {
 }
 
 /// Decodes raw response bytes into UTF-8 text, transparently decompressing
-/// `gzip`, `deflate`, or `br` (Brotli) and retaining partial prefixes for streaming SSE.
+/// `gzip`, `deflate`, `br` (Brotli), or `zstd` and retaining partial prefixes for streaming SSE.
 #[must_use]
 pub fn decode_body_bytes(raw: &[u8], encoding: Option<&str>) -> Option<String> {
     if raw.is_empty() {
@@ -1267,8 +1284,20 @@ pub fn decode_body_bytes(raw: &[u8], encoding: Option<&str>) -> Option<String> {
             let _ = decoder.read_to_end(&mut out);
             if out.is_empty() { raw.to_vec() } else { out }
         }
+        Some("zstd") => {
+            let out = decode_zstd(raw);
+            if out.is_empty() && !starts_like_zstd(raw) {
+                raw.to_vec()
+            } else {
+                out
+            }
+        }
         _ => raw.to_vec(),
     };
+    if decompressed.is_empty() {
+        // A `zstd` body whose first block has not arrived yet: no text so far.
+        return None;
+    }
 
     match String::from_utf8(decompressed) {
         Ok(s) => Some(s),
@@ -1280,6 +1309,154 @@ pub fn decode_body_bytes(raw: &[u8], encoding: Option<&str>) -> Option<String> {
             } else {
                 None
             }
+        }
+    }
+}
+
+/// Whether `raw` begins (or could begin, if cut short) with a `zstd` frame or
+/// skippable-frame magic number, as opposed to being an unencoded body.
+fn starts_like_zstd(raw: &[u8]) -> bool {
+    let head = raw
+        .get(..raw.len().min(ZSTD_FRAME_MAGIC.len()))
+        .unwrap_or_default();
+    let skippable = head.first().is_some_and(|b| b & 0xF0 == 0x50)
+        && ZSTD_SKIPPABLE_MAGIC_TAIL.starts_with(head.get(1..).unwrap_or_default());
+    ZSTD_FRAME_MAGIC.starts_with(head) || skippable
+}
+
+/// Decompresses one or more concatenated `zstd` frames (skipping skippable
+/// frames), capped at [`MAX_DECOMPRESSED_BYTES`]. A truncated final frame still
+/// yields the output of every block that arrived in full.
+fn decode_zstd(raw: &[u8]) -> Vec<u8> {
+    let limit = usize::try_from(MAX_DECOMPRESSED_BYTES).unwrap_or(usize::MAX);
+    let mut out = Vec::new();
+    let mut decoder = FrameDecoder::new();
+    decoder.set_max_window_size(ZSTD_MAX_WINDOW_BYTES);
+    let mut rest = raw;
+    while !rest.is_empty() && out.len() < limit {
+        // Frame_Header_Descriptor bit 2 is Content_Checksum_flag (RFC 8878 §3.1.1.1.1).
+        let has_checksum = rest.get(4).is_some_and(|d| d & 0x04 != 0);
+        let frame = rest;
+        let frame_out_start = out.len();
+        match decoder.reset(&mut rest) {
+            Ok(()) => {}
+            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                length,
+                ..
+            })) => {
+                rest = usize::try_from(length)
+                    .ok()
+                    .and_then(|len| rest.get(len..))
+                    .unwrap_or_default();
+                continue;
+            }
+            Err(_) => break,
+        }
+        match decode_zstd_frame(&mut decoder, &mut rest, has_checksum, &mut out, limit) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(remaining) => {
+                // A corrupt block leaves the decoder's window unreleased and may
+                // have pushed part of that block, so decode the frame again with
+                // a fresh reset, ending it right before the corrupt block.
+                out.truncate(frame_out_start);
+                let complete_len = frame.len().saturating_sub(remaining);
+                let mut patched = frame.get(..complete_len).unwrap_or_default().to_vec();
+                patched.extend_from_slice(&ZSTD_SYNTHETIC_FRAME_END);
+                let mut src = patched.as_slice();
+                if decoder.reset(&mut src).is_ok() {
+                    let _ =
+                        decode_zstd_frame(&mut decoder, &mut src, has_checksum, &mut out, limit);
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// How much of the next `zstd` block is present at the front of the input.
+enum ZstdBlock {
+    /// The whole block (and the frame checksum, if this block ends the frame).
+    Complete,
+    /// The whole block, but the frame checksum that follows it is cut short.
+    MissingChecksum,
+    /// The block header or body is cut short.
+    Truncated,
+}
+
+/// Classifies the next block from its header without decoding it.
+fn peek_zstd_block(rest: &[u8], has_checksum: bool) -> ZstdBlock {
+    let Some(&[b0, b1, b2]) = rest.get(..ZSTD_BLOCK_HEADER_BYTES) else {
+        return ZstdBlock::Truncated;
+    };
+    let header = u32::from_le_bytes([b0, b1, b2, 0]);
+    let last_block = header & 1 != 0;
+    let block_size = usize::try_from(header >> 3).unwrap_or(usize::MAX);
+    // Block_Type 1 (RLE) stores a single byte; Raw and Compressed store Block_Size.
+    let wire_size = if (header >> 1) & 0b11 == 1 {
+        1
+    } else {
+        block_size
+    };
+    let block_end = ZSTD_BLOCK_HEADER_BYTES.saturating_add(wire_size);
+    let checksum = if last_block && has_checksum {
+        ZSTD_CHECKSUM_BYTES
+    } else {
+        0
+    };
+    if rest.len() >= block_end.saturating_add(checksum) {
+        ZstdBlock::Complete
+    } else if rest.len() >= block_end {
+        ZstdBlock::MissingChecksum
+    } else {
+        ZstdBlock::Truncated
+    }
+}
+
+/// Decodes the blocks of the frame whose header `decoder` has just read,
+/// appending to `out` up to `limit` bytes. Returns `Ok(true)` when the frame
+/// ended in full and the input may hold another frame, `Ok(false)` when decoding
+/// should stop, and `Err(n)` when the block starting `n` bytes before the end of
+/// the input is corrupt.
+fn decode_zstd_frame(
+    decoder: &mut FrameDecoder,
+    rest: &mut &[u8],
+    has_checksum: bool,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<bool, usize> {
+    loop {
+        let remaining = rest.len();
+        let result = match peek_zstd_block(rest, has_checksum) {
+            ZstdBlock::Complete => {
+                decoder.decode_blocks(&mut *rest, BlockDecodingStrategy::UptoBlocks(1))
+            }
+            ZstdBlock::MissingChecksum => {
+                let padded = (*rest).chain(&ZSTD_SYNTHETIC_FRAME_END[ZSTD_BLOCK_HEADER_BYTES..]);
+                *rest = &[];
+                decoder.decode_blocks(padded, BlockDecodingStrategy::UptoBlocks(1))
+            }
+            ZstdBlock::Truncated => {
+                *rest = &[];
+                decoder.decode_blocks(
+                    &ZSTD_SYNTHETIC_FRAME_END[..],
+                    BlockDecodingStrategy::UptoBlocks(1),
+                )
+            }
+        };
+        if result.is_err() {
+            return Err(remaining);
+        }
+        if let Some(chunk) = decoder.collect() {
+            let room = limit.saturating_sub(out.len());
+            out.extend_from_slice(chunk.get(..room).unwrap_or(&chunk));
+        }
+        if out.len() >= limit {
+            return Ok(false);
+        }
+        if decoder.is_finished() {
+            return Ok(true);
         }
     }
 }
@@ -2075,6 +2252,45 @@ mod tests {
         );
     }
 
+    /// Text spanning several 128 KiB `zstd` blocks that does not collapse into one sequence.
+    fn multi_block_text() -> String {
+        use std::fmt::Write as _;
+
+        let mut text = String::new();
+        for i in 0..40_000u32 {
+            let _ = writeln!(text, "line {i}: {}", i.wrapping_mul(7919) % 10_007);
+        }
+        text
+    }
+
+    #[test]
+    fn decodes_zstd_round_trip() {
+        let payload = br#"{"flights":[{"price":419}]}"#;
+        let compressed = ruzstd::encoding::compress_to_vec(
+            &payload[..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        assert_ne!(compressed.as_slice(), &payload[..]);
+        assert_eq!(
+            decode_body_bytes(&compressed, Some("zstd")).as_deref(),
+            Some(r#"{"flights":[{"price":419}]}"#)
+        );
+        assert_eq!(
+            decode_body_bytes(&compressed, Some(" ZSTD ")).as_deref(),
+            Some(r#"{"flights":[{"price":419}]}"#)
+        );
+
+        let text = multi_block_text();
+        let compressed = ruzstd::encoding::compress_to_vec(
+            text.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        assert_eq!(
+            decode_body_bytes(&compressed, Some("zstd")).as_deref(),
+            Some(text.as_str())
+        );
+    }
+
     #[test]
     fn http1_chunked_request_with_extensions_and_trailers_keeps_sync() {
         let (mut corr, captured, _) = correlator("api.example.com");
@@ -2173,6 +2389,22 @@ mod tests {
         assert_eq!(
             header_values(&got[0].headers, "link"),
             vec!["</a.css>; rel=preload"]
+        );
+    }
+
+    #[test]
+    fn decodes_concatenated_zstd_frames() {
+        let mut compressed = ruzstd::encoding::compress_to_vec(
+            &b"data: one\n\n"[..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        compressed.extend(ruzstd::encoding::compress_to_vec(
+            &b"data: two\n\n"[..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        ));
+        assert_eq!(
+            decode_body_bytes(&compressed, Some("zstd")).as_deref(),
+            Some("data: one\n\ndata: two\n\n")
         );
     }
 
@@ -2321,6 +2553,98 @@ mod tests {
     }
 
     #[test]
+    fn keeps_partial_output_of_truncated_zstd_frame() {
+        let text = multi_block_text();
+        let compressed = ruzstd::encoding::compress_to_vec(
+            text.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        let truncated = &compressed[..compressed.len() * 3 / 4];
+        let partial = decode_body_bytes(truncated, Some("zstd")).unwrap_or_default();
+        assert_ne!(partial, "");
+        assert!(partial.len() < text.len());
+        assert!(text.starts_with(&partial));
+    }
+
+    #[test]
+    fn caps_zstd_output_at_max_decompressed_bytes() {
+        // Hand-built frame: no checksum, 1 MiB window, then RLE blocks of 128 KiB
+        // of `a` adding up to more than MAX_DECOMPRESSED_BYTES.
+        let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x50];
+        let blocks = 130;
+        for n in 1..=blocks {
+            // Block_Header: Last_Block | Block_Type (1 = RLE) << 1 | Block_Size << 3.
+            let header: u32 = u32::from(n == blocks) | (1 << 1) | (128 * 1024) << 3;
+            frame.extend_from_slice(&header.to_le_bytes()[..3]);
+            frame.push(b'a');
+        }
+        let body = decode_body_bytes(&frame, Some("zstd")).unwrap_or_default();
+        assert_eq!(
+            u64::try_from(body.len()).unwrap_or_default(),
+            MAX_DECOMPRESSED_BYTES
+        );
+        assert!(body.bytes().all(|b| b == b'a'));
+    }
+
+    /// Hand-built `zstd` frame: 1 MiB window (so the decoder holds back all
+    /// output until the frame ends), optional checksum, and one Raw block per
+    /// chunk, the last flagged `Last_Block`.
+    fn raw_block_frame(chunks: &[&[u8]], checksum: bool) -> Vec<u8> {
+        let mut frame = ZSTD_FRAME_MAGIC.to_vec();
+        frame.extend_from_slice(&[if checksum { 0x04 } else { 0x00 }, 0x50]);
+        for (n, chunk) in chunks.iter().enumerate() {
+            let last = u32::from(n + 1 == chunks.len());
+            let size = u32::try_from(chunk.len()).unwrap_or_default();
+            // Block_Header: Last_Block | Block_Type (0 = Raw) << 1 | Block_Size << 3.
+            frame.extend_from_slice(&(last | (size << 3)).to_le_bytes()[..3]);
+            frame.extend_from_slice(chunk);
+        }
+        if checksum {
+            // ruzstd leaves checksum verification to the caller.
+            frame.extend_from_slice(&[0xAB; 4]);
+        }
+        frame
+    }
+
+    #[test]
+    fn keeps_complete_blocks_of_truncated_zstd_frame_inside_window() {
+        let chunk = [b'x'; 1000];
+        let frame = raw_block_frame(&[&chunk, &chunk, &chunk, &chunk], false);
+        // Cut inside the last block's body, then inside its header.
+        for cut in [10, 1002] {
+            let truncated = &frame[..frame.len() - cut];
+            let body = decode_body_bytes(truncated, Some("zstd")).unwrap_or_default();
+            assert_eq!(body.len(), 3000, "cut {cut}");
+            assert!(body.bytes().all(|b| b == b'x'));
+        }
+    }
+
+    #[test]
+    fn keeps_last_zstd_block_when_only_checksum_is_cut() {
+        let frame = raw_block_frame(&[b"data: one\n\n", b"data: two\n\n"], true);
+        for cut in 0..=4 {
+            assert_eq!(
+                decode_body_bytes(&frame[..frame.len() - cut], Some("zstd")).as_deref(),
+                Some("data: one\n\ndata: two\n\n"),
+                "cut {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn skips_skippable_zstd_frames() {
+        let skippable = [0x5A, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 0xDE, 0xAD, 0xBE];
+        let mut body = skippable.to_vec();
+        body.extend(raw_block_frame(&[b"data: one\n\n"], false));
+        body.extend_from_slice(&skippable);
+        body.extend(raw_block_frame(&[b"data: two\n\n"], true));
+        assert_eq!(
+            decode_body_bytes(&body, Some("zstd")).as_deref(),
+            Some("data: one\n\ndata: two\n\n")
+        );
+    }
+
+    #[test]
     fn http1_results_do_not_depend_on_read_split_points() {
         let client: &[u8] = b"POST /a HTTP/1.1\r\nHost: s.test\r\nContent-Length: 5\r\n\r\nhelloPUT /b HTTP/1.1\r\nHost: s.test\r\nTransfer-Encoding: chunked\r\n\r\n2;e\r\nhi\r\n0\r\nT: x\r\n\r\nHEAD /c HTTP/1.1\r\nHost: s.test\r\n\r\nGET /d HTTP/1.1\r\nHost: s.test\r\n\r\n";
         let server: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nnew\r\n0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\nHTTP/1.1 304 Not Modified\r\nETag: \"e\"\r\n\r\n";
@@ -2344,5 +2668,48 @@ mod tests {
         for cut in 0..=server.len() {
             assert_eq!(run(client.len(), cut).0, baseline, "server cut {cut}");
         }
+    }
+
+    #[test]
+    fn zstd_body_without_complete_block_yields_none() {
+        let frame = raw_block_frame(&[b"data: one\n\n"], false);
+        for cut in [2, 6, 9, 13] {
+            assert_eq!(
+                decode_body_bytes(&frame[..cut], Some("zstd")),
+                None,
+                "cut {cut}"
+            );
+        }
+        assert_eq!(decode_body_bytes(&[0x5A, 0x2A], Some("zstd")), None);
+        // A body that is not zstd at all is still passed through as-is.
+        assert_eq!(
+            decode_body_bytes(b"plain text", Some("zstd")).as_deref(),
+            Some("plain text")
+        );
+    }
+
+    #[test]
+    fn keeps_blocks_before_corrupt_zstd_block() {
+        let good = raw_block_frame(&[b"aaaa", b"bbbb", b"cccc", b""], false);
+        // Drop the empty last block (3 bytes) and replace it with a corrupt one.
+        let prefix = &good[..good.len() - 3];
+
+        // Block_Type 3 (reserved), Block_Size 4, body present.
+        let mut reserved = prefix.to_vec();
+        reserved.extend_from_slice(&[0x26, 0x00, 0x00, 1, 2, 3, 4]);
+        assert_eq!(
+            decode_body_bytes(&reserved, Some("zstd")).as_deref(),
+            Some("aaaabbbbcccc")
+        );
+
+        // Raw block declaring 200000 bytes (over the 128 KiB block maximum), body present.
+        let mut oversized = prefix.to_vec();
+        let header: u32 = 1 | (200_000 << 3);
+        oversized.extend_from_slice(&header.to_le_bytes()[..3]);
+        oversized.extend(std::iter::repeat_n(b'z', 200_000));
+        assert_eq!(
+            decode_body_bytes(&oversized, Some("zstd")).as_deref(),
+            Some("aaaabbbbcccc")
+        );
     }
 }

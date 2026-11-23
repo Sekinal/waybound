@@ -1,7 +1,7 @@
 //! Bounded-timeout subprocess helper shared across Linux backend modules.
 
 use std::io::Read;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ pub fn run_with_timeout(
     timeout: Duration,
     context: &str,
 ) -> Result<Output> {
-    let mut cmd = Command::new(program);
+    let mut cmd = waybound_core::process::command(program);
     let _ = cmd
         .args(args)
         .stdin(Stdio::null())

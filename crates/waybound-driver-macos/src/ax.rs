@@ -8,11 +8,12 @@ use std::ptr;
 use waybound_core::{AccessibilityNode, Bounds, Result, Role, WayboundError};
 
 use crate::ffi::{
-    AXIsProcessTrusted, AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
-    AXUIElementGetTypeID, AXUIElementSetAttributeValue, AXValueGetTypeID, AXValueGetValue,
-    CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFGetTypeID, CgPoint, CgSize,
-    K_AX_ERROR_SUCCESS, K_AX_VALUE_TYPE_CG_POINT, K_AX_VALUE_TYPE_CG_SIZE, OwnedCf, cf_string,
-    cf_to_bool, cf_to_string, cf_to_url_string, kCFBooleanTrue,
+    AXIsProcessTrusted, AXUIElementCopyAttributeNames, AXUIElementCopyAttributeValue,
+    AXUIElementCreateApplication, AXUIElementGetTypeID, AXUIElementSetAttributeValue,
+    AXValueGetTypeID, AXValueGetValue, CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex,
+    CFEqual, CFGetTypeID, CgPoint, CgSize, K_AX_ERROR_SUCCESS, K_AX_VALUE_TYPE_CG_POINT,
+    K_AX_VALUE_TYPE_CG_SIZE, OwnedCf, cf_string, cf_to_bool, cf_to_i64, cf_to_string,
+    cf_to_url_string, kCFBooleanTrue,
 };
 
 const MAX_DEPTH: usize = 40;
@@ -135,7 +136,15 @@ pub fn snapshot_application_tree(pid: i32) -> Result<Vec<AccessibilityNode>> {
 
     let mut nodes = Vec::new();
     let mut visited = 0;
-    walk_node(&web_area, 0, &mut visited, &mut nodes);
+    // Created once per walk and shared by every probed node.
+    let expanded_key = cf_string("AXExpanded");
+    walk_node(
+        &web_area,
+        0,
+        &mut visited,
+        &mut nodes,
+        expanded_key.as_ref(),
+    );
     tracing::debug!(
         pid,
         visited,
@@ -255,7 +264,11 @@ fn enable_enhanced_ui(app: &OwnedCf) {
 }
 
 fn copy_attr(element: &OwnedCf, attr_name: &str) -> Option<OwnedCf> {
-    let key = cf_string(attr_name)?;
+    copy_attr_key(element, &cf_string(attr_name)?)
+}
+
+/// Like [`copy_attr`] with a pre-built attribute name `CFString`.
+fn copy_attr_key(element: &OwnedCf, key: &OwnedCf) -> Option<OwnedCf> {
     let mut out = ptr::null();
     // SAFETY: `element` and `key` are valid retained CoreFoundation references, and `out` receives a `+1` ref on success.
     unsafe {
@@ -356,11 +369,127 @@ fn accessible_name(role: Role, name: Option<String>, value: Option<&str>) -> Opt
     name
 }
 
+/// Maps a checkable role's numeric `AXValue` to the node's checked state.
+///
+/// `AXCheckBox`, `AXRadioButton`, switches, and Chromium's checkbox / radio menu items report
+/// `0` (off), `1` (on), or `2` (mixed). Mixed is reported as `Some(false)` (not fully
+/// checked). Other roles, and values that are missing or out of range, yield `None`, so a plain
+/// menu item without a numeric value has no checked state.
+fn checked_from_ax_value(role: Role, raw: Option<i64>) -> Option<bool> {
+    if !is_checkable(role) {
+        return None;
+    }
+    match raw? {
+        1 => Some(true),
+        0 | 2 => Some(false),
+        _ => None,
+    }
+}
+
+const fn is_checkable(role: Role) -> bool {
+    matches!(
+        role,
+        Role::CheckBox | Role::Radio | Role::Switch | Role::MenuItem
+    )
+}
+
+/// Roles that are actionable controls, for which `AXEnabled` is read.
+///
+/// Limiting these extra AX round trips to controls keeps snapshots of large pages fast;
+/// static text, headings, and containers are never reported disabled.
+const fn is_control(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Button
+            | Role::Link
+            | Role::TextBox
+            | Role::SearchBox
+            | Role::CheckBox
+            | Role::Radio
+            | Role::Switch
+            | Role::ComboBox
+            | Role::ListBox
+            | Role::Option
+            | Role::Tab
+            | Role::MenuItem
+            | Role::ListItem
+    )
+}
+
+/// How `AXExpanded` is read for a role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpandProbe {
+    /// The role is always expandable (combobox): read `AXExpanded` directly.
+    Always,
+    /// The role may be expandable (disclosure / menu buttons, links, menu and list items):
+    /// read `AXExpanded` only when the element lists it in its attribute names, because
+    /// answering `false` for any control would report non-expandable ones as collapsed.
+    IfAdvertised,
+    /// Never expandable: no AX call.
+    Never,
+}
+
+const fn expand_probe(role: Role) -> ExpandProbe {
+    match role {
+        Role::ComboBox => ExpandProbe::Always,
+        Role::Button | Role::Link | Role::MenuItem | Role::ListItem | Role::Tab => {
+            ExpandProbe::IfAdvertised
+        }
+        _ => ExpandProbe::Never,
+    }
+}
+
+fn read_bool_attr(element: &OwnedCf, attr_name: &str) -> Option<bool> {
+    copy_attr(element, attr_name).and_then(|v| cf_to_bool(&v))
+}
+
+/// Returns `true` if `element` lists the attribute named by `key` in
+/// `AXUIElementCopyAttributeNames`.
+fn advertises_attr(element: &OwnedCf, key: &OwnedCf) -> bool {
+    let mut raw_names = ptr::null();
+    // SAFETY: `element` is a valid retained `AXUIElementRef`; on success `raw_names` receives a
+    // `+1` retained `CFArrayRef` whose ownership is transferred to `OwnedCf`.
+    let names = unsafe {
+        if AXUIElementCopyAttributeNames(element.as_ptr(), &raw mut raw_names) != K_AX_ERROR_SUCCESS
+        {
+            return false;
+        }
+        OwnedCf::from_owned(raw_names)
+    };
+    let Some(names) = names else {
+        return false;
+    };
+    // SAFETY: `names` is a live CoreFoundation object whose type is checked to be `CFArray`;
+    // indices stay within `CFArrayGetCount`, elements are borrowed (`+0`) and only compared with
+    // `CFEqual` against the live `key` string while `names` keeps them alive.
+    unsafe {
+        if CFGetTypeID(names.as_ptr()) != CFArrayGetTypeID() {
+            return false;
+        }
+        let count = CFArrayGetCount(names.as_ptr());
+        (0..count).any(|idx| {
+            let item = CFArrayGetValueAtIndex(names.as_ptr(), idx);
+            !item.is_null() && CFEqual(item, key.as_ptr()) != 0
+        })
+    }
+}
+
+fn read_expanded(element: &OwnedCf, role: Role, expanded_key: Option<&OwnedCf>) -> Option<bool> {
+    let key = expanded_key?;
+    let read = || copy_attr_key(element, key).and_then(|v| cf_to_bool(&v));
+    match expand_probe(role) {
+        ExpandProbe::Always => read(),
+        ExpandProbe::IfAdvertised if advertises_attr(element, key) => read(),
+        ExpandProbe::IfAdvertised | ExpandProbe::Never => None,
+    }
+}
+
 fn walk_node(
     element: &OwnedCf,
     depth: usize,
     visited: &mut usize,
     out: &mut Vec<AccessibilityNode>,
+    expanded_key: Option<&OwnedCf>,
 ) {
     if depth > MAX_DEPTH || out.len() >= MAX_NODES || *visited >= MAX_VISITED {
         return;
@@ -379,7 +508,19 @@ fn walk_node(
         .filter(|s| !s.is_empty())
         .or_else(|| read_string_attr(element, "AXDescription").filter(|s| !s.is_empty()))
         .or_else(|| read_string_attr(element, "AXPlaceholderValue").filter(|s| !s.is_empty()));
-    let value = read_string_attr(element, "AXValue").filter(|s| !s.is_empty());
+    // `AXValue` is copied once: a string is the node's value, while checkable controls report
+    // their state as a `CFNumber` (a `CFBoolean` on some native switches).
+    let raw_value = copy_attr(element, "AXValue");
+    let value = raw_value
+        .as_ref()
+        .and_then(cf_to_string)
+        .filter(|s| !s.is_empty());
+    let checked = checked_from_ax_value(
+        role,
+        raw_value
+            .as_ref()
+            .and_then(|v| cf_to_i64(v).or_else(|| cf_to_bool(v).map(i64::from))),
+    );
     let name = accessible_name(role, name, value.as_deref());
     let focused = copy_attr(element, "AXFocused")
         .and_then(|v| cf_to_bool(&v))
@@ -387,6 +528,8 @@ fn walk_node(
     let bounds = read_bounds(element);
 
     if role != Role::Unknown || name.is_some() {
+        let disabled = is_control(role) && read_bool_attr(element, "AXEnabled") == Some(false);
+        let expanded = read_expanded(element, role, expanded_key);
         let id = format!("ax-{}", out.len());
         out.push(AccessibilityNode {
             id,
@@ -395,6 +538,9 @@ fn walk_node(
             value,
             bounds,
             focused,
+            checked,
+            disabled,
+            expanded,
         });
     }
 
@@ -430,7 +576,7 @@ fn walk_node(
         if out.len() >= MAX_NODES || *visited >= MAX_VISITED {
             break;
         }
-        walk_node(child, depth + 1, visited, out);
+        walk_node(child, depth + 1, visited, out, expanded_key);
     }
 }
 
@@ -451,5 +597,31 @@ mod tests {
         );
         // Other roles keep value and name separate (a text box's value is user input).
         assert_eq!(accessible_name(Role::TextBox, None, Some("typed")), None);
+    }
+
+    #[test]
+    fn ax_value_maps_to_checked_state_for_checkable_roles_only() {
+        assert_eq!(checked_from_ax_value(Role::CheckBox, Some(0)), Some(false));
+        assert_eq!(checked_from_ax_value(Role::CheckBox, Some(1)), Some(true));
+        // Mixed / indeterminate is "not fully checked".
+        assert_eq!(checked_from_ax_value(Role::CheckBox, Some(2)), Some(false));
+        assert_eq!(checked_from_ax_value(Role::Radio, Some(1)), Some(true));
+        assert_eq!(checked_from_ax_value(Role::Switch, Some(0)), Some(false));
+        assert_eq!(checked_from_ax_value(Role::CheckBox, Some(7)), None);
+        assert_eq!(checked_from_ax_value(Role::CheckBox, None), None);
+        assert_eq!(checked_from_ax_value(Role::Button, Some(1)), None);
+        // Chromium's checkbox / radio menu items report a numeric value; plain ones do not.
+        assert_eq!(checked_from_ax_value(Role::MenuItem, Some(1)), Some(true));
+        assert_eq!(checked_from_ax_value(Role::MenuItem, None), None);
+    }
+
+    #[test]
+    fn expanded_is_only_probed_for_roles_that_can_expand() {
+        assert_eq!(expand_probe(Role::ComboBox), ExpandProbe::Always);
+        assert_eq!(expand_probe(Role::Button), ExpandProbe::IfAdvertised);
+        assert_eq!(expand_probe(Role::Link), ExpandProbe::IfAdvertised);
+        assert_eq!(expand_probe(Role::TextBox), ExpandProbe::Never);
+        assert_eq!(expand_probe(Role::CheckBox), ExpandProbe::Never);
+        assert_eq!(expand_probe(Role::StaticText), ExpandProbe::Never);
     }
 }

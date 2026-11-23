@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import os
 import platform
 import re
@@ -13,7 +14,18 @@ import urllib.request
 from pathlib import Path
 
 DEFAULT_REPO = "Sekinal/waybound"
-DEFAULT_VERSION = "v0.3.0"
+_FALLBACK_VERSION = "v0.4.0"
+
+
+def _default_version() -> str:
+    """Return the release tag matching the installed SDK, so the daemon never lags behind it."""
+    try:
+        return f"v{importlib.metadata.version('waybound')}"
+    except importlib.metadata.PackageNotFoundError:
+        return _FALLBACK_VERSION
+
+
+DEFAULT_VERSION = _default_version()
 _SAFE_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _SAFE_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")

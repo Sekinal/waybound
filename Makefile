@@ -1,4 +1,4 @@
-.PHONY: setup check fix test fmt-check lint-rust lint-python
+.PHONY: setup check fix test fmt-check lint-rust lint-python deny
 
 setup:
 	cd python && uv sync --dev
@@ -26,3 +26,8 @@ test:
 	cargo build --workspace
 	cargo test --workspace --all-features
 	cd python && uv run pytest
+
+# Dependency audit (advisories, licences, bans, sources). Needs `cargo install cargo-deny`;
+# not part of `check` so contributors without the tool are not blocked. CI runs it.
+deny:
+	cargo deny check

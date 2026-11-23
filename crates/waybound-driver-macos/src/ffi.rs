@@ -83,10 +83,16 @@ pub enum CgEventType {
     RightMouseUp = 4,
     /// `kCGEventMouseMoved`
     MouseMoved = 5,
+    /// `kCGEventLeftMouseDragged`
+    LeftMouseDragged = 6,
+    /// `kCGEventRightMouseDragged`
+    RightMouseDragged = 7,
     /// `kCGEventOtherMouseDown`
     OtherMouseDown = 25,
     /// `kCGEventOtherMouseUp`
     OtherMouseUp = 26,
+    /// `kCGEventOtherMouseDragged`
+    OtherMouseDragged = 27,
 }
 
 /// CoreGraphics mouse buttons.
@@ -107,6 +113,7 @@ unsafe extern "C" {
     pub fn CFRelease(cf: CfTypeRef);
     pub fn CFRetain(cf: CfTypeRef) -> CfTypeRef;
     pub fn CFGetTypeID(cf: CfTypeRef) -> usize;
+    pub fn CFEqual(cf1: CfTypeRef, cf2: CfTypeRef) -> u8;
     pub fn CFStringGetTypeID() -> usize;
     pub fn CFArrayGetTypeID() -> usize;
     pub fn CFBooleanGetTypeID() -> usize;
@@ -143,6 +150,7 @@ unsafe extern "C" {
         attribute: CfStringRef,
         value: *mut CfTypeRef,
     ) -> i32;
+    pub fn AXUIElementCopyAttributeNames(element: AxUiElementRef, names: *mut CfArrayRef) -> i32;
     pub fn AXUIElementSetAttributeValue(
         element: AxUiElementRef,
         attribute: CfStringRef,
@@ -283,6 +291,26 @@ pub fn cf_to_bool(obj: &OwnedCf) -> Option<bool> {
             return None;
         }
         Some(CFBooleanGetValue(raw) != 0)
+    }
+}
+
+/// Converts an owned `CFTypeRef` to `i64` if its runtime type is `CFNumber`.
+#[must_use]
+pub fn cf_to_i64(obj: &OwnedCf) -> Option<i64> {
+    let raw = obj.as_ptr();
+    // SAFETY: `obj` guarantees `raw` is a live CoreFoundation object; the type ID check
+    // verifies `CFNumber` before `CFNumberGetValue` writes one `i64` into `out`.
+    unsafe {
+        if CFGetTypeID(raw) != CFNumberGetTypeID() {
+            return None;
+        }
+        let mut out = 0i64;
+        let ok = CFNumberGetValue(
+            raw,
+            K_CF_NUMBER_SINT64_TYPE,
+            (&raw mut out).cast::<c_void>(),
+        );
+        (ok != 0).then_some(out)
     }
 }
 
