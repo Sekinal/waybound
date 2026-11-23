@@ -85,6 +85,10 @@ class AsyncLocator:
         """Fill the resolved input element using native keyboard events."""
         await asyncio.to_thread(self._inner.fill, text)
 
+    async def drag_to(self, target: AsyncLocator, *, timeout_ms: int = 5_000) -> None:
+        """Drag this element onto `target` with a native press, pointer path, and release."""
+        await asyncio.to_thread(self._inner.drag_to, target._inner, timeout_ms=timeout_ms)
+
     async def check(self) -> None:
         """Ensure the checkbox/radio/switch is checked, clicking only if it is not."""
         await asyncio.to_thread(self._inner.check)

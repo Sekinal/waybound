@@ -66,6 +66,33 @@ async def test_async_launch_workflow() -> None:
         await page.get_by_role(Role.BUTTON, name="Search").click()
 
 
+def test_drag_to_against_mock_daemon() -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    with launch(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
+        origin = page.get_by_role(Role.TEXTBOX, name="Origin")
+        search = page.get_by_role(Role.BUTTON, name="Search")
+        origin.drag_to(search)
+        search.drag_to(origin, timeout_ms=200)
+
+        with pytest.raises(WayboundDaemonError) as missing:
+            origin.drag_to(page.get_by_role(Role.BUTTON, name="Nonexistent"), timeout_ms=100)
+        assert missing.value.code == "element_not_found"
+
+        # The connection stays usable after a failed drag.
+        assert page.url() == "https://mock.waybound.local/"
+
+
+async def test_async_drag_to_against_mock_daemon() -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    async with launch_async(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
+        origin = page.get_by_role(Role.TEXTBOX, name="Origin")
+        await origin.drag_to(page.get_by_role(Role.BUTTON, name="Search"), timeout_ms=200)
+
+
 def test_check_uncheck_round_trip_against_mock() -> None:
     if not DAEMON_BIN.exists():
         pytest.skip("waybound-daemon binary not built yet (run cargo build)")

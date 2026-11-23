@@ -16,7 +16,7 @@ from waybound import (
     Role,
     WayboundDaemonError,
 )
-from waybound.transport import _parse_node
+from waybound.transport import UnixSocketTransport, _parse_node
 
 
 class FakeTransport:
@@ -116,6 +116,11 @@ class FakeTransport:
     def screenshot(self, path: str) -> None:
         self.events.append(("screenshot", path))
 
+    def drag_to(
+        self, source: LocatorQuery, target: LocatorQuery, *, timeout_ms: int = 5_000
+    ) -> None:
+        self.events.append(("drag_to", (source, target, timeout_ms)))
+
     def set_checked(self, query: LocatorQuery, *, checked: bool) -> AccessibilityNode:
         self.events.append(("set_checked", (query, checked)))
         return AccessibilityNode(
@@ -164,6 +169,60 @@ def test_page_semantic_locators() -> None:
         ("scroll", (0.0, -250.0)),
         ("press", ("enter", ())),
     ]
+
+
+def test_locator_drag_to_sends_source_and_target_queries() -> None:
+    transport = FakeTransport()
+    page = Page(transport)
+
+    card = page.get_by_role(Role.BUTTON, name="Card 1")
+    column = page.get_by_role(Role.GROUP, name="Done").first
+    card.drag_to(column)
+    card.drag_to(column, timeout_ms=750)
+
+    source = LocatorQuery(role=Role.BUTTON, name="Card 1")
+    target = LocatorQuery(role=Role.GROUP, name="Done", nth=0)
+    assert transport.events == [
+        ("drag_to", (source, target, 5_000)),
+        ("drag_to", (source, target, 750)),
+    ]
+
+
+class _RecordingTransport(UnixSocketTransport):
+    """Socket-free transport capturing the wire payload and timeout of each request."""
+
+    def __init__(self) -> None:
+        self._base_timeout_s = 30.0
+        self.requests: list[tuple[dict[str, object], float | None]] = []
+
+    def _request(
+        self,
+        payload: dict[str, object],
+        *,
+        timeout_override_s: float | None = None,
+    ) -> dict[str, object]:
+        self.requests.append((payload, timeout_override_s))
+        return {"status": "ok"}
+
+
+def test_transport_drag_to_payload_and_scaled_timeout() -> None:
+    transport = _RecordingTransport()
+    source = LocatorQuery(role=Role.BUTTON, name="Card 1")
+    target = LocatorQuery(role=Role.GROUP, name="Done", exact=True)
+
+    transport.drag_to(source, target, timeout_ms=10_000)
+    transport.drag_to(source, target, timeout_ms=-5)
+
+    (payload, timeout_s), (clamped_payload, clamped_timeout_s) = transport.requests
+    assert payload == {
+        "method": "drag_to",
+        "source": {"role": "button", "name": "Card 1", "exact": False, "nth": 0},
+        "target": {"role": "group", "name": "Done", "exact": True, "nth": 0},
+        "timeout_ms": 10_000,
+    }
+    assert timeout_s == 50.0
+    assert clamped_payload["timeout_ms"] == 0
+    assert clamped_timeout_s == 30.0
 
 
 class FlakyUrlTransport(FakeTransport):

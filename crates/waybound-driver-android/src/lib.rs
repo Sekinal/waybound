@@ -8,11 +8,12 @@ pub mod xml;
 pub use waydroid::{WaydroidConfig, WaydroidSession};
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use waybound_core::{
-    AccessibilityNode, BackendKind, Driver, InputEvent, LocatorQuery, Point, Result, WayboundError,
+    AccessibilityNode, BackendKind, Driver, InputEvent, LocatorQuery, MouseButton, Point, Result,
+    WayboundError,
 };
 
 /// Android / Waydroid browser driver communicating with an unmodified Android Chrome
@@ -20,6 +21,9 @@ use waybound_core::{
 pub struct AndroidDriver {
     serial: Option<String>,
     cursor: Mutex<Point>,
+    drag: Mutex<adb::DragGesture>,
+    /// Device API level, probed on the first drag release and cached once read.
+    sdk_level: OnceLock<u32>,
     /// Serialises `uiautomator dump`: two concurrent dumps on one device make each other
     /// fail (`UiAutomationService ... already registered`).
     dump_lock: Mutex<()>,
@@ -37,6 +41,8 @@ impl AndroidDriver {
         Self {
             serial,
             cursor: Mutex::new(Point { x: 0.0, y: 0.0 }),
+            drag: Mutex::new(adb::DragGesture::Idle),
+            sdk_level: OnceLock::new(),
             dump_lock: Mutex::new(()),
             chords: adb::ChordSupportCache::new(),
         }
@@ -80,6 +86,20 @@ impl AndroidDriver {
                 adb::dump_ui_xml(serial)
             },
         )
+    }
+}
+
+impl AndroidDriver {
+    /// Returns the device API level, probing it once; a failed probe is retried next time.
+    fn sdk_level(&self) -> Option<u32> {
+        if let Some(level) = self.sdk_level.get() {
+            return Some(*level);
+        }
+        let probed = adb::probe_sdk_level(self.serial.as_deref());
+        if let Some(level) = probed {
+            let _ = self.sdk_level.set(level);
+        }
+        probed
     }
 }
 
@@ -130,7 +150,31 @@ impl Driver for AndroidDriver {
                 backend: "android_waydroid".to_owned(),
                 reason: "cursor state mutex poisoned".to_owned(),
             })?;
-        adb::dispatch_input(self.serial.as_deref(), event, &mut guard, &self.chords)
+        // A poisoned drag state only means an earlier dispatch panicked; the buffered press
+        // is still valid, and refusing here would leave a release unsent.
+        let mut drag = self
+            .drag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        adb::dispatch_input(
+            self.serial.as_deref(),
+            event,
+            &mut guard,
+            &self.chords,
+            &mut drag,
+            || self.sdk_level(),
+        )
+    }
+
+    /// Drops the buffered drag without sending anything: the finger never touched the
+    /// device (the whole gesture is only sent on release), so an aborted drag must not
+    /// turn into a real drop.
+    fn cancel_pointer_gesture(&self, _button: MouseButton) -> Result<()> {
+        *self
+            .drag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = adb::DragGesture::Idle;
+        Ok(())
     }
 }
 
@@ -154,6 +198,45 @@ mod tests {
         let driver = AndroidDriver::new(None);
         assert!(driver.open_url("file:///etc/passwd").is_err());
         assert!(driver.open_url("javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn cancelling_a_drag_forgets_it_without_invoking_adb() {
+        let driver = AndroidDriver::new(None);
+        // Press and drag only buffer state; neither runs adb.
+        assert!(
+            driver
+                .dispatch_input(&InputEvent::MouseDown {
+                    button: MouseButton::Left,
+                })
+                .is_ok()
+        );
+        assert!(
+            driver
+                .dispatch_input(&InputEvent::PointerDrag {
+                    to: Point { x: 50.0, y: 60.0 },
+                    button: MouseButton::Left,
+                })
+                .is_ok()
+        );
+        assert!(matches!(
+            driver.drag.lock().map(|g| g.clone()).ok(),
+            Some(adb::DragGesture::Pressed(_))
+        ));
+
+        assert!(driver.cancel_pointer_gesture(MouseButton::Left).is_ok());
+        assert_eq!(
+            driver.drag.lock().map(|g| g.clone()).ok(),
+            Some(adb::DragGesture::Idle)
+        );
+        // With nothing buffered, a later release has nothing to send (so no adb call).
+        assert!(
+            driver
+                .dispatch_input(&InputEvent::MouseUp {
+                    button: MouseButton::Left,
+                })
+                .is_ok()
+        );
     }
 
     #[test]

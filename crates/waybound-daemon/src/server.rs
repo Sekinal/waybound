@@ -73,6 +73,8 @@ pub struct ServerOptions {
 struct SessionState {
     /// Last pointer position sent by the daemon; `None` until the first move.
     last_cursor: Mutex<Option<Point>>,
+    /// Mouse buttons currently held by in-flight drags; shutdown waits for this to drop to 0.
+    held_buttons: AtomicUsize,
     shutdown: Arc<AtomicBool>,
     responses: Arc<ResponseStore>,
     options: ServerOptions,
@@ -86,6 +88,7 @@ impl SessionState {
     ) -> Self {
         Self {
             last_cursor: Mutex::new(None),
+            held_buttons: AtomicUsize::new(0),
             shutdown,
             responses,
             options,
@@ -237,6 +240,19 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             state.shutdown.store(true, Ordering::Release);
             Response::Ok
         }
+        Request::DragTo {
+            source,
+            target,
+            timeout_ms,
+        } => {
+            let wait = timeout_ms.map_or(DEFAULT_ACTION_WAIT, |ms| {
+                Duration::from_millis(ms.min(MAX_WAIT_TIMEOUT_MS))
+            });
+            match drag_element(driver, state, &source, &target, wait) {
+                Ok(()) => Response::Ok,
+                Err(err) => Response::from(&err),
+            }
+        }
         Request::SetChecked { query, checked } => {
             match set_checked_element(driver, state, &query, checked) {
                 Ok(node) => Response::Node { node },
@@ -363,11 +379,13 @@ const MAX_SCROLL_INTO_VIEW_ATTEMPTS: usize = 6;
 const DEFAULT_ACTION_WAIT: Duration = Duration::from_secs(5);
 const ACTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-fn locate_with_auto_wait(
+/// Locates `query`, polling for up to `wait` while it is not (yet) in the tree.
+fn locate_with_wait(
     driver: &dyn Driver,
     query: &LocatorQuery,
+    wait: Duration,
 ) -> Result<waybound_core::AccessibilityNode> {
-    poll_locate(driver, query, DEFAULT_ACTION_WAIT, ACTION_POLL_INTERVAL)
+    poll_locate(driver, query, wait, ACTION_POLL_INTERVAL)
 }
 
 fn validate_bounds(b: waybound_core::Bounds, query: &LocatorQuery) -> Result<()> {
@@ -389,6 +407,15 @@ fn hover_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery
     hover_element_node(driver, state, query).map(|_node| ())
 }
 
+fn hover_element_within(
+    driver: &dyn Driver,
+    state: &SessionState,
+    query: &LocatorQuery,
+    wait: Duration,
+) -> Result<()> {
+    hover_element_node_within(driver, state, query, wait).map(|_node| ())
+}
+
 /// Like [`hover_element`], but returns the node the pointer was moved onto, as re-located
 /// after any scroll-into-view (so its bounds are the ones on screen now).
 fn hover_element_node(
@@ -396,7 +423,16 @@ fn hover_element_node(
     state: &SessionState,
     query: &LocatorQuery,
 ) -> Result<waybound_core::AccessibilityNode> {
-    let mut node = locate_with_auto_wait(driver, query)?;
+    hover_element_node_within(driver, state, query, DEFAULT_ACTION_WAIT)
+}
+
+fn hover_element_node_within(
+    driver: &dyn Driver,
+    state: &SessionState,
+    query: &LocatorQuery,
+    wait: Duration,
+) -> Result<waybound_core::AccessibilityNode> {
+    let mut node = locate_with_wait(driver, query, wait)?;
     validate_bounds(node.bounds, query)?;
 
     // Auto-scroll off-screen elements into the visible viewport when viewport bounds are known.
@@ -676,6 +712,115 @@ fn navigate_url(driver: &dyn Driver, url: &str) -> Result<()> {
     })
 }
 
+/// Distance of the first moves after pressing, so the browser crosses its drag threshold
+/// (Chrome and Windows start an HTML5 drag after ~4 px, GTK after ~8 px) before the path.
+const DRAG_NUDGE_PX: f64 = 10.0;
+/// Delay between the press-hold nudge steps.
+const DRAG_NUDGE_INTERVAL: Duration = Duration::from_millis(16);
+/// Pause between pressing and the first move when motion pacing is off.
+const DRAG_PRESS_HOLD: Duration = Duration::from_millis(80);
+/// Dwell over the drop target before re-asserting the position, when pacing is off.
+const DRAG_SETTLE: Duration = Duration::from_millis(120);
+/// Pause between the last move over the target and the release.
+const DRAG_RELEASE_PAUSE: Duration = Duration::from_millis(50);
+/// Pause before retrying a failed button release.
+const RELEASE_RETRY_PAUSE: Duration = Duration::from_millis(20);
+/// Longest slice a drag sleeps before re-checking for shutdown.
+const SHUTDOWN_POLL_SLICE: Duration = Duration::from_millis(10);
+/// How long shutdown waits for in-flight drags to release their button. Drags stop within
+/// one step (at most one poll slice plus one dispatch) of seeing shutdown, so this mainly
+/// covers a slow backend: an `adb` release can take seconds.
+const HELD_BUTTON_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+
+/// A mouse button held down by the daemon, released when this guard is dropped.
+///
+/// Every early return (`?`) or unwind after the press therefore still lets go of the
+/// button; a stuck button on the user's machine is the worst failure a drag can have.
+///
+/// While it exists it is counted in [`SessionState::held_buttons`], so a daemon shutdown
+/// waits for the release instead of exiting with the button down.
+struct HeldButton<'a> {
+    driver: &'a dyn Driver,
+    button: MouseButton,
+    held_buttons: &'a AtomicUsize,
+    armed: bool,
+}
+
+impl<'a> HeldButton<'a> {
+    /// Presses `button`.
+    ///
+    /// The guard is counted in [`SessionState::held_buttons`] *before* the last shutdown
+    /// check, so a shutdown either stops the drag here or waits for its release. If the
+    /// press itself fails, the gesture is still cancelled on drop, since a backend may
+    /// have delivered the press before reporting an error.
+    fn press(driver: &'a dyn Driver, state: &'a SessionState, button: MouseButton) -> Result<Self> {
+        let _ = state.held_buttons.fetch_add(1, Ordering::AcqRel);
+        let mut guard = Self {
+            driver,
+            button,
+            held_buttons: &state.held_buttons,
+            armed: false,
+        };
+        ensure_not_shutting_down(state)?;
+        guard.armed = true;
+        driver.dispatch_input(&InputEvent::MouseDown { button })?;
+        Ok(guard)
+    }
+
+    /// Completes the drag by releasing the button, reporting a failure to the caller.
+    fn release(mut self) -> Result<()> {
+        self.armed = false;
+        release_button(self.driver, self.button)
+    }
+}
+
+impl Drop for HeldButton<'_> {
+    fn drop(&mut self) {
+        // An aborted drag is cancelled, not completed: on most backends that is a plain
+        // release, but a backend that replays the whole gesture on release (Android)
+        // must not perform a drop nobody asked for.
+        if self.armed
+            && let Err(err) = cancel_button(self.driver, self.button)
+        {
+            tracing::error!(error = %err, button = ?self.button, "failed to release mouse button after aborted drag");
+        }
+        // Always uncount, whatever happened above, so shutdown never waits on a ghost.
+        let _ = self.held_buttons.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Cancels a held gesture, retrying once after a short pause.
+fn cancel_button(driver: &dyn Driver, button: MouseButton) -> Result<()> {
+    driver.cancel_pointer_gesture(button).or_else(|err| {
+        tracing::warn!(error = %err, "pointer gesture cancel failed; retrying once");
+        thread::sleep(RELEASE_RETRY_PAUSE);
+        driver.cancel_pointer_gesture(button)
+    })
+}
+
+/// Sends a button release, retrying once after a short pause: a transient backend hiccup
+/// must not leave the button held.
+fn release_button(driver: &dyn Driver, button: MouseButton) -> Result<()> {
+    let event = InputEvent::MouseUp { button };
+    driver.dispatch_input(&event).or_else(|err| {
+        tracing::warn!(error = %err, "mouse button release failed; retrying once");
+        thread::sleep(RELEASE_RETRY_PAUSE);
+        driver.dispatch_input(&event)
+    })
+}
+
+/// Returns an error once the daemon has been asked to shut down, so an in-flight drag stops
+/// and its [`HeldButton`] guard releases the button before the process exits.
+fn ensure_not_shutting_down(state: &SessionState) -> Result<()> {
+    if state.shutdown.load(Ordering::Acquire) {
+        return Err(WayboundError::Io(std::io::Error::new(
+            ErrorKind::Interrupted,
+            "daemon is shutting down; drag aborted and mouse button released",
+        )));
+    }
+    Ok(())
+}
+
 /// Timing knobs for [`set_checked_element`]; tests shrink them to stay fast.
 #[derive(Debug, Clone, Copy)]
 struct CheckTiming {
@@ -805,6 +950,175 @@ fn refuse_radio_uncheck(
         });
     }
     Ok(())
+}
+
+/// Sleeps for `duration` in short slices, returning early with an error on shutdown.
+fn sleep_unless_shutting_down(state: &SessionState, duration: Duration) -> Result<()> {
+    let deadline = Instant::now() + duration;
+    loop {
+        ensure_not_shutting_down(state)?;
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        thread::sleep((deadline - now).min(SHUTDOWN_POLL_SLICE));
+    }
+}
+
+/// Plans the held-button moves of a drag from `start` to `end`.
+///
+/// The path is: a short nudge towards the target (to cross the browser's drag threshold),
+/// the planned human path (or one direct step when `smooth` is false), and a final step
+/// that repeats `end` after `settle`, so the page sees a `dragover` on the drop target
+/// right before the release. The last two steps always land exactly on `end`.
+fn plan_drag_path(
+    start: Point,
+    end: Point,
+    smooth: bool,
+    settle: Duration,
+    rng: &mut SplitMix64,
+) -> Vec<waybound_core::MotionStep> {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let distance = dx.hypot(dy);
+    let (ux, uy) = if distance.is_finite() && distance >= 1.0 {
+        (dx / distance, dy / distance)
+    } else {
+        (1.0, 0.0)
+    };
+
+    let mut steps = Vec::new();
+    for fraction in [0.4, 1.0] {
+        steps.push(waybound_core::MotionStep {
+            point: Point {
+                x: (DRAG_NUDGE_PX * fraction).mul_add(ux, start.x),
+                y: (DRAG_NUDGE_PX * fraction).mul_add(uy, start.y),
+            },
+            delay: DRAG_NUDGE_INTERVAL,
+        });
+    }
+    let nudged = steps.last().map_or(start, |step| step.point);
+
+    if smooth {
+        steps.extend(plan_human_pointer_path(
+            nudged,
+            end,
+            MotionConfig::default(),
+            rng,
+        ));
+    }
+    if steps.last().is_none_or(|step| step.point != end) {
+        steps.push(waybound_core::MotionStep {
+            point: end,
+            delay: Duration::ZERO,
+        });
+    }
+    steps.push(waybound_core::MotionStep {
+        point: end,
+        delay: settle,
+    });
+    steps
+}
+
+fn set_last_cursor(state: &SessionState, point: Point) {
+    if let Ok(mut guard) = state.last_cursor.lock() {
+        *guard = Some(point);
+    }
+}
+
+/// Drags the element matching `source` onto the element matching `target`.
+///
+/// Both elements are resolved (with auto-wait) before the button goes down, so a missing
+/// target never leaves a press behind. Once pressed, the button is owned by a
+/// [`HeldButton`] guard and released on every exit path.
+fn drag_element(
+    driver: &dyn Driver,
+    state: &SessionState,
+    source: &LocatorQuery,
+    target: &LocatorQuery,
+    wait: Duration,
+) -> Result<()> {
+    ensure_not_shutting_down(state)?;
+    hover_element_within(driver, state, source, wait)?;
+    let target_node = locate_with_wait(driver, target, wait)?;
+    validate_bounds(target_node.bounds, target)?;
+    let viewport = driver.viewport_bounds().ok().flatten();
+    let zone = visible_drop_zone(target_node.bounds, viewport).ok_or_else(|| {
+        WayboundError::ElementNotFound {
+            query: format!(
+                "drag target {target:?} at {:?} is outside the visible viewport {viewport:?}; scroll it into view first",
+                target_node.bounds
+            ),
+        }
+    })?;
+
+    let use_motion = state.options.use_motion;
+    let mut rng = SplitMix64::from_entropy();
+    let drop_point = if use_motion {
+        pick_click_point(zone, &mut rng)
+    } else {
+        let (x, y) = zone.center();
+        Point { x, y }
+    };
+    let start = state
+        .last_cursor
+        .lock()
+        .map_or(None, |g| *g)
+        .unwrap_or(drop_point);
+    let (press_hold, settle) = if use_motion {
+        thread::sleep(hover_pause_before_click(&mut rng));
+        (
+            Duration::from_millis(rng.range_u64(90, 160)),
+            Duration::from_millis(rng.range_u64(120, 220)),
+        )
+    } else {
+        (DRAG_PRESS_HOLD, DRAG_SETTLE)
+    };
+    // Android turns the whole press..release into one swipe, so intermediate points add
+    // nothing but latency there.
+    let smooth = use_motion && driver.backend_kind() != BackendKind::AndroidWaydroid;
+    let path = plan_drag_path(start, drop_point, smooth, settle, &mut rng);
+
+    let button = MouseButton::Left;
+    let held = HeldButton::press(driver, state, button)?;
+    sleep_unless_shutting_down(state, press_hold)?;
+    for step in path {
+        sleep_unless_shutting_down(state, step.delay)?;
+        driver.dispatch_input(&InputEvent::PointerDrag {
+            to: step.point,
+            button,
+        })?;
+        set_last_cursor(state, step.point);
+    }
+    sleep_unless_shutting_down(state, DRAG_RELEASE_PAUSE)?;
+    held.release()
+}
+
+/// Inset from the viewport edges that counts as visible, matching `hover_element`.
+const VIEWPORT_EDGE_MARGIN: f64 = 12.0;
+
+/// Returns the part of `target` that lies inside `viewport` (inset by
+/// [`VIEWPORT_EDGE_MARGIN`]), where a drop actually lands on the target, or `None` when no
+/// part of it is visible. An unknown or degenerate viewport leaves `target` unchanged,
+/// using the same "usable viewport" rule as `hover_element`.
+fn visible_drop_zone(
+    target: waybound_core::Bounds,
+    viewport: Option<waybound_core::Bounds>,
+) -> Option<waybound_core::Bounds> {
+    let Some(vp) = viewport.filter(|vp| vp.width > 2.0 * VIEWPORT_EDGE_MARGIN && vp.height > 40.0)
+    else {
+        return Some(target);
+    };
+    let left = target.x.max(vp.x + VIEWPORT_EDGE_MARGIN);
+    let top = target.y.max(vp.y + VIEWPORT_EDGE_MARGIN);
+    let right = (target.x + target.width).min(vp.x + vp.width - VIEWPORT_EDGE_MARGIN);
+    let bottom = (target.y + target.height).min(vp.y + vp.height - VIEWPORT_EDGE_MARGIN);
+    (right > left && bottom > top).then_some(waybound_core::Bounds {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
 }
 
 fn disabled_error(query: &LocatorQuery, desired: bool) -> WayboundError {
@@ -968,11 +1282,16 @@ pub fn serve_unix(
             {
                 tracing::debug!(error = %err, "transient accept error, continuing");
             }
-            Err(err) => return Err(WayboundError::Io(err)),
+            Err(err) => {
+                // Unwind like a requested shutdown so an in-flight drag still releases.
+                state.shutdown.store(true, Ordering::Release);
+                drain_connections(&active_connections, &state.held_buttons);
+                return Err(WayboundError::Io(err));
+            }
         }
     }
 
-    drain_connections(&active_connections);
+    drain_connections(&active_connections, &state.held_buttons);
     Ok(())
 }
 
@@ -1053,19 +1372,47 @@ pub fn serve_tcp(
             {
                 tracing::debug!(error = %err, "transient tcp accept error, continuing");
             }
-            Err(err) => return Err(WayboundError::Io(err)),
+            Err(err) => {
+                // Unwind like a requested shutdown so an in-flight drag still releases.
+                state.shutdown.store(true, Ordering::Release);
+                drain_connections(&active_connections, &state.held_buttons);
+                return Err(WayboundError::Io(err));
+            }
         }
     }
 
-    drain_connections(&active_connections);
+    drain_connections(&active_connections, &state.held_buttons);
     Ok(())
 }
 
-fn drain_connections(active_connections: &AtomicUsize) {
+fn drain_connections(active_connections: &AtomicUsize, held_buttons: &AtomicUsize) {
     tracing::info!("shutdown requested; draining active connections");
     let drain_deadline = Instant::now() + Duration::from_millis(250);
     while active_connections.load(Ordering::Acquire) > 0 && Instant::now() < drain_deadline {
         thread::sleep(Duration::from_millis(10));
+    }
+    let _ = wait_for_held_buttons(held_buttons, HELD_BUTTON_SHUTDOWN_WAIT);
+}
+
+/// Blocks until no drag holds a mouse button, or until `limit` elapses.
+///
+/// The process exits right after draining, which would kill a connection thread before its
+/// [`HeldButton`] guard sends the release. Drags notice shutdown between steps and release
+/// promptly; this only gives that release (and its retry) time to reach the OS.
+fn wait_for_held_buttons(held_buttons: &AtomicUsize, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if held_buttons.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            tracing::error!(
+                held = held_buttons.load(Ordering::Acquire),
+                "shutting down while a drag still holds a mouse button"
+            );
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1195,6 +1542,26 @@ mod tests {
         )
     }
 
+    fn state_with(use_motion: bool, shutdown: Arc<AtomicBool>) -> SessionState {
+        SessionState::new(
+            ServerOptions {
+                use_motion,
+                inflight: InflightCounter::default(),
+            },
+            Arc::new(ResponseStore::default()),
+            shutdown,
+        )
+    }
+
+    fn is_drag_input(event: &InputEvent) -> bool {
+        matches!(
+            event,
+            InputEvent::MouseDown { .. }
+                | InputEvent::MouseUp { .. }
+                | InputEvent::PointerDrag { .. }
+        )
+    }
+
     fn key_events(driver: &MockDriver) -> Vec<(KeyCode, Vec<KeyModifier>)> {
         driver
             .recorded_events()
@@ -1223,6 +1590,492 @@ mod tests {
                 (KeyCode::Char('N'), Vec::new()),
                 (KeyCode::Char('R'), Vec::new()),
                 (KeyCode::Char('T'), Vec::new()),
+            ]
+        );
+    }
+
+    fn search_button() -> LocatorQuery {
+        LocatorQuery::by_role(Role::Button, Some("Search Flights".to_owned()))
+    }
+
+    fn origin_box() -> LocatorQuery {
+        LocatorQuery::by_role(Role::TextBox, Some("Origin".to_owned()))
+    }
+
+    fn short_wait() -> Duration {
+        Duration::from_millis(50)
+    }
+
+    #[test]
+    fn drag_to_presses_moves_with_button_held_and_releases_on_target() {
+        let driver = MockDriver::sample_page();
+        let state = state();
+        let result = drag_element(
+            &driver,
+            &state,
+            &origin_box(),
+            &search_button(),
+            short_wait(),
+        );
+        assert!(result.is_ok(), "{result:?}");
+
+        // Origin centre (220, 138) -> Search Flights centre (430, 138).
+        let source = Point { x: 220.0, y: 138.0 };
+        let target = Point { x: 430.0, y: 138.0 };
+        let left = MouseButton::Left;
+        assert_eq!(
+            driver.recorded_events(),
+            vec![
+                InputEvent::PointerMove { to: source },
+                InputEvent::MouseDown { button: left },
+                InputEvent::PointerDrag {
+                    to: Point { x: 224.0, y: 138.0 },
+                    button: left,
+                },
+                InputEvent::PointerDrag {
+                    to: Point { x: 230.0, y: 138.0 },
+                    button: left,
+                },
+                InputEvent::PointerDrag {
+                    to: target,
+                    button: left
+                },
+                InputEvent::PointerDrag {
+                    to: target,
+                    button: left
+                },
+                InputEvent::MouseUp { button: left },
+            ]
+        );
+        assert_eq!(state.last_cursor.lock().map_or(None, |g| *g), Some(target));
+    }
+
+    #[test]
+    fn drag_to_through_request_handler_returns_ok() {
+        let driver = MockDriver::sample_page();
+        let response = handle_request(
+            &driver,
+            &state(),
+            Request::DragTo {
+                source: origin_box(),
+                target: search_button(),
+                timeout_ms: Some(50),
+            },
+        );
+        assert_eq!(response, Response::Ok);
+    }
+
+    #[test]
+    fn drag_to_releases_the_button_when_a_move_fails_mid_path() {
+        for fail_at in 0..4 {
+            let driver = MockDriver::failing_drag_at(fail_at);
+            let result = drag_element(
+                &driver,
+                &state(),
+                &origin_box(),
+                &search_button(),
+                short_wait(),
+            );
+            assert!(result.is_err(), "step {fail_at} should fail");
+
+            let events = driver.recorded_events();
+            let downs = events
+                .iter()
+                .filter(|e| matches!(e, InputEvent::MouseDown { .. }))
+                .count();
+            assert_eq!(downs, 1);
+            assert_eq!(
+                events.last(),
+                Some(&InputEvent::MouseUp {
+                    button: MouseButton::Left,
+                }),
+                "button left held after failure at step {fail_at}: {events:?}"
+            );
+            let drags = events
+                .iter()
+                .filter(|e| matches!(e, InputEvent::PointerDrag { .. }))
+                .count();
+            assert_eq!(drags, fail_at);
+        }
+    }
+
+    #[test]
+    fn drag_to_unknown_target_errors_without_pressing() {
+        let driver = MockDriver::sample_page();
+        let missing = LocatorQuery::by_role(Role::Button, Some("Nowhere".to_owned()));
+        let result = drag_element(&driver, &state(), &origin_box(), &missing, short_wait());
+        assert!(matches!(result, Err(WayboundError::ElementNotFound { .. })));
+        assert!(driver.recorded_events().iter().all(|e| !matches!(
+            e,
+            InputEvent::MouseDown { .. }
+                | InputEvent::MouseUp { .. }
+                | InputEvent::PointerDrag { .. }
+        )));
+
+        let response = handle_request(
+            &driver,
+            &state(),
+            Request::DragTo {
+                source: origin_box(),
+                target: missing,
+                timeout_ms: Some(0),
+            },
+        );
+        assert!(matches!(
+            response,
+            Response::Error { ref code, .. } if code == "element_not_found"
+        ));
+    }
+
+    #[test]
+    fn drag_to_releases_when_shutdown_arrives_mid_drag() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let driver = MockDriver::raising_on_drag(Arc::clone(&shutdown));
+        let state = state_with(false, Arc::clone(&shutdown));
+        let result = drag_element(
+            &driver,
+            &state,
+            &origin_box(),
+            &search_button(),
+            short_wait(),
+        );
+        assert!(
+            matches!(result, Err(WayboundError::Io(ref e)) if e.kind() == ErrorKind::Interrupted),
+            "{result:?}"
+        );
+
+        let events = driver.recorded_events();
+        let drags = events
+            .iter()
+            .filter(|e| matches!(e, InputEvent::PointerDrag { .. }))
+            .count();
+        assert_eq!(drags, 1, "drag kept going after shutdown: {events:?}");
+        assert_eq!(
+            events.last(),
+            Some(&InputEvent::MouseUp {
+                button: MouseButton::Left,
+            })
+        );
+        assert_eq!(state.held_buttons.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn drag_to_does_not_press_once_shutdown_is_requested() {
+        let driver = MockDriver::sample_page();
+        let state = state_with(false, Arc::new(AtomicBool::new(true)));
+        let result = drag_element(
+            &driver,
+            &state,
+            &origin_box(),
+            &search_button(),
+            short_wait(),
+        );
+        assert!(result.is_err());
+        assert!(!driver.recorded_events().iter().any(is_drag_input));
+    }
+
+    #[test]
+    fn shutdown_waits_for_a_held_button_to_be_released() {
+        let held = Arc::new(AtomicUsize::new(1));
+        let releaser = {
+            let held = Arc::clone(&held);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(120));
+                let _ = held.fetch_sub(1, Ordering::AcqRel);
+            })
+        };
+        let started = Instant::now();
+        assert!(wait_for_held_buttons(&held, Duration::from_secs(5)));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(releaser.join().is_ok());
+
+        // The wait is bounded: a release that never comes does not hang shutdown.
+        let stuck = AtomicUsize::new(1);
+        let started = Instant::now();
+        assert!(!wait_for_held_buttons(&stuck, Duration::from_millis(60)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn drag_to_releases_when_the_press_itself_fails() {
+        let driver = MockDriver::failing_press();
+        let state = state();
+        let result = drag_element(
+            &driver,
+            &state,
+            &origin_box(),
+            &search_button(),
+            short_wait(),
+        );
+        assert!(result.is_err());
+        let drag_events: Vec<_> = driver
+            .recorded_events()
+            .into_iter()
+            .filter(is_drag_input)
+            .collect();
+        assert_eq!(
+            drag_events,
+            vec![
+                InputEvent::MouseDown {
+                    button: MouseButton::Left,
+                },
+                InputEvent::MouseUp {
+                    button: MouseButton::Left,
+                },
+            ]
+        );
+        assert_eq!(state.held_buttons.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn drag_to_drops_on_the_visible_part_of_a_half_visible_target() {
+        // Search Flights spans x 360..500; the inset viewport edge is at 430 - 12 = 418,
+        // so the visible part is x 360..418 and its centre x = 389.
+        let driver = MockDriver::with_viewport(Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 430.0,
+            height: 800.0,
+        });
+        let result = drag_element(
+            &driver,
+            &state(),
+            &origin_box(),
+            &search_button(),
+            short_wait(),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let events = driver.recorded_events();
+        let drop = Point { x: 389.0, y: 138.0 };
+        assert_eq!(
+            events[events.len() - 2..],
+            [
+                InputEvent::PointerDrag {
+                    to: drop,
+                    button: MouseButton::Left,
+                },
+                InputEvent::MouseUp {
+                    button: MouseButton::Left,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn drop_zone_is_the_visible_part_of_the_target() {
+        let target = Bounds {
+            x: 360.0,
+            y: 120.0,
+            width: 140.0,
+            height: 36.0,
+        };
+        let vp = |width: f64| {
+            Some(Bounds {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height: 800.0,
+            })
+        };
+        assert_eq!(visible_drop_zone(target, None), Some(target));
+        assert_eq!(visible_drop_zone(target, vp(1280.0)), Some(target));
+        let zone = visible_drop_zone(target, vp(430.0));
+        assert_eq!(
+            zone,
+            Some(Bounds {
+                x: 360.0,
+                y: 120.0,
+                width: 58.0,
+                height: 36.0,
+            })
+        );
+        assert_eq!(visible_drop_zone(target, vp(300.0)), None);
+        // Only the margin strip visible counts as not visible.
+        assert_eq!(visible_drop_zone(target, vp(372.0)), None);
+
+        // With motion the random drop point always lands inside the visible part.
+        if let Some(zone) = zone {
+            let mut rng = SplitMix64::new(42);
+            for _ in 0..500 {
+                let p = pick_click_point(zone, &mut rng);
+                assert!((360.0..=418.0).contains(&p.x) && (120.0..=156.0).contains(&p.y));
+            }
+        }
+    }
+
+    #[test]
+    fn aborted_drags_cancel_and_completed_drags_release() {
+        let failing = MockDriver::failing_drag_at(1);
+        assert!(
+            drag_element(
+                &failing,
+                &state(),
+                &origin_box(),
+                &search_button(),
+                short_wait()
+            )
+            .is_err()
+        );
+        assert_eq!(failing.cancelled_gestures(), 1);
+
+        let ok = MockDriver::sample_page();
+        assert!(drag_element(&ok, &state(), &origin_box(), &search_button(), short_wait()).is_ok());
+        assert_eq!(ok.cancelled_gestures(), 0);
+        assert_eq!(
+            ok.recorded_events().last(),
+            Some(&InputEvent::MouseUp {
+                button: MouseButton::Left,
+            })
+        );
+    }
+
+    #[test]
+    fn drag_to_refuses_a_target_outside_the_viewport_without_pressing() {
+        // Origin (centre x=220) is visible; Search Flights (centre x=430) is not.
+        let driver = MockDriver::with_viewport(Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 300.0,
+            height: 800.0,
+        });
+        let result = drag_element(
+            &driver,
+            &state(),
+            &origin_box(),
+            &search_button(),
+            short_wait(),
+        );
+        assert!(
+            matches!(result, Err(WayboundError::ElementNotFound { ref query }) if query.contains("outside the visible viewport")),
+            "{result:?}"
+        );
+        assert!(!driver.recorded_events().iter().any(is_drag_input));
+
+        // The same drag inside the viewport goes ahead.
+        let wide = MockDriver::with_viewport(Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1280.0,
+            height: 800.0,
+        });
+        assert!(
+            drag_element(
+                &wide,
+                &state(),
+                &origin_box(),
+                &search_button(),
+                short_wait()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn drag_to_with_zero_timeout_fails_fast_for_a_missing_source() {
+        let driver = MockDriver::sample_page();
+        let missing = LocatorQuery::by_role(Role::Button, Some("Nowhere".to_owned()));
+        let started = Instant::now();
+        let result = drag_element(
+            &driver,
+            &state(),
+            &missing,
+            &search_button(),
+            Duration::ZERO,
+        );
+        assert!(matches!(result, Err(WayboundError::ElementNotFound { .. })));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn drag_to_with_motion_follows_a_planned_path_with_the_button_held() {
+        let driver = MockDriver::sample_page();
+        let state = state_with(true, Arc::new(AtomicBool::new(false)));
+        // A known starting cursor makes the hover follow a planned path too.
+        set_last_cursor(&state, Point { x: 20.0, y: 20.0 });
+        let result = drag_element(
+            &driver,
+            &state,
+            &origin_box(),
+            &search_button(),
+            short_wait(),
+        );
+        assert!(result.is_ok(), "{result:?}");
+
+        let events = driver.recorded_events();
+        let down = events
+            .iter()
+            .position(|e| matches!(e, InputEvent::MouseDown { .. }));
+        let up = events
+            .iter()
+            .position(|e| matches!(e, InputEvent::MouseUp { .. }));
+        assert_eq!(up, Some(events.len() - 1));
+        let (Some(down), Some(up)) = (down, up) else {
+            return;
+        };
+        // Planned hover moves before the press, only held moves between press and release.
+        assert!(down > 1, "expected a planned hover path: {events:?}");
+        assert!(
+            events[..down]
+                .iter()
+                .all(|e| matches!(e, InputEvent::PointerMove { .. }))
+        );
+        let held: Vec<Point> = events[down + 1..up]
+            .iter()
+            .filter_map(|e| match e {
+                InputEvent::PointerDrag {
+                    to,
+                    button: MouseButton::Left,
+                } => Some(*to),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(held.len(), up - down - 1);
+        assert!(held.len() > 6, "expected a multi-step drag path: {held:?}");
+
+        // Ends twice on a point inside the Search Flights button.
+        let last = held[held.len() - 1];
+        assert_eq!(held[held.len() - 2], last);
+        assert!((360.0..=500.0).contains(&last.x) && (120.0..=156.0).contains(&last.y));
+
+        // The first held move is a small nudge from the press point.
+        let pressed_at = match events[down - 1] {
+            InputEvent::PointerMove { to } => to,
+            _ => last,
+        };
+        let nudge = (held[0].x - pressed_at.x).hypot(held[0].y - pressed_at.y);
+        assert!((3.0..=5.0).contains(&nudge), "nudge was {nudge}");
+        assert_eq!(state.held_buttons.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn drag_path_nudges_then_ends_exactly_on_target() {
+        let mut rng = SplitMix64::new(7);
+        let start = Point { x: 0.0, y: 0.0 };
+        let end = Point { x: 0.0, y: 300.0 };
+        let settle = Duration::from_millis(5);
+        let path = plan_drag_path(start, end, true, settle, &mut rng);
+        assert!(path.len() > 4);
+        assert_eq!(
+            path.first().map(|s| s.point),
+            Some(Point { x: 0.0, y: 4.0 })
+        );
+        assert_eq!(
+            path.get(1).map(|s| s.point),
+            Some(Point { x: 0.0, y: 10.0 })
+        );
+        let tail: Vec<_> = path.iter().rev().take(2).map(|s| s.point).collect();
+        assert_eq!(tail, vec![end, end]);
+        assert_eq!(path.last().map(|s| s.delay), Some(settle));
+
+        // Dropping onto the start point still moves far enough to begin a drag.
+        let in_place = plan_drag_path(start, start, false, settle, &mut rng);
+        assert_eq!(
+            in_place.iter().map(|s| s.point).collect::<Vec<_>>(),
+            vec![
+                Point { x: 4.0, y: 0.0 },
+                Point { x: 10.0, y: 0.0 },
+                start,
+                start
             ]
         );
     }

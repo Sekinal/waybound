@@ -2,7 +2,8 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use waybound_core::{
     AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, MouseButton, Point, Result, Role,
@@ -27,6 +28,19 @@ const ONE_BY_ONE_PNG: &[u8] = &[
 pub struct MockDriver {
     state: Mutex<MockState>,
     events: Mutex<Vec<InputEvent>>,
+    /// When set, the `n`-th (0-based) [`InputEvent::PointerDrag`] fails instead of being
+    /// recorded, to exercise cleanup paths in the middle of a drag.
+    fail_drag_at: Option<usize>,
+    /// When set, every [`InputEvent::MouseDown`] fails (after being recorded, as if the
+    /// backend delivered the press and then reported an error).
+    fail_press: bool,
+    /// Visible viewport reported by [`Driver::viewport_bounds`].
+    viewport: Option<Bounds>,
+    /// Flag raised as soon as the first [`InputEvent::PointerDrag`] is dispatched, to
+    /// simulate a daemon shutdown arriving mid-drag.
+    raise_on_drag: Option<Arc<AtomicBool>>,
+    /// Number of [`Driver::cancel_pointer_gesture`] calls (aborted drags).
+    cancels: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -121,7 +135,58 @@ impl MockDriver {
                 ..MockState::default()
             }),
             events: Mutex::new(Vec::new()),
+            fail_drag_at: None,
+            fail_press: false,
+            viewport: None,
+            raise_on_drag: None,
+            cancels: AtomicUsize::new(0),
         }
+    }
+
+    /// Returns a sample-page driver whose mouse presses report failure.
+    #[cfg(test)]
+    #[must_use]
+    pub fn failing_press() -> Self {
+        Self {
+            fail_press: true,
+            ..Self::sample_page()
+        }
+    }
+
+    /// Returns a sample-page driver reporting `viewport` as the visible web area.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_viewport(viewport: Bounds) -> Self {
+        Self {
+            viewport: Some(viewport),
+            ..Self::sample_page()
+        }
+    }
+
+    /// Returns a sample-page driver that sets `flag` when the first drag step arrives.
+    #[cfg(test)]
+    #[must_use]
+    pub fn raising_on_drag(flag: Arc<AtomicBool>) -> Self {
+        Self {
+            raise_on_drag: Some(flag),
+            ..Self::sample_page()
+        }
+    }
+
+    /// Returns a sample-page driver whose `n`-th (0-based) pointer drag step fails.
+    #[cfg(test)]
+    #[must_use]
+    pub fn failing_drag_at(n: usize) -> Self {
+        Self {
+            fail_drag_at: Some(n),
+            ..Self::sample_page()
+        }
+    }
+
+    /// Returns how many aborted gestures were cancelled.
+    #[cfg(test)]
+    pub fn cancelled_gestures(&self) -> usize {
+        self.cancels.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -221,7 +286,9 @@ impl Driver for MockDriver {
     }
 
     fn viewport_bounds(&self) -> Result<Option<Bounds>> {
-        Ok(self.state.lock().map_or(None, |st| st.viewport))
+        Ok(self
+            .viewport
+            .or_else(|| self.state.lock().map_or(None, |st| st.viewport)))
     }
 
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
@@ -247,6 +314,12 @@ impl Driver for MockDriver {
 
     fn current_url(&self) -> Result<Option<String>> {
         Ok(Some("https://mock.waybound.local/".to_owned()))
+    }
+
+    fn cancel_pointer_gesture(&self, button: MouseButton) -> Result<()> {
+        let _ = self.cancels.fetch_add(1, Ordering::AcqRel);
+        // Same as the trait default: an ordinary release.
+        self.dispatch_input(&InputEvent::MouseUp { button })
     }
 
     fn screenshot(&self, output_path: &Path) -> Result<()> {
@@ -277,7 +350,28 @@ impl Driver for MockDriver {
             _ => {}
         }
         if let Ok(mut guard) = self.events.lock() {
+            if let (InputEvent::PointerDrag { .. }, Some(fail_at)) = (event, self.fail_drag_at) {
+                let drags_so_far = guard
+                    .iter()
+                    .filter(|e| matches!(e, InputEvent::PointerDrag { .. }))
+                    .count();
+                if drags_so_far == fail_at {
+                    return Err(WayboundError::BackendUnavailable {
+                        backend: "mock".to_owned(),
+                        reason: format!("injected failure on pointer drag step {fail_at}"),
+                    });
+                }
+            }
             guard.push(event.clone());
+        }
+        if let (InputEvent::PointerDrag { .. }, Some(flag)) = (event, &self.raise_on_drag) {
+            flag.store(true, Ordering::Release);
+        }
+        if self.fail_press && matches!(event, InputEvent::MouseDown { .. }) {
+            return Err(WayboundError::BackendUnavailable {
+                backend: "mock".to_owned(),
+                reason: "injected failure on mouse press".to_owned(),
+            });
         }
         Ok(())
     }

@@ -34,6 +34,8 @@ pub struct LinuxDriver {
     display_server: Option<DisplayServer>,
     x11: Arc<Mutex<Option<x11_native::X11Client>>>,
     atspi: Arc<Mutex<Option<atspi_native::AtspiClient>>>,
+    /// Pointer position left by the last `ydotool` move (Wayland fallback only).
+    ydotool_cursor: Arc<Mutex<Option<(i32, i32)>>>,
 }
 
 impl LinuxDriver {
@@ -46,6 +48,7 @@ impl LinuxDriver {
             display_server: None,
             x11: Arc::new(Mutex::new(None)),
             atspi: Arc::new(Mutex::new(None)),
+            ydotool_cursor: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -59,6 +62,7 @@ impl LinuxDriver {
             display_server: None,
             x11: Arc::new(Mutex::new(None)),
             atspi: Arc::new(Mutex::new(None)),
+            ydotool_cursor: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -185,10 +189,17 @@ impl Driver for LinuxDriver {
         {
             return Ok(());
         }
+        // A poisoned lock only means an earlier dispatch panicked; the position is still
+        // usable, and refusing here could leave a drag's release unsent.
+        let mut ydotool_cursor = self
+            .ydotool_cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         input::dispatch_input(
             event,
             self.resolved_display_server(),
             self.display.as_deref(),
+            &mut ydotool_cursor,
         )
     }
 }

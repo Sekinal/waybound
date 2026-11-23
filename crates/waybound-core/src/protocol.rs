@@ -131,6 +131,18 @@ pub enum Request {
     },
     /// Request a graceful daemon shutdown (unwinds RAII browser & socket guards).
     Shutdown,
+    /// Press the primary button on the element matching `source`, drag it along a planned
+    /// pointer path to the element matching `target`, and release it there.
+    DragTo {
+        /// Semantic locator query for the element to drag.
+        source: LocatorQuery,
+        /// Semantic locator query for the drop target.
+        target: LocatorQuery,
+        /// How long to wait for each of `source` and `target` to appear, in milliseconds
+        /// (defaults to the daemon's standard action auto-wait).
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
     /// Idempotently drive a checkbox / radio / switch to `checked`.
     ///
     /// Auto-waits for the element like `click` (and, when a click is needed, for it to be
@@ -230,6 +242,37 @@ mod tests {
                 assert_eq!(parsed, req);
             }
         }
+    }
+
+    #[test]
+    fn drag_to_request_round_trips_as_json() {
+        let req = Request::DragTo {
+            source: LocatorQuery::by_role(Role::Button, Some("Card".to_owned())),
+            target: LocatorQuery::by_role(Role::TextBox, Some("Done".to_owned())),
+            timeout_ms: Some(2_500),
+        };
+        let json = serde_json::to_value(&req).ok();
+        assert_eq!(
+            json.as_ref()
+                .and_then(|v| v.get("method"))
+                .and_then(serde_json::Value::as_str),
+            Some("drag_to")
+        );
+        let decoded = json.and_then(|v| serde_json::from_value::<Request>(v).ok());
+        assert_eq!(decoded, Some(req));
+
+        // `timeout_ms` is optional on the wire.
+        let minimal: Option<Request> = serde_json::from_str(
+            r#"{"method":"drag_to","source":{"role":"button","name":"A","exact":false,"nth":0},"target":{"role":"button","name":"B","exact":false,"nth":0}}"#,
+        )
+        .ok();
+        assert!(matches!(
+            minimal,
+            Some(Request::DragTo {
+                timeout_ms: None,
+                ..
+            })
+        ));
     }
 
     #[test]
