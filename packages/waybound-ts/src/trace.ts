@@ -1,6 +1,7 @@
 /** Opt-in production trace bundle recorder and HAR 1.2 exporter. */
 
-import { appendFile, mkdir, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { appendFile, mkdir, rm, rmdir, writeFile } from "node:fs/promises";
 import { STATUS_CODES } from "node:http";
 import path from "node:path";
 import { DEFAULT_VERSION } from "./binary.js";
@@ -335,6 +336,10 @@ export class TraceRecorder {
   #eventCount = 0;
   #finalized = false;
   #finalizedPath: string | null = null;
+  #checkedOutputDir = false;
+  #createdOutputDir = false;
+  readonly #createdFiles = new Set<string>();
+  readonly #createdSubdirs = new Set<string>();
 
   constructor(page: TracePageLike, outputDir: string, options: TraceRecorderOptions = {}) {
     this.#page = page;
@@ -351,23 +356,60 @@ export class TraceRecorder {
     return this.#outputDir;
   }
 
-  async #ensureDirs(): Promise<void> {
+  async #ensureOutputDir(): Promise<void> {
+    if (!this.#checkedOutputDir) {
+      this.#checkedOutputDir = true;
+      this.#createdOutputDir = !existsSync(this.#outputDir);
+    }
     await mkdir(this.#outputDir, { recursive: true });
+  }
+
+  async #ensureDirs(): Promise<void> {
+    await this.#ensureOutputDir();
     if (this.#captureScreenshots) {
-      await mkdir(path.join(this.#outputDir, "screenshots"), { recursive: true });
+      const shotsDir = path.join(this.#outputDir, "screenshots");
+      if (!existsSync(shotsDir)) {
+        this.#createdSubdirs.add(shotsDir);
+      }
+      await mkdir(shotsDir, { recursive: true });
     }
     if (this.#captureTrees) {
-      await mkdir(path.join(this.#outputDir, "trees"), { recursive: true });
+      const treesDir = path.join(this.#outputDir, "trees");
+      if (!existsSync(treesDir)) {
+        this.#createdSubdirs.add(treesDir);
+      }
+      await mkdir(treesDir, { recursive: true });
+    }
+  }
+
+  async #cleanupOnSuccess(): Promise<void> {
+    if (this.#createdOutputDir) {
+      await rm(this.#outputDir, { recursive: true, force: true });
+      return;
+    }
+    for (const filePath of this.#createdFiles) {
+      try {
+        await rm(filePath, { force: true });
+      } catch {
+        // Best-effort cleanup of trace files.
+      }
+    }
+    for (const subdir of this.#createdSubdirs) {
+      try {
+        await rmdir(subdir);
+      } catch {
+        // Leave non-empty or already-removed directories intact.
+      }
     }
   }
 
   async #appendEvent(event: TraceEvent): Promise<TraceEvent> {
-    await mkdir(this.#outputDir, { recursive: true });
-    await appendFile(
-      path.join(this.#outputDir, "timeline.jsonl"),
-      `${JSON.stringify(event)}\n`,
-      "utf8",
-    );
+    await this.#ensureOutputDir();
+    const timelinePath = path.join(this.#outputDir, "timeline.jsonl");
+    if (!existsSync(timelinePath)) {
+      this.#createdFiles.add(timelinePath);
+    }
+    await appendFile(timelinePath, `${JSON.stringify(event)}\n`, "utf8");
     this.#eventCount += 1;
     return event;
   }
@@ -406,8 +448,10 @@ export class TraceRecorder {
     let screenshotRel: string | null = null;
     if (this.#captureScreenshots) {
       const rel = `screenshots/${seqPrefix}_${slug}.png`;
+      const shotPath = path.join(this.#outputDir, rel);
       try {
-        await this.#page.screenshot(path.join(this.#outputDir, rel));
+        await this.#page.screenshot(shotPath);
+        this.#createdFiles.add(shotPath);
         screenshotRel = rel;
       } catch (err) {
         captureErrors.push(`screenshot capture failed: ${formatError(err)}`);
@@ -417,13 +461,11 @@ export class TraceRecorder {
     let treeRel: string | null = null;
     if (this.#captureTrees) {
       const rel = `trees/${seqPrefix}_${slug}.json`;
+      const treePath = path.join(this.#outputDir, rel);
       try {
         const nodes = await this.#page.snapshotTree();
-        await writeFile(
-          path.join(this.#outputDir, rel),
-          JSON.stringify(nodes.map(serializeNode)),
-          "utf8",
-        );
+        await writeFile(treePath, JSON.stringify(nodes.map(serializeNode)), "utf8");
+        this.#createdFiles.add(treePath);
         treeRel = rel;
       } catch (err) {
         captureErrors.push(`tree capture failed: ${formatError(err)}`);
@@ -451,7 +493,7 @@ export class TraceRecorder {
     const failed = options.failed ?? false;
 
     if (this.#onErrorOnly && !failed) {
-      await rm(this.#outputDir, { recursive: true, force: true });
+      await this.#cleanupOnSuccess();
       this.#finalizedPath = null;
       return null;
     }

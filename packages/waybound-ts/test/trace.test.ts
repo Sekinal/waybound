@@ -1,7 +1,7 @@
 /** Unit and live daemon E2E tests for HAR 1.2 export and `TraceRecorder`. */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
@@ -340,6 +340,36 @@ describe("TraceRecorder E2E: waybound-daemon --backend mock", { skip }, () => {
         assert.equal(failShot.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC), true);
         assert.equal(existsSync(path.join(failDir, "trees", "002_failure.json")), true);
         assert.equal(existsSync(path.join(failDir, "network.har")), true);
+
+        // 4. onErrorOnly: true preserves pre-existing outputDir and user files while cleaning trace files
+        const existingDir = path.join(tmp, "preexisting");
+        mkdirSync(existingDir, { recursive: true });
+        const keepPath = path.join(existingDir, "keep.txt");
+        writeFileSync(keepPath, "do not delete me", "utf8");
+
+        await withTrace(
+          page,
+          existingDir,
+          async (trace) => {
+            await trace.recordAction("step_one");
+            await trace.recordSnapshot("mid_run");
+            assert.equal(existsSync(path.join(existingDir, "timeline.jsonl")), true);
+            assert.equal(
+              existsSync(path.join(existingDir, "screenshots", "002_mid_run.png")),
+              true,
+            );
+            assert.equal(existsSync(path.join(existingDir, "trees", "002_mid_run.json")), true);
+          },
+          { onErrorOnly: true },
+        );
+
+        assert.equal(existsSync(existingDir), true);
+        assert.equal(readFileSync(keepPath, "utf8"), "do not delete me");
+        assert.equal(existsSync(path.join(existingDir, "timeline.jsonl")), false);
+        assert.equal(existsSync(path.join(existingDir, "screenshots")), false);
+        assert.equal(existsSync(path.join(existingDir, "trees")), false);
+        assert.equal(existsSync(path.join(existingDir, "manifest.json")), false);
+        assert.equal(existsSync(path.join(existingDir, "network.har")), false);
       });
     } finally {
       await session.close();

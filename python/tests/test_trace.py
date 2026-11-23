@@ -178,6 +178,21 @@ def test_responses_to_har_redacts_sensitive_headers() -> None:
     ]
 
 
+def test_responses_to_har_handles_out_of_range_timestamp() -> None:
+    resp = CapturedResponse(
+        url="https://example.com/overflow",
+        status=200,
+        content_type="text/plain",
+        body="ok",
+        captured_at_ms=10**20,
+    )
+    har = responses_to_har([resp])
+    entry = _as_dict(_as_list(_as_dict(har["log"])["entries"])[0])
+    started = entry["startedDateTime"]
+    assert isinstance(started, str)
+    assert started.endswith("Z")
+
+
 class _CrashingTransport:
     """Minimal transport stub whose capture methods all fail to test crash resilience."""
 
@@ -372,3 +387,31 @@ async def test_async_trace_bundle_e2e_mock_daemon(tmp_path: Path) -> None:
     fail_manifest = _as_dict(json.loads((fail_dir / "manifest.json").read_text(encoding="utf-8")))
     assert fail_manifest["failed"] is True
     assert (fail_dir / "screenshots" / "002_failure.png").exists()
+
+
+def test_on_error_only_preserves_preexisting_output_dir_and_files(tmp_path: Path) -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    existing_dir = tmp_path / "preexisting"
+    existing_dir.mkdir()
+    keep_file = existing_dir / "keep.txt"
+    keep_file.write_text("do not delete me", encoding="utf-8")
+
+    with (
+        launch(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page,
+        TraceRecorder(page, existing_dir, on_error_only=True) as trace,
+    ):
+        trace.record_action("step_one")
+        trace.record_snapshot("mid_run")
+        assert (existing_dir / "timeline.jsonl").exists()
+        assert (existing_dir / "screenshots" / "002_mid_run.png").exists()
+        assert (existing_dir / "trees" / "002_mid_run.json").exists()
+
+    assert existing_dir.exists()
+    assert keep_file.read_text(encoding="utf-8") == "do not delete me"
+    assert not (existing_dir / "timeline.jsonl").exists()
+    assert not (existing_dir / "screenshots").exists()
+    assert not (existing_dir / "trees").exists()
+    assert not (existing_dir / "manifest.json").exists()
+    assert not (existing_dir / "network.har").exists()

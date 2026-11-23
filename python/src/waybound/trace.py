@@ -47,7 +47,13 @@ def _sdk_version() -> str:
 
 
 def _iso_utc_from_ms(ts_ms: int | None) -> str:
-    dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=UTC) if ts_ms is not None else datetime.now(UTC)
+    if ts_ms is not None:
+        try:
+            dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=UTC)
+        except (ValueError, OverflowError, OSError):
+            dt = datetime.now(UTC)
+    else:
+        dt = datetime.now(UTC)
     return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
@@ -241,18 +247,45 @@ class TraceRecorder:
         self._event_count = 0
         self._finalized = False
         self._finalized_path: Path | None = None
+        self._checked_output_dir = False
+        self._created_output_dir = False
+        self._created_files: set[Path] = set()
+        self._created_subdirs: set[Path] = set()
 
     @property
     def output_dir(self) -> Path:
         """Directory where the trace bundle is staged and written."""
         return self._output_dir
 
-    def _ensure_dirs(self) -> None:
+    def _ensure_output_dir(self) -> None:
+        if not self._checked_output_dir:
+            self._checked_output_dir = True
+            self._created_output_dir = not self._output_dir.exists()
         self._output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _ensure_dirs(self) -> None:
+        self._ensure_output_dir()
         if self._capture_screenshots:
-            (self._output_dir / "screenshots").mkdir(parents=True, exist_ok=True)
+            shots_dir = self._output_dir / "screenshots"
+            if not shots_dir.exists():
+                self._created_subdirs.add(shots_dir)
+            shots_dir.mkdir(parents=True, exist_ok=True)
         if self._capture_trees:
-            (self._output_dir / "trees").mkdir(parents=True, exist_ok=True)
+            trees_dir = self._output_dir / "trees"
+            if not trees_dir.exists():
+                self._created_subdirs.add(trees_dir)
+            trees_dir.mkdir(parents=True, exist_ok=True)
+
+    def _cleanup_on_success(self) -> None:
+        if self._created_output_dir:
+            shutil.rmtree(self._output_dir, ignore_errors=True)
+            return
+        for file_path in self._created_files:
+            with contextlib.suppress(OSError):
+                file_path.unlink(missing_ok=True)
+        for subdir in self._created_subdirs:
+            with contextlib.suppress(OSError):
+                subdir.rmdir()
 
     def _append_event(  # noqa: PLR0913
         self,
@@ -265,7 +298,7 @@ class TraceRecorder:
         tree: str | None = None,
         error: str | None = None,
     ) -> dict[str, object]:
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_output_dir()
         event: dict[str, object] = {
             "ts_ms": int(time.time() * 1000),
             "seq": seq,
@@ -277,6 +310,8 @@ class TraceRecorder:
             "error": error,
         }
         timeline_path = self._output_dir / "timeline.jsonl"
+        if not timeline_path.exists():
+            self._created_files.add(timeline_path)
         with timeline_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(event) + "\n")
         self._event_count += 1
@@ -327,8 +362,10 @@ class TraceRecorder:
         screenshot_rel: str | None = None
         if self._capture_screenshots:
             rel = f"screenshots/{seq:03d}_{slug}.png"
+            shot_path = self._output_dir / rel
             try:
-                self._page.screenshot(self._output_dir / rel)
+                self._page.screenshot(shot_path)
+                self._created_files.add(shot_path)
                 screenshot_rel = rel
             except Exception as exc:
                 capture_errors.append(f"screenshot capture failed: {exc}")
@@ -336,10 +373,12 @@ class TraceRecorder:
         tree_rel: str | None = None
         if self._capture_trees:
             rel = f"trees/{seq:03d}_{slug}.json"
+            tree_path = self._output_dir / rel
             try:
                 nodes = self._page.snapshot_tree()
                 serialized = [_serialize_node(node) for node in nodes]
-                (self._output_dir / rel).write_text(json.dumps(serialized), encoding="utf-8")
+                tree_path.write_text(json.dumps(serialized), encoding="utf-8")
+                self._created_files.add(tree_path)
                 tree_rel = rel
             except Exception as exc:
                 capture_errors.append(f"tree capture failed: {exc}")
@@ -382,8 +421,10 @@ class TraceRecorder:
         screenshot_rel: str | None = None
         if self._capture_screenshots:
             rel = f"screenshots/{seq:03d}_{slug}.png"
+            shot_path = self._output_dir / rel
             try:
-                await self._page.screenshot(self._output_dir / rel)
+                await self._page.screenshot(shot_path)
+                self._created_files.add(shot_path)
                 screenshot_rel = rel
             except Exception as exc:
                 capture_errors.append(f"screenshot capture failed: {exc}")
@@ -391,10 +432,12 @@ class TraceRecorder:
         tree_rel: str | None = None
         if self._capture_trees:
             rel = f"trees/{seq:03d}_{slug}.json"
+            tree_path = self._output_dir / rel
             try:
                 nodes = await self._page.snapshot_tree()
                 serialized = [_serialize_node(node) for node in nodes]
-                (self._output_dir / rel).write_text(json.dumps(serialized), encoding="utf-8")
+                tree_path.write_text(json.dumps(serialized), encoding="utf-8")
+                self._created_files.add(tree_path)
                 tree_rel = rel
             except Exception as exc:
                 capture_errors.append(f"tree capture failed: {exc}")
@@ -433,7 +476,7 @@ class TraceRecorder:
         self._finalized = True
 
         if self._on_error_only and not failed:
-            shutil.rmtree(self._output_dir, ignore_errors=True)
+            self._cleanup_on_success()
             self._finalized_path = None
             return None
 
@@ -465,7 +508,7 @@ class TraceRecorder:
         self._finalized = True
 
         if self._on_error_only and not failed:
-            shutil.rmtree(self._output_dir, ignore_errors=True)
+            self._cleanup_on_success()
             self._finalized_path = None
             return None
 
