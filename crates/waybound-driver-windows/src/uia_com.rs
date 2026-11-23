@@ -937,7 +937,7 @@ impl SnapError {
                 reason: format!("Windows UIAutomation (native COM): {reason}"),
             },
             Self::Timeout(operation) => WayboundError::Timeout {
-                operation: format!("Windows UIAutomation (native COM): {operation}"),
+                context: format!("Windows UIAutomation (native COM): {operation}"),
                 timeout_ms: UIA_QUERY_TIMEOUT_MS,
             },
         }
