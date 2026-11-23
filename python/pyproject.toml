@@ -25,6 +25,11 @@ classifiers = [
   "Typing :: Typed",
 ]
 
+[project.optional-dependencies]
+crawlee = [
+  "crawlee>=1.0.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/Sekinal/waybound"
 Repository = "https://github.com/Sekinal/waybound"
@@ -37,6 +42,7 @@ waybound-mcp = "waybound.mcp_server:main"
 
 [dependency-groups]
 dev = [
+  "crawlee>=1.0.0",
   "mypy>=1.15.0",
   "pre-commit>=4.2.0",
   "pytest>=8.3.0",

@@ -17,6 +17,11 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
+    "./crawlee": {
+      "types": "./dist/crawlee.d.ts",
+      "import": "./dist/crawlee.js",
+      "default": "./dist/crawlee.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -38,8 +43,17 @@
     "pretest": "tsc -p tsconfig.build.json && tsc -p tsconfig.json",
     "test": "node --test --test-timeout=60000 \"build-test/test/**/*.test.js\""
   },
+  "peerDependencies": {
+    "@crawlee/basic": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@crawlee/basic": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@biomejs/biome": "2.6.8",
+    "@crawlee/basic": "^3.18.2",
     "@types/node": "24.19.2",
     "typescript": "5.9.3"
   }
