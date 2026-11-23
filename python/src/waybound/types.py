@@ -360,6 +360,16 @@ class SessionFingerprint:
 
 
 @dataclass(frozen=True, slots=True)
+class NetworkStats:
+    """Per-session bandwidth and connection counters tracked by the daemon proxy."""
+
+    bytes_sent: int
+    bytes_received: int
+    connections_total: int
+    connections_blocked: int
+
+
+@dataclass(frozen=True, slots=True)
 class TreeSnapshot:
     """Accessibility tree snapshot along with truncation metadata."""
 
@@ -482,6 +492,10 @@ class Transport(Protocol):
 
     def export_fingerprint(self) -> SessionFingerprint:
         """Export the live TLS, HTTP/2, header, and cookie fingerprint captured from the session."""
+        ...
+
+    def network_stats(self) -> NetworkStats:
+        """Return per-session bandwidth and connection counters from the daemon proxy."""
         ...
 
     def screenshot(self, path: str) -> None:

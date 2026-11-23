@@ -15,6 +15,7 @@ from waybound.types import (
     CapturedWebSocketFrame,
     KeyModifier,
     LocatorQuery,
+    NetworkStats,
     Role,
     SessionFingerprint,
     SupportsTreeSnapshot,
@@ -328,6 +329,10 @@ class Page:
     def export_fingerprint(self) -> SessionFingerprint:
         """Export the live TLS, HTTP/2, header, and cookie fingerprint captured from the session."""
         return self._transport.export_fingerprint()
+
+    def network_stats(self) -> NetworkStats:
+        """Return per-session bandwidth and connection counters from the daemon proxy."""
+        return self._transport.network_stats()
 
     def handoff_http_client(  # noqa: PLR0913
         self,

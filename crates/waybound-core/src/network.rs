@@ -136,6 +136,19 @@ const fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Per-session bandwidth and connection counters tracked by the local proxy forwarder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkStats {
+    /// Total bytes forwarded from the browser/client to upstream servers.
+    pub bytes_sent: u64,
+    /// Total bytes forwarded from upstream servers to the browser/client.
+    pub bytes_received: u64,
+    /// Total proxy connections/requests handled (including blocked ones).
+    pub connections_total: u64,
+    /// Proxy connections/requests rejected by the L4 host blocker.
+    pub connections_blocked: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

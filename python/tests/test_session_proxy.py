@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import pytest
 
 from waybound.session import LaunchOptions, Session, _daemon_env
-
-if TYPE_CHECKING:
-    import pytest
 
 UPSTREAM_URL = "http://user:s3cret@proxy.example.com:8080"
 
@@ -37,3 +34,23 @@ def test_inherited_proxy_env_passes_through_when_no_proxy_option(
     assert _daemon_env(override)["WAYBOUND_PROXY"] == override
     monkeypatch.delenv("WAYBOUND_PROXY")
     assert "WAYBOUND_PROXY" not in _daemon_env(None)
+
+
+def test_block_presets_emit_repeatable_cli_flags_and_reject_unknown() -> None:
+    opts = LaunchOptions(
+        backend="mock",
+        block_hosts=("tracker.example",),
+        block_presets=("analytics", " ADS "),
+        daemon_binary="/nonexistent/waybound-daemon",
+    )
+    session = Session(opts)
+    cmd = session._build_daemon_cmd(socket_path=None, tcp_addr=("127.0.0.1", 1))
+    assert "--block-hosts" in cmd
+    idx_hosts = cmd.index("--block-hosts")
+    assert cmd[idx_hosts + 1] == "tracker.example"
+
+    preset_pairs = [cmd[i + 1] for i, flag in enumerate(cmd) if flag == "--block-preset"]
+    assert preset_pairs == ["analytics", "ads"]
+
+    with pytest.raises(ValueError, match="unknown block preset"):
+        LaunchOptions(block_presets=("analytics", "bogus"))

@@ -6,6 +6,7 @@ import { after, afterEach, before, describe, it } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Page } from "../src/client.js";
 import { WayboundDaemonError } from "../src/errors.js";
+import { buildDaemonArgs } from "../src/session.js";
 import {
   DEFAULT_TIMEOUT_MS,
   type Endpoint,
@@ -614,5 +615,55 @@ describe("wire encoding helpers", () => {
     assert.throws(() => page.getByRole(Role.BUTTON).nth(-1), RangeError);
     assert.throws(() => page.getByRole(Role.BUTTON).nth(1.5), RangeError);
     assert.equal(page.getByRole(Role.BUTTON).nth(3).first.query.nth, 0);
+  });
+
+  it("queries network_stats and maps wire fields to camelCase NetworkStats", async () => {
+    const d = await fakeDaemon((req, sock) => {
+      assert.equal(req.method, "network_stats");
+      reply(sock, {
+        status: "network_stats",
+        stats: {
+          bytes_sent: 1024,
+          bytes_received: 4096,
+          connections_total: 7,
+          connections_blocked: 2,
+        },
+      });
+    });
+    const t = await Transport.connect(d.endpoint);
+    try {
+      const page = new Page(t);
+      assert.deepEqual(await page.networkStats(), {
+        bytesSent: 1024,
+        bytesReceived: 4096,
+        connectionsTotal: 7,
+        connectionsBlocked: 2,
+      });
+    } finally {
+      t.close();
+      await d.close();
+    }
+  });
+
+  it("emits repeatable --block-preset flags and rejects unknown presets", () => {
+    const args = buildDaemonArgs(
+      { backend: "mock", blockHosts: ["tracker.test"], blockPresets: ["analytics", " ADS "] },
+      { host: "127.0.0.1", port: 9999 },
+    );
+    const presets: string[] = [];
+    for (let i = 0; i < args.length; i += 1) {
+      if (args[i] === "--block-preset") {
+        presets.push(args[i + 1] ?? "");
+      }
+    }
+    assert.deepEqual(presets, ["analytics", "ads"]);
+    assert.throws(
+      () =>
+        buildDaemonArgs(
+          { backend: "mock", blockPresets: ["analytics", "bogus"] },
+          { host: "127.0.0.1", port: 9999 },
+        ),
+      RangeError,
+    );
   });
 });

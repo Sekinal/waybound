@@ -19,11 +19,24 @@ from waybound.client import Page
 from waybound.transport import UnixSocketTransport, WayboundDaemonError
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
     from types import TracebackType
 
 BackendName = Literal["mock", "macos", "linux", "windows", "android"]
+BLOCK_PRESETS: frozenset[str] = frozenset({"analytics", "ads", "media"})
 _MIN_WORKSPACE_PARENTS = 4
+
+
+def _validate_block_presets(presets: Sequence[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for raw in presets:
+        name = raw.strip().lower()
+        if name not in BLOCK_PRESETS:
+            allowed = ", ".join(sorted(BLOCK_PRESETS))
+            msg = f"unknown block preset {raw!r} (expected one of: {allowed})"
+            raise ValueError(msg)
+        normalized.append(name)
+    return tuple(normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +57,7 @@ class LaunchOptions:
     ssl_keylog: Path | str | None = None
     proxy: str | None = None
     block_hosts: tuple[str, ...] = ()
+    block_presets: Sequence[str] = ()
     timezone: str | None = None
     locale: str | None = None
     focus: bool = False
@@ -51,6 +65,10 @@ class LaunchOptions:
     use_tcp: bool = False
     daemon_binary: Path | str | None = None
     startup_timeout_s: float = 5.0
+
+    def __post_init__(self) -> None:
+        if self.block_presets:
+            _validate_block_presets(self.block_presets)
 
 
 def _daemon_bin_name() -> str:
@@ -195,6 +213,8 @@ class Session:
                 cmd.extend([flag, val])
         if opts.block_hosts:
             cmd.extend(["--block-hosts", ",".join(opts.block_hosts)])
+        for preset in _validate_block_presets(opts.block_presets):
+            cmd.extend(["--block-preset", preset])
         if opts.headless_xvfb:
             cmd.append("--headless-xvfb")
         if opts.launch_chrome:

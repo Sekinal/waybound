@@ -17,6 +17,7 @@ import {
   type KeyModifier,
   type LocatorQuery,
   type NamedKey,
+  type NetworkStats,
   Role,
   type TreeSnapshot,
 } from "./types.js";
@@ -346,6 +347,11 @@ export class Page {
   /** Wait until no HTTP/1.1–2 request is in flight for `idleMs`. */
   waitForNetworkIdle(options: NetworkIdleOptions = {}): Promise<void> {
     return this.#transport.waitForNetworkIdle(options.idleMs ?? 500, options.timeoutMs ?? 15_000);
+  }
+
+  /** Return per-session bandwidth and connection counters from the daemon proxy. */
+  networkStats(): Promise<NetworkStats> {
+    return this.#transport.networkStats();
   }
 
   /**

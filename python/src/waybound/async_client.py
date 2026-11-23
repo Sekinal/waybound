@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         CapturedResponse,
         CapturedWebSocketFrame,
         KeyModifier,
+        NetworkStats,
         Role,
         SessionFingerprint,
         TreeSnapshot,
@@ -237,6 +238,10 @@ class AsyncPage:
     async def export_fingerprint(self) -> SessionFingerprint:
         """Export the live TLS, HTTP/2, header, and cookie fingerprint captured from the session."""
         return await asyncio.to_thread(self._inner.export_fingerprint)
+
+    async def network_stats(self) -> NetworkStats:
+        """Return per-session bandwidth and connection counters from the daemon proxy."""
+        return await asyncio.to_thread(self._inner.network_stats)
 
     async def handoff_http_client(  # noqa: PLR0913
         self,

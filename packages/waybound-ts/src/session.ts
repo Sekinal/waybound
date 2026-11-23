@@ -11,6 +11,9 @@ import { resolveDaemonBinary } from "./binary.js";
 import { Page } from "./client.js";
 import { WayboundDaemonError, WayboundLaunchError } from "./errors.js";
 import { checkMs, DEFAULT_TIMEOUT_MS, type Endpoint, Transport } from "./transport.js";
+import { BLOCK_PRESETS } from "./types.js";
+
+const BLOCK_PRESET_SET: ReadonlySet<string> = new Set(BLOCK_PRESETS);
 
 export type BackendName = "mock" | "macos" | "linux" | "windows" | "android";
 
@@ -37,6 +40,8 @@ export interface LaunchOptions {
   /** Upstream proxy; passed via `WAYBOUND_PROXY` so credentials stay out of `ps` output. */
   readonly proxy?: string;
   readonly blockHosts?: readonly string[];
+  /** Opt-in curated L4 host blocklist presets (`"analytics"`, `"ads"`, `"media"`). */
+  readonly blockPresets?: readonly string[];
   readonly timezone?: string;
   readonly locale?: string;
   readonly focus?: boolean;
@@ -79,6 +84,17 @@ export function buildDaemonArgs(options: LaunchOptions, endpoint: Endpoint): str
   }
   if (options.blockHosts !== undefined && options.blockHosts.length > 0) {
     args.push("--block-hosts", options.blockHosts.join(","));
+  }
+  if (options.blockPresets !== undefined) {
+    for (const raw of options.blockPresets) {
+      const normalized = raw.trim().toLowerCase();
+      if (!BLOCK_PRESET_SET.has(normalized)) {
+        throw new RangeError(
+          `unknown block preset ${JSON.stringify(raw)} (expected one of: ${BLOCK_PRESETS.join(", ")})`,
+        );
+      }
+      args.push("--block-preset", normalized);
+    }
   }
   const flags: [string, boolean | undefined][] = [
     ["--headless-xvfb", options.headlessXvfb],
