@@ -25,10 +25,13 @@ pub type CgEventRef = *const c_void;
 pub const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 /// Accessibility success code (`kAXErrorSuccess`).
 pub const K_AX_ERROR_SUCCESS: i32 = 0;
-/// `kAXValueTypeCGPoint`.
-pub const K_AX_VALUE_TYPE_CG_POINT: i32 = 1;
+/// `kAXValueTypeCGPoint` (`AXValueType` is `UInt32` in `AXValue.h`).
+pub const K_AX_VALUE_TYPE_CG_POINT: u32 = 1;
 /// `kAXValueTypeCGSize`.
-pub const K_AX_VALUE_TYPE_CG_SIZE: i32 = 2;
+pub const K_AX_VALUE_TYPE_CG_SIZE: u32 = 2;
+/// `kAXValueTypeAXError`: an `AXValue` wrapping an `AXError` (`SInt32`), used by
+/// `AXUIElementCopyMultipleAttributeValues` for attributes it could not read.
+pub const K_AX_VALUE_TYPE_AX_ERROR: u32 = 5;
 
 /// `kCGHIDEventTap`.
 pub const K_CG_HID_EVENT_TAP: u32 = 0;
@@ -67,6 +70,13 @@ pub struct CgSize {
     pub width: f64,
     /// Height.
     pub height: f64,
+}
+
+/// Opaque `CFArrayCallBacks` structure (`CFArray.h`); only the address of the
+/// `kCFTypeArrayCallBacks` constant is ever used.
+#[repr(C)]
+pub struct CfArrayCallBacks {
+    _private: [u8; 0],
 }
 
 /// CoreGraphics mouse event types.
@@ -109,6 +119,11 @@ pub enum CgMouseButton {
 
 unsafe extern "C" {
     pub static kCFBooleanTrue: CfBooleanRef;
+    pub static kCFBooleanFalse: CfBooleanRef;
+    /// Retain / release / equality callbacks for arrays of CF objects (`CFArray.h`).
+    pub static kCFTypeArrayCallBacks: CfArrayCallBacks;
+    #[cfg(test)]
+    pub static kCFNull: CfTypeRef;
 
     pub fn CFRelease(cf: CfTypeRef);
     pub fn CFRetain(cf: CfTypeRef) -> CfTypeRef;
@@ -140,11 +155,35 @@ unsafe extern "C" {
     ) -> u8;
     pub fn CFArrayGetCount(the_array: CfArrayRef) -> isize;
     pub fn CFArrayGetValueAtIndex(the_array: CfArrayRef, idx: isize) -> CfTypeRef;
+    /// `CFArrayRef CFArrayCreate(CFAllocatorRef, const void **values, CFIndex numValues,
+    /// const CFArrayCallBacks *callBacks)`; Create rule (`+1`).
+    pub fn CFArrayCreate(
+        allocator: CfTypeRef,
+        values: *mut CfTypeRef,
+        num_values: isize,
+        call_backs: *const CfArrayCallBacks,
+    ) -> CfArrayRef;
+    pub fn CFNullGetTypeID() -> usize;
+    #[cfg(test)]
+    pub fn CFGetRetainCount(cf: CfTypeRef) -> isize;
 
     pub fn AXIsProcessTrusted() -> u8;
     pub fn AXUIElementGetTypeID() -> usize;
     pub fn AXValueGetTypeID() -> usize;
     pub fn AXUIElementCreateApplication(pid: i32) -> AxUiElementRef;
+    /// `AXUIElementRef AXUIElementCreateSystemWide(void)`; Create rule (`+1`).
+    pub fn AXUIElementCreateSystemWide() -> AxUiElementRef;
+    /// `AXError AXUIElementSetMessagingTimeout(AXUIElementRef, float timeoutInSeconds)`.
+    pub fn AXUIElementSetMessagingTimeout(element: AxUiElementRef, timeout_in_seconds: f32) -> i32;
+    /// `AXError AXUIElementCopyMultipleAttributeValues(AXUIElementRef, CFArrayRef attributes,
+    /// AXCopyMultipleAttributeOptions options, CFArrayRef *values)`; `values` follows the
+    /// Copy rule (`CF_RETURNS_RETAINED`).
+    pub fn AXUIElementCopyMultipleAttributeValues(
+        element: AxUiElementRef,
+        attributes: CfArrayRef,
+        options: u32,
+        values: *mut CfArrayRef,
+    ) -> i32;
     pub fn AXUIElementCopyAttributeValue(
         element: AxUiElementRef,
         attribute: CfStringRef,
@@ -156,7 +195,12 @@ unsafe extern "C" {
         attribute: CfStringRef,
         value: CfTypeRef,
     ) -> i32;
-    pub fn AXValueGetValue(value: AxValueRef, value_type: i32, value_ptr: *mut c_void) -> u8;
+    pub fn AXValueGetValue(value: AxValueRef, value_type: u32, value_ptr: *mut c_void) -> u8;
+    /// `AXValueType AXValueGetType(AXValueRef)`.
+    pub fn AXValueGetType(value: AxValueRef) -> u32;
+    /// `AXValueRef AXValueCreate(AXValueType, const void *valuePtr)`; Create rule (`+1`).
+    #[cfg(test)]
+    pub fn AXValueCreate(value_type: u32, value_ptr: *const c_void) -> AxValueRef;
 
     pub fn CGEventCreateMouseEvent(
         source: CfTypeRef,
@@ -232,6 +276,15 @@ impl OwnedCf {
     }
 }
 
+impl Clone for OwnedCf {
+    fn clone(&self) -> Self {
+        // SAFETY: `self` owns a retain on a live CF object; `CFRetain` adds one more for the
+        // clone (it returns its argument, so the pointer is unchanged and non-null).
+        let _same = unsafe { CFRetain(self.as_ptr()) };
+        Self { ptr: self.ptr }
+    }
+}
+
 impl Drop for OwnedCf {
     fn drop(&mut self) {
         // SAFETY: `OwnedCf` exclusively owns one retain count on `self.ptr`.
@@ -247,6 +300,48 @@ pub fn cf_string(text: &str) -> Option<OwnedCf> {
     unsafe {
         let raw = CFStringCreateWithCString(ptr::null(), c_str.as_ptr(), K_CF_STRING_ENCODING_UTF8);
         OwnedCf::from_owned(raw)
+    }
+}
+
+/// Creates an immutable `CFArray` holding `values` (each retained by the array through
+/// `kCFTypeArrayCallBacks`, so the caller keeps its own references).
+#[must_use]
+pub fn cf_array(values: &[OwnedCf]) -> Option<OwnedCf> {
+    let mut raw: Vec<CfTypeRef> = values.iter().map(OwnedCf::as_ptr).collect();
+    let count = isize::try_from(raw.len()).ok()?;
+    // SAFETY: `raw` holds `count` live CF object pointers kept alive by `values` for the
+    // duration of the call; `kCFTypeArrayCallBacks` makes the array `CFRetain` each value and
+    // release it when the array is freed. `CFArrayCreate` follows the Create rule (`+1`) and
+    // returns null on allocation failure.
+    unsafe {
+        OwnedCf::from_owned(CFArrayCreate(
+            ptr::null(),
+            raw.as_mut_ptr(),
+            count,
+            &raw const kCFTypeArrayCallBacks,
+        ))
+    }
+}
+
+/// Returns the items of `array` as owned references, or `None` if it is not a `CFArray`.
+///
+/// Values inside a `CFArray` are borrowed from it (Get rule), so each one is retained into its
+/// own [`OwnedCf`] and stays valid after `array` is released. A null entry is `None`.
+#[must_use]
+pub fn cf_array_items(array: &OwnedCf) -> Option<Vec<Option<OwnedCf>>> {
+    // SAFETY: `array` is a live CF object; the type ID is checked before any `CFArray` call,
+    // indices stay below `CFArrayGetCount`, and each borrowed (`+0`) value is retained while
+    // `array` still keeps it alive.
+    unsafe {
+        if CFGetTypeID(array.as_ptr()) != CFArrayGetTypeID() {
+            return None;
+        }
+        let count = CFArrayGetCount(array.as_ptr());
+        Some(
+            (0..count)
+                .map(|idx| OwnedCf::retain(CFArrayGetValueAtIndex(array.as_ptr(), idx)))
+                .collect(),
+        )
     }
 }
 
@@ -330,4 +425,90 @@ pub fn cf_to_url_string(obj: &OwnedCf) -> Option<String> {
         OwnedCf::retain(CFURLGetString(raw))?
     };
     cf_to_string(&url_cf_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn retain_count(cf: &OwnedCf) -> isize {
+        // SAFETY: `cf` is a live CF object owned by the caller.
+        unsafe { CFGetRetainCount(cf.as_ptr()) }
+    }
+
+    // Long enough not to be stored as a tagged-pointer string, whose retain count is not real.
+    const NAMES: [&str; 3] = [
+        "waybound-ownership-test-AXRole-0001",
+        "waybound-ownership-test-AXTitle-0002",
+        "waybound-ownership-test-AXChildren-03",
+    ];
+
+    #[test]
+    fn cf_array_round_trips_strings_and_balances_retains() {
+        let strings: Vec<OwnedCf> = NAMES.iter().filter_map(|n| cf_string(n)).collect();
+        assert_eq!(strings.len(), NAMES.len());
+        let before: Vec<isize> = strings.iter().map(retain_count).collect();
+
+        let array = cf_array(&strings);
+        assert!(array.is_some());
+        let Some(array) = array else { return };
+        // The array holds its own retain on every value (kCFTypeArrayCallBacks).
+        let held: Vec<isize> = strings.iter().map(retain_count).collect();
+        let expected: Vec<isize> = before.iter().map(|c| c + 1).collect();
+        assert_eq!(held, expected);
+
+        let items = cf_array_items(&array);
+        let texts: Option<Vec<Option<String>>> = items.as_ref().map(|v| {
+            v.iter()
+                .map(|i| i.as_ref().and_then(cf_to_string))
+                .collect()
+        });
+        let wanted: Vec<Option<String>> = NAMES.iter().map(|n| Some((*n).to_owned())).collect();
+        assert_eq!(texts, Some(wanted));
+        // Items are retained copies of borrowed values: dropping them gives the retains back.
+        drop(items);
+        assert_eq!(
+            strings.iter().map(retain_count).collect::<Vec<_>>(),
+            expected
+        );
+
+        drop(array);
+        assert_eq!(strings.iter().map(retain_count).collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn cf_array_items_survive_the_array() {
+        let strings: Vec<OwnedCf> = NAMES.iter().filter_map(|n| cf_string(n)).collect();
+        let items = cf_array(&strings).and_then(|array| cf_array_items(&array));
+        drop(strings);
+        let first = items
+            .as_ref()
+            .and_then(|v| v.first())
+            .and_then(|i| i.as_ref().and_then(cf_to_string));
+        assert_eq!(first.as_deref(), NAMES.first().copied());
+    }
+
+    #[test]
+    fn cf_array_handles_empty_input_and_rejects_non_arrays() {
+        let empty = cf_array(&[]);
+        assert_eq!(
+            empty.as_ref().and_then(cf_array_items).map(|v| v.len()),
+            Some(0)
+        );
+        let not_array = cf_string("waybound-not-an-array-string-value");
+        assert!(not_array.as_ref().and_then(cf_array_items).is_none());
+    }
+
+    #[test]
+    fn clone_takes_its_own_retain() {
+        let s = cf_string("waybound-ownership-test-clone-0004");
+        assert!(s.is_some());
+        let Some(s) = s else { return };
+        let before = retain_count(&s);
+        let copy = s.clone();
+        assert_eq!(retain_count(&s), before + 1);
+        assert_eq!(cf_to_string(&copy), cf_to_string(&s));
+        drop(copy);
+        assert_eq!(retain_count(&s), before);
+    }
 }
