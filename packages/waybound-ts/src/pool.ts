@@ -464,7 +464,6 @@ class IsolatedDisplayStack {
           ),
         );
       }, timeoutMs);
-      timer.unref();
 
       proc.once("error", onError);
       proc.once("exit", onExit);
@@ -820,7 +819,6 @@ export class BrowserPool implements AsyncDisposable {
           reject(createTimeoutError(`timed out after ${timeoutMs}ms waiting for a browser slot`));
         }, timeoutMs),
       };
-      waiter.timer.unref();
       this.#waiters.push(waiter);
     });
   }
