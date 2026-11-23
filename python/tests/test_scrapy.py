@@ -23,6 +23,7 @@ from waybound import (
     BrowserPool,
     CapturedCookie,
     CapturedResponse,
+    HandoffHttpClient,
     HeaderEntry,
     Http2Fingerprint,
     HttpHeader,
@@ -536,3 +537,83 @@ async def test_from_crawler_validates_settings_and_accepts_all_waybound_options(
     bad_proxies_crawler = _make_crawler({"WAYBOUND_PROXIES": "http://single-str"})
     with pytest.raises(TypeError, match="WAYBOUND_PROXIES"):
         WayboundDownloadHandler.from_crawler(bad_proxies_crawler)
+
+
+def _cached_handoff_client(handler: WayboundDownloadHandler) -> HandoffHttpClient | None:
+    return handler._handoff_client
+
+
+async def test_fast_http_first_request_override_does_not_poison_cached_default_client(
+    local_http_server_url: str,
+) -> None:
+    """A per-request fingerprint override on request #1 stays ephemeral and never poisons cache."""
+    default_fp = _sample_fingerprint(user_agent="DefaultAgent/1.0")
+    override_fp = _sample_fingerprint(user_agent="OverrideAgent/9.0")
+    crawler = _make_crawler({"WAYBOUND_FINGERPRINT": default_fp})
+    handler = WayboundDownloadHandler.from_crawler(crawler)
+    try:
+        # First request uses an override fingerprint -> must be ephemeral, not cached.
+        override_req = Request(
+            f"{local_http_server_url}/first",
+            meta={"waybound_http": True, "waybound_fingerprint": override_fp},
+        )
+        override_resp = await handler.download_request(override_req)
+        assert isinstance(override_resp, TextResponse)
+        assert json.loads(override_resp.text)["user_agent"] == "OverrideAgent/9.0"
+        assert _cached_handoff_client(handler) is None
+
+        # Subsequent default requests populate and reuse the cached default client.
+        default_req_1 = Request(f"{local_http_server_url}/second", meta={"waybound_http": True})
+        default_resp_1 = await handler.download_request(default_req_1)
+        assert isinstance(default_resp_1, TextResponse)
+        assert json.loads(default_resp_1.text)["user_agent"] == "DefaultAgent/1.0"
+        cached_client = _cached_handoff_client(handler)
+        assert cached_client is not None
+        assert cached_client.fingerprint == default_fp
+
+        default_req_2 = Request(f"{local_http_server_url}/third", meta={"waybound_http": True})
+        default_resp_2 = await handler.download_request(default_req_2)
+        assert isinstance(default_resp_2, TextResponse)
+        assert json.loads(default_resp_2.text)["user_agent"] == "DefaultAgent/1.0"
+        assert _cached_handoff_client(handler) is cached_client
+    finally:
+        await handler.close()
+
+
+async def test_fast_http_evicts_dead_shared_client_and_recovers(
+    local_http_server_url: str,
+) -> None:
+    """A fatal `WayboundDaemonError` evicts the dead shared client so the next request recovers."""
+    default_fp = _sample_fingerprint(user_agent="RecoverAgent/1.0")
+    crawler = _make_crawler({"WAYBOUND_FINGERPRINT": default_fp})
+    handler = WayboundDownloadHandler.from_crawler(crawler)
+    try:
+        first_resp = await handler.download_request(
+            Request(f"{local_http_server_url}/warm", meta={"waybound_http": True})
+        )
+        assert first_resp.status == 200
+        dead_client = _cached_handoff_client(handler)
+        assert dead_client is not None
+
+        # Simulate the replay worker dying underneath the handler.
+        dead_client.close()
+
+        with pytest.raises(WayboundDaemonError) as exc_info:
+            await handler.download_request(
+                Request(f"{local_http_server_url}/after-crash", meta={"waybound_http": True})
+            )
+        assert exc_info.value.code == "closed"
+        assert _cached_handoff_client(handler) is None
+
+        # Next request spawns a fresh worker and succeeds.
+        recovered_resp = await handler.download_request(
+            Request(f"{local_http_server_url}/recovered", meta={"waybound_http": True})
+        )
+        assert isinstance(recovered_resp, TextResponse)
+        assert recovered_resp.status == 200
+        assert json.loads(recovered_resp.text)["user_agent"] == "RecoverAgent/1.0"
+        fresh_client = _cached_handoff_client(handler)
+        assert fresh_client is not None
+        assert fresh_client is not dead_client
+    finally:
+        await handler.close()

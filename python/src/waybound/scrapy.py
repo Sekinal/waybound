@@ -19,6 +19,7 @@ Requires the optional `scrapy` extra:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 from collections.abc import Awaitable, Callable, Sequence
@@ -58,6 +59,7 @@ type PageCallback = Callable[[AsyncPage, Request], Awaitable[None]]
 type _FallbackDownloadResult = Awaitable[Response] | Deferred[Response] | Response
 
 _TEXT_CONTENT_TYPE_TOKENS = ("text/", "json", "xml", "javascript")
+_FATAL_HANDOFF_ERROR_CODES = frozenset({"closed", "eof", "io_error", "protocol_error"})
 
 
 class _FallbackDownloadHandler(Protocol):
@@ -459,8 +461,11 @@ class WayboundDownloadHandler:
         proxy: str | None,
     ) -> tuple[HandoffHttpClient, bool]:
         """Return `(client, should_close_after_request)`."""
+        can_cache = proxy is None and (
+            self._default_fingerprint is None or fingerprint == self._default_fingerprint
+        )
         async with self._handoff_lock:
-            if self._handoff_client is None and proxy is None:
+            if self._handoff_client is None and can_cache:
                 self._handoff_client = await asyncio.to_thread(
                     HandoffHttpClient,
                     fingerprint,
@@ -484,6 +489,14 @@ class WayboundDownloadHandler:
             daemon_binary=self._daemon_binary,
         )
         return (ephemeral, True)
+
+    async def _evict_handoff_client(self, client: HandoffHttpClient) -> None:
+        async with self._handoff_lock:
+            if self._handoff_client is client:
+                self._handoff_client = None
+                self._handoff_client_proxy = None
+        with contextlib.suppress(OSError, WayboundDaemonError, RuntimeError):
+            await asyncio.to_thread(client.close)
 
     async def _download_fast_http(self, request: Request) -> Response:
         raw_meta_fp: object = request.meta.get("waybound_fingerprint")
@@ -512,6 +525,10 @@ class WayboundDownloadHandler:
                 headers=req_headers or None,
                 body=req_body,
             )
+        except WayboundDaemonError as exc:
+            if not ephemeral and exc.code in _FATAL_HANDOFF_ERROR_CODES:
+                await self._evict_handoff_client(client)
+            raise
         finally:
             if ephemeral:
                 await asyncio.to_thread(client.close)
