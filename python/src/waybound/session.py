@@ -246,6 +246,20 @@ def _wait_exited(proc: subprocess.Popen[bytes], timeout_s: float) -> bool:
     return True
 
 
+# Temp directories a daemon creates under the system temp dir, named after its pid: its
+# Wayland compositor runtime dir and its temporary Chrome profile. A daemon that is killed
+# cannot remove them.
+_DAEMON_TEMP_PREFIXES = ("waybound-wl-daemon-", "waybound-profile-")
+
+
+def _remove_daemon_temp_dirs(pid: int) -> None:
+    """Remove temp dirs left by daemon `pid`; call only after it exited (and before reaping)."""
+    base = Path(tempfile.gettempdir())
+    for prefix in _DAEMON_TEMP_PREFIXES:
+        for path in base.glob(f"{prefix}{pid}-*"):
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def _kill_process_group(pgid: int | None) -> None:
     """SIGKILL what is left of a daemon's process group (its browser, Xvfb, helpers)."""
     if pgid is None or sys.platform == "win32":
@@ -527,8 +541,10 @@ class Session:
                         with contextlib.suppress(OSError):
                             proc.kill()
                         _wait_exited(proc, _KILL_GRACE_S)
-                    # Backstop only: the daemon has exited but is not reaped yet.
+                    # Backstop only: the daemon has exited but is not reaped yet, so its pid
+                    # (the group id, and the suffix of its temp dir names) cannot be reused.
                     _kill_process_group(self._pgid)
+                    _remove_daemon_temp_dirs(proc.pid)
                     with contextlib.suppress(subprocess.TimeoutExpired):
                         proc.wait(timeout=_KILL_GRACE_S)
                     self._proc = None

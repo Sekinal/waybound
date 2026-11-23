@@ -373,6 +373,7 @@ class _IsolatedDisplayStack:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
+                process_group=0,  # new group led by dbus-daemon; AT-SPI joins it below
             )
             processes.append(dbus)
             dbus_address = cls._read_dbus_address(dbus)
@@ -388,6 +389,7 @@ class _IsolatedDisplayStack:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     env=child_env,
+                    process_group=dbus.pid,
                 )
                 processes.append(atspi)
                 time.sleep(_ATSPI_SETTLE_DELAY_S)
@@ -500,28 +502,38 @@ _PARALLEL_HINT = (
 )
 
 
-def _check_parallel_input(options: LaunchOptions, *, isolated_displays: bool) -> None:
+def _check_parallel_input(
+    options: LaunchOptions, *, isolated_displays: bool, display_backend: DisplayBackend
+) -> None:
     """Refuse local pools whose slots would share one pointer/keyboard (or one device)."""
     try:
-        _check_parallel_input_inner(options, isolated_displays=isolated_displays)
+        _check_parallel_input_inner(
+            options, isolated_displays=isolated_displays, display_backend=display_backend
+        )
     except ValueError as err:
         raise ValueError(f"{err}{_PARALLEL_HINT}") from None
 
 
-def _check_parallel_input_inner(options: LaunchOptions, *, isolated_displays: bool) -> None:
+def _check_parallel_input_inner(
+    options: LaunchOptions, *, isolated_displays: bool, display_backend: DisplayBackend
+) -> None:
     backend = options.backend
+    # Every Wayland slot's daemon runs its own in-process compositor, with its own seat (pointer
+    # and keyboard), so Wayland slots never share input even without `isolated_displays`.
+    own_input = isolated_displays or display_backend == "wayland" or options.headless_wayland
     if backend in ("macos", "windows"):
         msg = (
             f"size > 1 is not supported for backend={backend!r}: every slot would drive the "
             "one real desktop pointer, keyboard and window focus, so parallel slots would steal "
             "each other's clicks and keystrokes. Use size=1, remote_workers, or Linux with "
-            "isolated_displays=True."
+            "display_backend='wayland' or isolated_displays=True."
         )
         raise ValueError(msg)
-    if backend == "linux" and not isolated_displays:
+    if backend == "linux" and not own_input:
         msg = (
-            "size > 1 with backend='linux' requires isolated_displays=True: otherwise every slot "
-            "shares one X display (or the daemon's single headless_xvfb display :99) and its "
+            "size > 1 with backend='linux' requires display_backend='wayland' (one headless "
+            "compositor per slot) or isolated_displays=True (one Xvfb per slot): otherwise every "
+            "slot shares one X display (or the daemon's single headless_xvfb display :99) and its "
             "input."
         )
         raise ValueError(msg)
@@ -644,7 +656,7 @@ class _Permit:
 class BrowserPool:
     """Async pool of isolated local or remote `waybound` browser sessions."""
 
-    def __init__(  # noqa: PLR0913, PLR0915
+    def __init__(  # noqa: PLR0913
         self,
         *,
         size: int | None = None,
@@ -681,7 +693,11 @@ class BrowserPool:
             )
             raise ValueError(msg)
         if not parsed_remotes and resolved_size > 1:
-            _check_parallel_input(resolved_options, isolated_displays=isolated_displays)
+            _check_parallel_input(
+                resolved_options,
+                isolated_displays=isolated_displays,
+                display_backend=display_backend,
+            )
         if max_uses_per_slot is not None and max_uses_per_slot < 1:
             msg = f"max_uses_per_slot must be >= 1, got {max_uses_per_slot}"
             raise ValueError(msg)
@@ -994,7 +1010,7 @@ class BrowserPool:
             remote_worker=raw_worker,
         )
 
-    async def _launch_local_slot(self, *, proxy: str | None) -> _PoolSlot:
+    async def _launch_local_slot(self, *, proxy: str | None) -> _PoolSlot:  # noqa: PLR0915
         effective_proxy, is_override = self._next_proxy(proxy)
         self._slot_counter += 1
         use_wayland = self._display_backend == "wayland"

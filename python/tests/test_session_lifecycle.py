@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import replace
@@ -405,3 +406,26 @@ def test_daemon_stopped_by_a_signal_terminates_helpers_even_while_we_live() -> N
         session.close()  # tolerates helpers and daemon already gone
     finally:
         _stop_group(helper)
+
+
+@pytest.mark.usefixtures("daemon")
+def test_close_removes_temp_dirs_a_killed_daemon_left_behind() -> None:
+    session = Session(MOCK)
+    session.__enter__()
+    pid = session.daemon_pid
+    assert pid is not None
+    base = Path(tempfile.gettempdir())
+    # What a daemon creates and would remove on a graceful shutdown.
+    left = [base / f"waybound-wl-daemon-{pid}-0", base / f"waybound-profile-{pid}-1-2"]
+    unrelated = base / f"waybound-profile-{pid + 1}-1-2"
+    for path in [*left, unrelated]:
+        path.mkdir()
+    try:
+        os.kill(pid, signal.SIGKILL)
+        session.close()
+        assert not any(path.exists() for path in left)
+        assert unrelated.exists()
+    finally:
+        for path in [*left, unrelated]:
+            if path.exists():
+                path.rmdir()

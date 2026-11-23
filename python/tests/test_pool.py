@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -150,8 +152,9 @@ async def test_pool_wayland_backend_skips_xvfb_and_passes_headless_wayland(
             options: LaunchOptions,
             *,
             extra_env: dict[str, str] | None = None,
+            _reap_pgid: int | None = None,
         ) -> None:
-            _ = extra_env
+            _ = extra_env, _reap_pgid
             captured_opts.append(options)
             real = real_session_cls(options)
             captured_cmds.append(
@@ -163,6 +166,10 @@ async def test_pool_wayland_backend_skips_xvfb_and_passes_headless_wayland(
 
         def ping(self) -> str:
             return "0.5.0"
+
+        def is_healthy(self, *, timeout_s: float = 2.0) -> bool:
+            _ = timeout_s
+            return True
 
         def close(self) -> None:
             pass
@@ -763,3 +770,38 @@ def test_stacks_hook_closes_sessions_before_stacks(monkeypatch: pytest.MonkeyPat
 def test_parallel_refusal_points_crawlee_users_at_the_fix() -> None:
     with pytest.raises(ValueError, match="pool_size=1"):
         BrowserPool(size=2, launch_options=LaunchOptions(backend="macos", launch_chrome=True))
+
+
+def test_wayland_slots_have_their_own_input_and_xvfb_needs_isolation() -> None:
+    linux = LaunchOptions(backend="linux", launch_chrome=True)
+    # One in-process compositor per daemon: no shared input even without isolated_displays.
+    BrowserPool(size=2, launch_options=linux, display_backend="wayland")
+    BrowserPool(size=2, launch_options=replace(linux, headless_wayland=True))
+    with pytest.raises(ValueError, match="display_backend='wayland'"):
+        BrowserPool(size=2, launch_options=linux, display_backend="xvfb")
+
+
+def test_wayland_helper_stack_runs_in_one_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launcher = tmp_path / "fake-at-spi-bus-launcher"
+    launcher.write_text("#!/bin/sh\nexec sleep 30\n")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/bin/sh")
+    monkeypatch.setattr(
+        pool_mod,
+        "build_dbus_command",
+        lambda: ["/bin/sh", "-c", "echo unix:path=/tmp/fake-bus; exec sleep 30"],
+    )
+    monkeypatch.setattr(pool_mod, "find_atspi_launcher", lambda: launcher)
+    monkeypatch.setattr(pool_mod, "_ATSPI_SETTLE_DELAY_S", 0.0)
+    stack = pool_mod._IsolatedDisplayStack.start_wayland_dbus()
+    assert stack is not None
+    try:
+        pids = [proc.pid for proc in stack._processes]
+        assert len(pids) == 2
+        assert stack.pgid == pids[0]
+        assert {os.getpgid(pid) for pid in pids} == {pids[0]}  # the daemon's WAYBOUND_REAP_PGID
+        assert stack.pgid != os.getpgrp()
+    finally:
+        stack.close()
