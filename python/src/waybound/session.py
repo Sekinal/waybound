@@ -19,6 +19,7 @@ from waybound.client import Page
 from waybound.transport import UnixSocketTransport, WayboundDaemonError
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from types import TracebackType
 
 BackendName = Literal["mock", "macos", "linux", "windows", "android"]
@@ -126,7 +127,10 @@ def _connect_with_retry(
     raise TimeoutError(msg)
 
 
-def _daemon_env(proxy: str | None) -> dict[str, str]:
+def _daemon_env(
+    proxy: str | None,
+    extra_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """Builds the daemon's environment.
 
     The proxy URL may embed credentials, so it travels in the environment (readable only by
@@ -134,6 +138,8 @@ def _daemon_env(proxy: str | None) -> dict[str, str]:
     the environment of every process it spawns in turn.
     """
     env = os.environ.copy()
+    if extra_env is not None:
+        env.update(extra_env)
     if proxy is not None:
         env["WAYBOUND_PROXY"] = proxy
     return env
@@ -142,9 +148,15 @@ def _daemon_env(proxy: str | None) -> dict[str, str]:
 class Session:
     """Context manager that starts `waybound-daemon`, connects, and cleans up on exit."""
 
-    def __init__(self, options: LaunchOptions | None = None) -> None:
+    def __init__(
+        self,
+        options: LaunchOptions | None = None,
+        *,
+        extra_env: Mapping[str, str] | None = None,
+    ) -> None:
         opts = options if options is not None else LaunchOptions()
         self._options = opts
+        self._extra_env: dict[str, str] | None = dict(extra_env) if extra_env is not None else None
         self._daemon_binary = _resolve_daemon_binary(opts.daemon_binary)
         self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._proc: subprocess.Popen[bytes] | None = None
@@ -217,7 +229,7 @@ class Session:
         stderr_log = Path(tmp_dir.name) / "daemon.stderr.log"
         cmd = self._build_daemon_cmd(socket_path=socket_path, tcp_addr=tcp_addr)
 
-        child_env = _daemon_env(opts.proxy)
+        child_env = _daemon_env(opts.proxy, self._extra_env)
 
         try:
             with stderr_log.open("wb") as stderr_file:
@@ -248,6 +260,13 @@ class Session:
         _exc_tb: TracebackType | None,
     ) -> None:
         self.close()
+
+    def ping(self) -> str:
+        """Send a health-check ping to the active daemon and return its version."""
+        if self._transport is None:
+            msg = "Session is not active"
+            raise RuntimeError(msg)
+        return self._transport.ping()
 
     def close(self) -> None:
         """Gracefully shut down the daemon (unwinding browser & socket guards) and clean up."""

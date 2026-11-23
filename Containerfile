@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     gir1.2-atspi-2.0 \
     gnupg \
+    openbox \
     python3 \
     python3-gi \
     python3-pip \

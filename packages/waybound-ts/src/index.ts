@@ -27,6 +27,20 @@ export {
   type TimeoutOptions,
 } from "./client.js";
 export { WayboundDaemonError, WayboundLaunchError } from "./errors.js";
+export {
+  type AcquireOptions,
+  BrowserPool,
+  type BrowserPoolOptions,
+  buildDbusArgs,
+  buildSlotEnv,
+  buildXvfbArgs,
+  findFreeDisplayNum,
+  type PooledPage,
+  type PoolStats,
+  parseRemoteWorker,
+  type ReleaseOptions,
+  type RemoteWorkerEndpoint,
+} from "./pool.js";
 export { type BackendName, type LaunchOptions, launch, Session } from "./session.js";
 export {
   DEFAULT_TIMEOUT_MS,

@@ -49,6 +49,8 @@ export interface LaunchOptions {
   readonly startupTimeoutMs?: number;
   /** Base per-request timeout. Default 30 000 ms; long actions scale on top of it. */
   readonly timeoutMs?: number;
+  /** Extra environment variables passed to the spawned `waybound-daemon` child process. */
+  readonly extraEnv?: Readonly<Record<string, string>>;
 }
 
 /** Build the daemon argv (without the executable) for `options` and `endpoint`. */
@@ -251,6 +253,11 @@ export class Session {
     return this.#closing !== null;
   }
 
+  /** Send a health-check `ping` to the daemon and return its version string. */
+  ping(timeoutMs?: number): Promise<string> {
+    return this.#transport.ping(timeoutMs);
+  }
+
   /**
    * Gracefully shut down the daemon (so it unwinds its browser and socket guards), then
    * escalate to SIGTERM and SIGKILL if it does not exit, and remove the temporary directory.
@@ -316,7 +323,7 @@ export async function launch(options: LaunchOptions = {}): Promise<Session> {
       ? { host: "127.0.0.1", port: await reserveLoopbackPort() }
       : { socketPath: path.join(tmpDir, "w.sock") };
     const stderrLog = path.join(tmpDir, "daemon.stderr.log");
-    const env = { ...process.env };
+    const env: NodeJS.ProcessEnv = { ...process.env, ...options.extraEnv };
     if (options.proxy !== undefined) {
       env.WAYBOUND_PROXY = options.proxy;
     }
