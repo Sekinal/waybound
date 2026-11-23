@@ -26,6 +26,10 @@ waybound-driver-windows.workspace = true
 waybound-http = { workspace = true, optional = true }
 waybound-net.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# Safe `kill(2)` wrapper for asking Chrome to shut down; already in the tree via zbus.
+rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
+
 [dev-dependencies]
 brotli.workspace = true
 flate2.workspace = true

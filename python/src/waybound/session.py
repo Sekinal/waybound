@@ -26,6 +26,9 @@ BackendName = Literal["mock", "macos", "linux", "windows", "android"]
 BLOCK_PRESETS: frozenset[str] = frozenset({"analytics", "ads", "media"})
 PasswordStore = Literal["basic", "gnome-libsecret", "kwallet", "kwallet5", "kwallet6", "detect"]
 _MIN_WORKSPACE_PARENTS = 4
+# The daemon gives Chrome up to 5 s to exit cleanly after SIGTERM (so cookies are flushed and
+# `SingletonLock` is removed); wait longer than that before escalating.
+_DAEMON_EXIT_TIMEOUT_S = 8.0
 
 
 def _validate_block_presets(presets: Sequence[str]) -> tuple[str, ...]:
@@ -319,11 +322,11 @@ class Session:
                     if proc.poll() is None:
                         if shutdown_sent:
                             with contextlib.suppress(subprocess.TimeoutExpired):
-                                proc.wait(timeout=2.0)
+                                proc.wait(timeout=_DAEMON_EXIT_TIMEOUT_S)
                         if proc.poll() is None:
                             proc.terminate()
                             try:
-                                proc.wait(timeout=2.0)
+                                proc.wait(timeout=_DAEMON_EXIT_TIMEOUT_S)
                             except subprocess.TimeoutExpired:
                                 proc.kill()
                                 with contextlib.suppress(subprocess.TimeoutExpired):

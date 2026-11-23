@@ -73,10 +73,70 @@ impl LaunchedChrome {
     }
 }
 
-impl Drop for LaunchedChrome {
-    fn drop(&mut self) {
+/// How long Chrome gets to exit after the graceful signal before it is killed (Unix only).
+#[cfg(unix)]
+const GRACEFUL_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Signal that asks Chrome for an orderly shutdown.
+///
+/// In Chromium's `chrome/browser/chrome_browser_main_posix.cc`, Linux maps `SIGINT` and
+/// `SIGHUP` to `Exit()` (`chrome::AttemptExit()`, the normal browser shutdown) but `SIGTERM`
+/// to `chrome::SessionEnding()`, which commits prefs and Local State and then calls
+/// `TerminateCurrentProcessImmediately` without flushing the cookie store or releasing
+/// `SingletonLock` (`application_lifetime_desktop.cc`, `browser_process_impl.cc`). Other
+/// POSIX platforms, macOS included, map every handled signal to `Exit()`. `SIGKILL`, the
+/// fallback, skips shutdown entirely and can lose cookies written in the last ~30 seconds.
+#[cfg(target_os = "linux")]
+const GRACEFUL_SIGNAL: rustix::process::Signal = rustix::process::Signal::INT;
+#[cfg(all(unix, not(target_os = "linux")))]
+const GRACEFUL_SIGNAL: rustix::process::Signal = rustix::process::Signal::TERM;
+
+/// Sends [`GRACEFUL_SIGNAL`] in-process (safe `rustix` wrapper, no helper binary). Returns
+/// whether the signal was delivered and logs a warning when it was not.
+#[cfg(unix)]
+fn request_graceful_exit(pid: i32) -> bool {
+    let Some(target) = (pid > 0)
+        .then(|| rustix::process::Pid::from_raw(pid))
+        .flatten()
+    else {
+        tracing::warn!(pid, "invalid Chrome pid; cannot request a graceful exit");
+        return false;
+    };
+    match rustix::process::kill_process(target, GRACEFUL_SIGNAL) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(pid, error = %err, "could not send Chrome its graceful-exit signal");
+            false
+        }
+    }
+}
+
+impl LaunchedChrome {
+    /// Stops Chrome: graceful signal and a bounded wait on Unix, then `SIGKILL`.
+    fn terminate(&mut self) {
+        #[cfg(unix)]
+        if request_graceful_exit(self.pid) {
+            let deadline = std::time::Instant::now() + GRACEFUL_EXIT_TIMEOUT;
+            while std::time::Instant::now() < deadline {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    Err(_) => break,
+                }
+            }
+            tracing::warn!(
+                pid = self.pid,
+                "Chrome did not exit after the graceful signal; killing it"
+            );
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl Drop for LaunchedChrome {
+    fn drop(&mut self) {
+        self.terminate();
         if let Some(dir) = self.temp_profile.take() {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -455,6 +515,65 @@ mod tests {
 
         opts.password_store = Some("plaintext; rm -rf".to_owned());
         assert!(launch_chrome(&opts).is_err());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn drop_sends_graceful_signal_and_waits_for_a_clean_exit() {
+        let scratch = create_temp_profile_dir().unwrap_or_default();
+        assert!(scratch.is_dir(), "could not create scratch dir");
+        let script = scratch.join("trap-chrome.sh");
+        let body = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n\
+                    trap 'sleep 0.3; echo int > \"$0.term\"; exit 0' INT\n\
+                    trap 'sleep 0.3; echo term > \"$0.term\"; exit 0' TERM\n\
+                    while :; do sleep 0.05; done\n";
+        assert!(std::fs::write(&script, body).is_ok());
+        assert!(std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).is_ok());
+
+        let launched = launch_chrome(&options(&script, Some(scratch.join("p"))));
+        assert!(launched.is_ok());
+        assert!(
+            recorded_args(&script).is_some(),
+            "fake browser did not start"
+        );
+        drop(launched);
+        let marker = PathBuf::from(format!("{}.term", script.display()));
+        assert_eq!(
+            std::fs::read_to_string(&marker).ok().as_deref(),
+            Some(if cfg!(target_os = "linux") {
+                "int\n"
+            } else {
+                "term\n"
+            }),
+            "the browser did not get the graceful signal, or was killed before its handler ran"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn drop_kills_a_browser_that_ignores_the_graceful_signal() {
+        let scratch = create_temp_profile_dir().unwrap_or_default();
+        assert!(scratch.is_dir(), "could not create scratch dir");
+        let script = scratch.join("stubborn-chrome.sh");
+        let body = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n\
+                    trap '' INT TERM\nwhile :; do sleep 0.05; done\n";
+        assert!(std::fs::write(&script, body).is_ok());
+        assert!(std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).is_ok());
+
+        let launched = launch_chrome(&options(&script, Some(scratch.join("p"))));
+        assert!(launched.is_ok());
+        assert!(
+            recorded_args(&script).is_some(),
+            "fake browser did not start"
+        );
+        let started = Instant::now();
+        drop(launched);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= GRACEFUL_EXIT_TIMEOUT,
+            "did not wait for a graceful exit"
+        );
+        assert!(elapsed < GRACEFUL_EXIT_TIMEOUT + Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
