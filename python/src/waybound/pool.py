@@ -529,6 +529,14 @@ def _check_parallel_input_inner(
             "display_backend='wayland' or isolated_displays=True."
         )
         raise ValueError(msg)
+    if backend == "linux" and not options.launch_chrome:
+        msg = (
+            "size > 1 with backend='linux' requires launch_chrome=True: every slot uses the same "
+            "launch options, so without it the slots would all attach to one browser (the same "
+            "pid) or, with no pid, to whichever Chrome answers first on the shared accessibility "
+            "bus."
+        )
+        raise ValueError(msg)
     if backend == "linux" and not own_input:
         msg = (
             "size > 1 with backend='linux' requires display_backend='wayland' (one headless "

@@ -429,3 +429,58 @@ def test_close_removes_temp_dirs_a_killed_daemon_left_behind() -> None:
         for path in [*left, unrelated]:
             if path.exists():
                 path.rmdir()
+
+
+RUST_UNIX_TEMP_DEFAULT = Path("/tmp")  # noqa: S108 - what Rust's temp_dir() falls back to
+
+
+def test_daemon_temp_base_follows_rust_temp_dir() -> None:
+    assert session_mod._daemon_temp_base({}) == RUST_UNIX_TEMP_DEFAULT
+    assert session_mod._daemon_temp_base({"TMPDIR": "/x/y"}) == Path("/x/y")
+    assert session_mod._daemon_temp_base({"TMPDIR": ""}) is None
+    # TEMP/TMP are not consulted by Rust on Unix.
+    assert session_mod._daemon_temp_base({"TEMP": "/elsewhere"}) == RUST_UNIX_TEMP_DEFAULT
+
+
+@pytest.mark.usefixtures("daemon")
+def test_temp_dirs_are_found_in_the_daemons_tmpdir_and_only_those_recorded(
+    tmp_path: Path,
+) -> None:
+    session = Session(MOCK, extra_env={"TMPDIR": str(tmp_path)})
+    session.__enter__()
+    pid = session.daemon_pid
+    assert pid is not None
+    ours = tmp_path / f"waybound-profile-{pid}-1-2"
+    ours.mkdir()
+    os.kill(pid, signal.SIGKILL)
+    session.close()
+    assert not ours.exists()
+    # A directory appearing after the session closed is never touched by it.
+    later = tmp_path / f"waybound-profile-{pid}-3-4"
+    later.mkdir()
+    session.close()
+    assert later.exists()
+
+
+@pytest.mark.usefixtures("daemon")
+def test_temp_dirs_are_kept_if_the_daemon_may_still_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    session = Session(MOCK, extra_env={"TMPDIR": str(tmp_path)})
+    session.__enter__()
+    pid = session.daemon_pid
+    assert pid is not None
+    ours = tmp_path / f"waybound-wl-daemon-{pid}-0"
+    ours.mkdir()
+    proc = session._proc
+    assert proc is not None
+    proc.kill()
+    proc.wait()
+    for name in ("_GRACEFUL_SHUTDOWN_S", "_TERMINATE_GRACE_S", "_KILL_GRACE_S"):
+        monkeypatch.setattr(session_mod, name, 0.05)
+    monkeypatch.setattr(session_mod, "_has_exited", lambda _proc: False)
+    # Re-snapshot needs an unreaped pid; simulate one recorded at start-up instead.
+    session._daemon_temp_dirs = {ours}
+    session.close()
+    assert ours.exists()
+    assert "did not exit after SIGKILL" in caplog.text

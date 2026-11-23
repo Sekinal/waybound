@@ -31,6 +31,8 @@ from waybound.transport import UnixSocketTransport
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from waybound.pool import DisplayBackend
+
 # ---------------------------------------------------------------------------
 # Pure unit tests (run on every OS)
 # ---------------------------------------------------------------------------
@@ -618,7 +620,11 @@ def test_pool_refuses_parallel_slots_that_share_input(options: LaunchOptions) ->
         BrowserPool(size=2, launch_options=options)
     BrowserPool(size=1, launch_options=options)
     BrowserPool(size=2, launch_options=options, remote_workers=["h1:1", "h2:1"])
-    BrowserPool(size=2, launch_options=LaunchOptions(backend="linux"), isolated_displays=True)
+    BrowserPool(
+        size=2,
+        launch_options=LaunchOptions(backend="linux", launch_chrome=True),
+        isolated_displays=True,
+    )
 
 
 def test_find_free_display_num_reuses_stale_locks(tmp_path: Path) -> None:
@@ -805,3 +811,19 @@ def test_wayland_helper_stack_runs_in_one_process_group(
         assert stack.pgid != os.getpgrp()
     finally:
         stack.close()
+
+
+@pytest.mark.parametrize("display_backend", ["wayland", "xvfb"])
+def test_linux_pool_without_launch_chrome_is_refused(display_backend: DisplayBackend) -> None:
+    for opts in (
+        LaunchOptions(backend="linux"),
+        LaunchOptions(backend="linux", pid=4242),
+    ):
+        with pytest.raises(ValueError, match="launch_chrome=True"):
+            BrowserPool(
+                size=2,
+                launch_options=opts,
+                display_backend=display_backend,
+                isolated_displays=True,
+            )
+    BrowserPool(size=1, launch_options=LaunchOptions(backend="linux"), display_backend="wayland")

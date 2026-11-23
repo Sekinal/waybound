@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import logging
 import os
 import shutil
 import signal
@@ -250,14 +251,37 @@ def _wait_exited(proc: subprocess.Popen[bytes], timeout_s: float) -> bool:
 # Wayland compositor runtime dir and its temporary Chrome profile. A daemon that is killed
 # cannot remove them.
 _DAEMON_TEMP_PREFIXES = ("waybound-wl-daemon-", "waybound-profile-")
+_LOG = logging.getLogger("waybound")
 
 
-def _remove_daemon_temp_dirs(pid: int) -> None:
-    """Remove temp dirs left by daemon `pid`; call only after it exited (and before reaping)."""
-    base = Path(tempfile.gettempdir())
+def _daemon_temp_base(env: Mapping[str, str]) -> Path | None:
+    """The directory the daemon's `std::env::temp_dir()` resolves to, given its environment.
+
+    On Unix Rust reads only `TMPDIR` (no `TEMP`/`TMP`, no writability fallback), defaulting to
+    `/tmp`; an empty value would be relative to the daemon's working directory, so it is not
+    guessed. Windows is skipped: the daemon's temp dirs there are not cleaned up by the SDK.
+    """
+    if sys.platform == "win32":
+        return None
+    value = env.get("TMPDIR")
+    if value is None:
+        return Path("/tmp")  # noqa: S108 - Rust's documented Unix default
+    return Path(value) if value else None
+
+
+def _snapshot_daemon_temp_dirs(base: Path | None, pid: int) -> set[Path]:
+    """List the temp dirs named after daemon `pid`.
+
+    Call only while that daemon has not been reaped (alive or a zombie), so `pid` cannot belong
+    to another process. Removal later touches only these exact paths, never a fresh glob, so a
+    reused pid can never cause another session's directories to be deleted.
+    """
+    if base is None:
+        return set()
+    found: set[Path] = set()
     for prefix in _DAEMON_TEMP_PREFIXES:
-        for path in base.glob(f"{prefix}{pid}-*"):
-            shutil.rmtree(path, ignore_errors=True)
+        found.update(base.glob(f"{prefix}{pid}-*"))
+    return found
 
 
 def _kill_process_group(pgid: int | None) -> None:
@@ -316,6 +340,9 @@ class Session:
         self._pgid: int | None = None
         self._transport: UnixSocketTransport | None = None
         self._owner_pid = os.getpid()
+        self._daemon_temp_base: Path | None = None
+        # Temp dirs named after our daemon's pid, recorded while it is unreaped (see close).
+        self._daemon_temp_dirs: set[Path] = set()
         # Single-flight `close`: a pool and a borrower (or two threads) closing at once must
         # not run two shutdown sequences against one daemon.
         self._close_lock = threading.Lock()
@@ -416,6 +443,7 @@ class Session:
                     start_new_session=detach,
                 )
             self._proc = proc
+            self._daemon_temp_base = _daemon_temp_base(child_env)
             if detach:
                 self._pgid = proc.pid
             transport = _connect_with_retry(
@@ -426,6 +454,9 @@ class Session:
                 timeout_s=opts.startup_timeout_s,
             )
             self._transport = transport
+            # The daemon creates its temp dirs before it accepts connections, and it is alive
+            # here, so every match is ours.
+            self._daemon_temp_dirs = _snapshot_daemon_temp_dirs(self._daemon_temp_base, proc.pid)
             return Page(transport)
         except BaseException:
             self.close()
@@ -494,6 +525,7 @@ class Session:
         self._proc = None
         self._pgid = None
         self._tmp_dir = None
+        self._daemon_temp_dirs = set()
 
     def close(self) -> None:
         """Gracefully shut down the daemon (unwinding browser & socket guards) and clean up.
@@ -516,8 +548,28 @@ class Session:
         with self._close_lock:
             self._close_locked()
 
+    def _remove_recorded_temp_dirs(self, proc: subprocess.Popen[bytes]) -> None:
+        """Remove the recorded temp dirs of a daemon that has exited; never of a live one."""
+        dirs, self._daemon_temp_dirs = self._daemon_temp_dirs, set()
+        if not dirs:
+            return
+        if not _has_exited(proc):
+            # Never delete a profile from under a process that may still run.
+            _LOG.warning(
+                "waybound-daemon %d did not exit after SIGKILL; leaving its temp dirs in place: %s",
+                proc.pid,
+                ", ".join(sorted(map(str, dirs))),
+            )
+            return
+        for path in dirs:
+            shutil.rmtree(path, ignore_errors=True)
+
     def _close_locked(self) -> None:
         proc = self._proc
+        if proc is not None and proc.returncode is None:
+            # Not reaped yet (on macOS `_has_exited` reaps via `poll()`), so the pid is still
+            # ours: complete the snapshot of its temp dirs before anything can reap it.
+            self._daemon_temp_dirs |= _snapshot_daemon_temp_dirs(self._daemon_temp_base, proc.pid)
         shutdown_sent = False
         try:
             if self._transport is not None:
@@ -544,7 +596,7 @@ class Session:
                     # Backstop only: the daemon has exited but is not reaped yet, so its pid
                     # (the group id, and the suffix of its temp dir names) cannot be reused.
                     _kill_process_group(self._pgid)
-                    _remove_daemon_temp_dirs(proc.pid)
+                    self._remove_recorded_temp_dirs(proc)
                     with contextlib.suppress(subprocess.TimeoutExpired):
                         proc.wait(timeout=_KILL_GRACE_S)
                     self._proc = None
