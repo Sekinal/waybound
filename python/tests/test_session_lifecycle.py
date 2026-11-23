@@ -386,3 +386,22 @@ def test_helper_group_is_stopped_when_python_alone_dies(sig: int) -> None:
         child.stdout.close()
         if helper_pgid and _group_alive(helper_pgid):
             os.killpg(helper_pgid, signal.SIGKILL)
+
+
+@pytest.mark.usefixtures("daemon")
+def test_daemon_stopped_by_a_signal_terminates_helpers_even_while_we_live() -> None:
+    helper = _helper_group()
+    try:
+        session = Session(MOCK, _reap_pgid=helper.pid)
+        session.__enter__()
+        daemon_pid = session.daemon_pid
+        assert daemon_pid is not None
+        os.kill(daemon_pid, signal.SIGTERM)  # a third party stops the slot's daemon
+        deadline = time.monotonic() + 5
+        while _group_alive(helper.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _group_alive(helper.pid), "helpers of a signalled daemon kept running"
+        assert not session.is_healthy()
+        session.close()  # tolerates helpers and daemon already gone
+    finally:
+        _stop_group(helper)

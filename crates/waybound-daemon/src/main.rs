@@ -270,8 +270,10 @@ impl BackendBundle {
         &self,
         inflight: InflightCounter,
         fingerprint: FingerprintRecorder,
+        sdk_shutdown: Arc<AtomicBool>,
     ) -> ServerOptions {
         ServerOptions {
+            sdk_shutdown,
             use_motion: self.use_motion,
             inflight,
             fingerprint,
@@ -605,11 +607,13 @@ fn main() -> ExitCode {
 
     // Started before any child process is spawned; `finish` runs after the graceful shutdown
     // (when `_lifetime` is dropped at the end of `main`, see `LifetimeGuard`).
-    let _lifetime = LifetimeGuard(Some(Lifetime::start(
+    let lifetime = Lifetime::start(
         &shutdown,
         cli.exit_with_parent,
         parse_pgid(env::var("WAYBOUND_REAP_PGID").ok().as_deref()),
-    )));
+    );
+    let sdk_shutdown = lifetime.sdk_shutdown_flag();
+    let _lifetime = LifetimeGuard(Some(lifetime));
 
     let responses = Arc::new(ResponseStore::default());
     let inflight = InflightCounter::default();
@@ -639,7 +643,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let options = bundle.server_options(inflight, fingerprint);
+    let options = bundle.server_options(inflight, fingerprint, sdk_shutdown);
 
     if let Some(addr) = tcp_addr {
         if let Err(err) = server::serve_tcp(&addr, &bundle.driver, responses, options, shutdown) {

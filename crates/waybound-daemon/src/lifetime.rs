@@ -5,8 +5,9 @@
 //!   stopped) once the watched process is gone, however it died (`SIGKILL` included).
 //! * `WAYBOUND_REAP_PGID=<pgid>`: a process group the SDK started for this daemon's helpers (a
 //!   pool slot's Xvfb, D-Bus and AT-SPI2). It is honoured only together with an SDK-set parent
-//!   pid, and it is stopped only as a fallback when that parent is gone at shutdown; while
-//!   the parent lives, the SDK stops its own helpers.
+//!   pid. It is left alone when the daemon stops because the SDK asked it to (the SDK then
+//!   stops its own helpers, quickly); for any other reason (a signal, the watchdog, a fatal
+//!   error) the slot is dead anyway, so the daemon stops the group itself.
 //!
 //! Signals and probes go through `rustix` (no `unsafe`, no external `kill` utility). Unix
 //! only; elsewhere both variables are ignored with a warning.
@@ -121,6 +122,7 @@ mod unix {
         watched: Option<Watched>,
         parent_gone: Arc<AtomicBool>,
         group: Option<Arc<HelperGroup>>,
+        sdk_shutdown: Arc<AtomicBool>,
     }
 
     impl Lifetime {
@@ -161,26 +163,42 @@ mod unix {
                 watched,
                 parent_gone,
                 group,
+                sdk_shutdown: Arc::new(AtomicBool::new(false)),
             }
         }
 
-        /// Called after the graceful shutdown: if the SDK process is gone (so nobody else
-        /// will stop the helpers), stop the helper group. While the SDK lives it stops its
-        /// own helpers, so this returns at once.
+        /// Flag the server sets when the SDK sends `shutdown`.
+        pub fn sdk_shutdown_flag(&self) -> Arc<AtomicBool> {
+            Arc::clone(&self.sdk_shutdown)
+        }
+
+        /// Called after the graceful shutdown.
+        ///
+        /// * The SDK asked for the shutdown: it stops its own helpers, so nothing happens.
+        /// * Any other cause (signal, watchdog, fatal error) and the SDK is gone: stop the
+        ///   group (`SIGTERM`, short grace, `SIGKILL`).
+        /// * Any other cause and the SDK is alive: only `SIGTERM` the group and return at
+        ///   once. The helpers are the SDK's children, so they stay zombies until it reaps
+        ///   them and waiting here would only stall; the SDK's own teardown of the slot reaps
+        ///   them and kills anything that ignored the signal.
         pub fn finish(self) {
             let Some(group) = self.group else {
                 return;
             };
-            let parent_gone =
-                self.parent_gone.load(Ordering::Acquire) || self.watched.is_some_and(Watched::gone);
-            if !parent_gone {
+            if self.sdk_shutdown.load(Ordering::Acquire) {
                 return;
             }
             group.observe();
             if group.seen_empty.load(Ordering::Acquire) {
                 return;
             }
-            reap(&group);
+            let parent_gone =
+                self.parent_gone.load(Ordering::Acquire) || self.watched.is_some_and(Watched::gone);
+            if parent_gone {
+                reap(&group);
+            } else {
+                let _ = kill_process_group(group.pgid, Signal::TERM);
+            }
         }
     }
 
@@ -296,7 +314,7 @@ mod unix {
         }
 
         #[test]
-        fn reap_only_when_the_parent_is_gone_and_stops_every_member() {
+        fn reap_follows_the_shutdown_cause_and_stops_every_member() {
             let Some(mut leader) = spawn_group() else {
                 return;
             };
@@ -308,7 +326,7 @@ mod unix {
             let pgid = validate_group(raw, pid_watch, me, parent);
             assert!(pgid.is_some());
 
-            // Parent (this test process) alive: finish() must not touch the group.
+            // SDK alive and it requested the shutdown: finish() must not touch the group.
             let alive = Lifetime {
                 watched: me,
                 parent_gone: Arc::new(AtomicBool::new(false)),
@@ -318,7 +336,9 @@ mod unix {
                         seen_empty: AtomicBool::new(false),
                     })
                 }),
+                sdk_shutdown: Arc::new(AtomicBool::new(false)),
             };
+            alive.sdk_shutdown.store(true, Ordering::Release);
             let started = Instant::now();
             alive.finish();
             assert!(started.elapsed() < Duration::from_millis(100));
@@ -334,12 +354,47 @@ mod unix {
                         seen_empty: AtomicBool::new(false),
                     })
                 }),
+                sdk_shutdown: Arc::new(AtomicBool::new(false)),
             };
             gone.finish();
             let _ = leader.wait();
             if let Some(pgid) = pgid {
                 assert!(matches!(test_kill_process_group(pgid), Err(Errno::SRCH)));
             }
+        }
+
+        #[test]
+        fn a_daemon_stopped_by_anything_else_terminates_helpers_without_waiting() {
+            let Some(mut leader) = spawn_group() else {
+                return;
+            };
+            let raw = i32::try_from(leader.id()).unwrap_or(0);
+            thread::sleep(Duration::from_millis(200));
+            let me = to_pid(std::process::id()).map(|pid| Watched { pid, direct: false });
+            let pid_watch = ParentWatch::Pid(std::process::id());
+            let parent = std::os::unix::process::parent_id();
+            let pgid = validate_group(raw, pid_watch, me, parent);
+            // SDK (this test process) alive, but the daemon was stopped by a signal.
+            let signalled = Lifetime {
+                watched: me,
+                parent_gone: Arc::new(AtomicBool::new(false)),
+                group: pgid.map(|pgid| {
+                    Arc::new(HelperGroup {
+                        pgid,
+                        seen_empty: AtomicBool::new(false),
+                    })
+                }),
+                sdk_shutdown: Arc::new(AtomicBool::new(false)),
+            };
+            let started = Instant::now();
+            signalled.finish();
+            assert!(
+                started.elapsed() < Duration::from_millis(100),
+                "must not wait"
+            );
+            // The helpers got SIGTERM; we (their parent) reap them, as the SDK would.
+            let status = leader.wait();
+            assert!(status.is_ok_and(|s| !s.success()));
         }
 
         #[test]
@@ -387,6 +442,12 @@ mod other {
                 );
             }
             Self
+        }
+
+        /// A flag nothing reads on this platform.
+        pub fn sdk_shutdown_flag(&self) -> Arc<AtomicBool> {
+            let _ = self;
+            Arc::new(AtomicBool::new(false))
         }
 
         /// Nothing to do on this platform.

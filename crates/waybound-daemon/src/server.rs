@@ -76,6 +76,9 @@ pub struct ServerOptions {
     pub proxy_stats: Option<Arc<ProxyStats>>,
     /// Liveness probe for the browser this daemon launched, reported by `ping`.
     pub browser: Option<BrowserProbe>,
+    /// Set when the shutdown was requested by the SDK's `shutdown` request (as opposed to a
+    /// signal, the parent watchdog or an error), see `lifetime::Lifetime::finish`.
+    pub sdk_shutdown: Arc<AtomicBool>,
 }
 
 struct SessionState {
@@ -274,6 +277,7 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             Err(err) => Response::from(&err),
         },
         Request::Shutdown => {
+            state.options.sdk_shutdown.store(true, Ordering::Release);
             state.shutdown.store(true, Ordering::Release);
             Response::Ok
         }
@@ -1577,6 +1581,7 @@ mod tests {
                 fingerprint: FingerprintRecorder::new(),
                 proxy_stats: None,
                 browser: None,
+                sdk_shutdown: Arc::new(AtomicBool::new(false)),
             },
             Arc::new(ResponseStore::default()),
             Arc::new(AtomicBool::new(false)),
@@ -1591,6 +1596,7 @@ mod tests {
                 fingerprint: FingerprintRecorder::new(),
                 proxy_stats: None,
                 browser: None,
+                sdk_shutdown: Arc::new(AtomicBool::new(false)),
             },
             Arc::new(ResponseStore::default()),
             shutdown,
@@ -2768,6 +2774,7 @@ mod tests {
                 fingerprint: FingerprintRecorder::new(),
                 proxy_stats: Some(forwarder.stats_handle()),
                 browser: None,
+                sdk_shutdown: Arc::new(AtomicBool::new(false)),
             },
             Arc::new(ResponseStore::default()),
             Arc::new(AtomicBool::new(false)),
