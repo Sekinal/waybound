@@ -19,6 +19,7 @@ import pytest
 
 from waybound.cli import main
 from waybound.profile import (
+    IMPORT_MARKER,
     MANIFEST_NAME,
     BundleVerificationError,
     IncompatibleBundleError,
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 
 COOKIE_SECRET = b"SUPER-SECRET-COOKIE-VALUE"
 BASIC: PasswordStoreKind = "basic"
+DPAPI: PasswordStoreKind = "dpapi"
 CHROME_BASIC: PasswordStore = "basic"
 
 EXPECTED_DEFAULT = {
@@ -197,9 +199,21 @@ def test_manifest_content(profile: Path, tmp_path: Path) -> None:
     assert doc["source"]["os"] == current_os()
 
 
-def test_password_store_override(profile: Path, tmp_path: Path) -> None:
-    result = export_profile(profile, tmp_path / "b.tar.gz", password_store=BASIC)
-    assert result.manifest.password_store == BASIC
+def test_password_store_override_cannot_contradict_detection(profile: Path, tmp_path: Path) -> None:
+    detected = infer_password_store(current_os(), ("v10",))
+    assert detected is not None
+    override: PasswordStoreKind = "keyring" if detected != "keyring" else "dpapi"
+    result = export_profile(profile, tmp_path / "b.tar.gz", password_store=override)
+    assert result.manifest.password_store == detected
+    assert any("contradicts" in w for w in result.warnings)
+
+
+def test_password_store_override_used_when_nothing_detected(profile: Path, tmp_path: Path) -> None:
+    for db in ("Cookies", "Network/Cookies"):
+        (profile / "Default" / db).unlink()
+    result = export_profile(profile, tmp_path / "b.tar.gz", password_store=DPAPI)
+    assert result.manifest.cookie_encryption_prefixes == ()
+    assert result.manifest.password_store == DPAPI
 
 
 def test_bundle_is_private_and_not_overwritten(profile: Path, tmp_path: Path) -> None:
@@ -222,16 +236,32 @@ def test_export_rejects_non_profile_dirs(profile: Path, tmp_path: Path) -> None:
 
 
 def test_export_refuses_live_lock(profile: Path, tmp_path: Path) -> None:
-    (profile / "SingletonLock").symlink_to("some-other-host-4242")
+    (profile / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
     assert profile_lock_state(profile) == "live"
     with pytest.raises(ProfileLockedError, match="running"):
         export_profile(profile, tmp_path / "b.tar.gz")
+    with pytest.raises(ProfileLockedError, match="running"):
+        export_profile(profile, tmp_path / "b.tar.gz", ignore_lock=True)
     assert not (tmp_path / "b.tar.gz").exists()
 
 
-def test_windows_lockfile_counts_as_live(profile: Path) -> None:
-    _write(profile / "lockfile", b"")
+def test_foreign_lock_needs_ignore_lock(profile: Path, tmp_path: Path) -> None:
+    (profile / "SingletonLock").symlink_to("some-other-host-4242")
+    assert profile_lock_state(profile) == "foreign"
+    with pytest.raises(ProfileLockedError, match="another host"):
+        export_profile(profile, tmp_path / "b.tar.gz")
+    result = export_profile(profile, tmp_path / "b.tar.gz", ignore_lock=True)
+    assert any("another host" in w for w in result.warnings)
+
+
+def test_unparseable_lock_is_live(profile: Path) -> None:
+    (profile / "SingletonLock").symlink_to("garbage")
     assert profile_lock_state(profile) == "live"
+
+
+def test_windows_lockfile_is_a_lock(profile: Path) -> None:
+    _write(profile / "lockfile", b"")
+    assert profile_lock_state(profile) == ("live" if os.name == "nt" else "foreign")
 
 
 @pytest.mark.skipif(os.name != "posix", reason="SingletonLock pid probing is POSIX only")
@@ -252,7 +282,7 @@ def _tree(root: Path) -> dict[str, bytes]:
     return {
         p.relative_to(root).as_posix(): p.read_bytes()
         for p in root.rglob("*")
-        if p.is_file() and not p.is_symlink()
+        if p.is_file() and not p.is_symlink() and p.name != IMPORT_MARKER
     }
 
 
@@ -267,6 +297,7 @@ def test_round_trip_bytes_and_permissions(profile: Path, tmp_path: Path) -> None
     bundle = _portable(profile, tmp_path)
     target = tmp_path / "restored"
     result = import_profile(bundle, target)
+    assert (target / IMPORT_MARKER).is_file()
     restored = _tree(target)
     assert set(restored) == EXPECTED_DEFAULT
     for rel, data in restored.items():
@@ -288,7 +319,11 @@ def test_import_refuses_non_empty_target_without_force(profile: Path, tmp_path: 
     with pytest.raises(ProfileError, match="not empty"):
         import_profile(bundle, target)
     assert (target / "old-file").read_bytes() == b"old"
+    with pytest.raises(ProfileError, match="only replaces a Chrome user-data-dir"):
+        import_profile(bundle, target, force=True)
+    assert (target / "old-file").read_bytes() == b"old"
 
+    _write(target / "Local State", b"{}")
     import_profile(bundle, target, force=True)
     assert not (target / "old-file").exists()
     assert set(_tree(target)) == EXPECTED_DEFAULT
@@ -316,8 +351,8 @@ def test_import_refuses_symlink_target(profile: Path, tmp_path: Path) -> None:
 def test_import_refuses_live_target_even_with_force(profile: Path, tmp_path: Path) -> None:
     bundle = _portable(profile, tmp_path)
     target = tmp_path / "live"
-    target.mkdir()
-    (target / "SingletonLock").symlink_to("elsewhere-1")
+    _write(target / "Local State", b"{}")
+    (target / "SingletonLock").symlink_to(f"{socket.gethostname()}-{os.getpid()}")
     with pytest.raises(ProfileLockedError):
         import_profile(bundle, target, force=True)
     assert os.path.lexists(target / "SingletonLock")
@@ -371,6 +406,8 @@ def _assert_rejected(bundle: Path, target: Path, match: str) -> None:
     with pytest.raises(BundleVerificationError, match=match):
         import_profile(bundle, target)
     assert not target.exists(), "a rejected import must not leave the target behind"
+    leftovers = [p.name for p in target.parent.iterdir() if ".waybound-" in p.name]
+    assert not leftovers, f"staging left behind: {leftovers}"
 
 
 GOOD = ("Default/Preferences", b"{}")
@@ -459,7 +496,7 @@ def test_manifest_must_come_first(tmp_path: Path) -> None:
 def test_case_colliding_paths_refused(tmp_path: Path) -> None:
     doc = _manifest_doc([GOOD, ("Default/Local Storage/a", b""), ("Default/Local Storage/A", b"")])
     bundle = _hostile(tmp_path / "b.tar.gz", doc, [])
-    _assert_rejected(bundle, tmp_path / "t", "duplicate")
+    _assert_rejected(bundle, tmp_path / "t", "collides")
 
 
 def test_credentials_must_be_declared(tmp_path: Path) -> None:
@@ -481,10 +518,12 @@ def test_failed_import_with_force_keeps_existing_contents(tmp_path: Path) -> Non
     )
     target = tmp_path / "t"
     _write(target / "keep", b"keep")
+    _write(target / "Local State", b"{}")
     with pytest.raises(BundleVerificationError):
         import_profile(bundle, target, force=True)
     assert (target / "keep").read_bytes() == b"keep"
-    assert [p.name for p in target.iterdir()] == ["keep"]
+    assert sorted(p.name for p in target.iterdir()) == ["Local State", "keep"]
+    assert not [p for p in tmp_path.iterdir() if ".waybound-" in p.name]
 
 
 # ---------------------------------------------------------------------------- compatibility
@@ -535,7 +574,12 @@ def test_infer_password_store(
 
 
 def test_incompatible_bundle_refused_unless_allowed(tmp_path: Path) -> None:
-    doc = _manifest_doc([GOOD], source={"os": _other_os(), "arch": "x"}, password_store=None)
+    doc = _manifest_doc(
+        [GOOD],
+        source={"os": _other_os(), "arch": "x"},
+        password_store=None,
+        cookie_encryption_prefixes=["v10"],
+    )
     members = [(_member("profile/Default/Preferences", b"{}"), b"{}")]
     bundle = _hostile(tmp_path / "b.tar.gz", doc, members)
     with pytest.raises(IncompatibleBundleError):
@@ -578,7 +622,12 @@ def test_cli_round_trip(profile: Path, tmp_path: Path, capsys: pytest.CaptureFix
 def test_cli_errors(profile: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     (profile / "SingletonLock").symlink_to("other-host-1")
     assert main(["profile", "export", str(profile), str(tmp_path / "x.tar.gz")]) == 1
-    assert "running" in capsys.readouterr().err
+    assert "--ignore-lock" in capsys.readouterr().err
+    args = ["profile", "export", str(profile), str(tmp_path / "x.tar.gz"), "--ignore-lock"]
+    assert main(args) == 0
+    capsys.readouterr()
+    assert main(["profile", "inspect", str(tmp_path / "x.tar.gz"), "--max-bytes", "0"]) == 2
+    assert main(["profile", "import", str(tmp_path / "x.tar.gz"), "t", "--max-bytes", "-1"]) == 2
     assert main(["profile"]) == 2
     assert main(["profile", "bogus"]) == 2
     capsys.readouterr()

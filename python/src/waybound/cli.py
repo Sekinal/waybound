@@ -12,7 +12,9 @@ from waybound.binary import DEFAULT_VERSION, download_daemon_binary
 from waybound.profile import (
     DEFAULT_MAX_BYTES,
     PASSWORD_STORE_KINDS,
+    Compatibility,
     Manifest,
+    OsName,
     ProfileError,
     assess_compatibility,
     current_os,
@@ -81,6 +83,32 @@ def run_doctor() -> dict[str, str]:
     }
 
 
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value <= 0:
+        msg = f"must be a positive integer, got {text}"
+        raise argparse.ArgumentTypeError(msg)
+    return value
+
+
+def _add_max_bytes(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--max-bytes",
+        type=_positive_int,
+        default=DEFAULT_MAX_BYTES,
+        help=f"refuse bundles larger than this when uncompressed (default {DEFAULT_MAX_BYTES})",
+    )
+
+
+def _add_ignore_lock(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--ignore-lock",
+        action="store_true",
+        help="accept a SingletonLock written by Chrome on another host (e.g. a finished "
+        "container); never overrides a lock held by a local Chrome",
+    )
+
+
 def _profile_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="waybound profile",
@@ -99,31 +127,41 @@ def _profile_parser() -> argparse.ArgumentParser:
     exp.add_argument(
         "--password-store",
         choices=PASSWORD_STORE_KINDS,
-        help="override the cookie key store recorded in the manifest (default: detected)",
+        help="cookie key store to record when it cannot be detected (a value that "
+        "contradicts the cookie database is ignored)",
     )
     exp.add_argument("--force", action="store_true", help="overwrite an existing bundle")
+    _add_ignore_lock(exp)
 
     imp = sub.add_parser("import", help="restore a bundle into a Chrome --user-data-dir")
     imp.add_argument("bundle", type=Path)
     imp.add_argument("profile_dir", type=Path)
     imp.add_argument(
-        "--force", action="store_true", help="replace the contents of a non-empty target"
+        "--force",
+        action="store_true",
+        help="replace an existing Chrome user-data-dir or previous import (old one is "
+        "removed only after the new one is in place)",
     )
     imp.add_argument(
         "--allow-incompatible",
         action="store_true",
         help="import even if cookies cannot decrypt on this OS",
     )
-    imp.add_argument(
-        "--max-bytes",
-        type=int,
-        default=DEFAULT_MAX_BYTES,
-        help=f"refuse bundles larger than this when uncompressed (default {DEFAULT_MAX_BYTES})",
-    )
+    _add_ignore_lock(imp)
+    _add_max_bytes(imp)
 
     ins = sub.add_parser("inspect", help="print a bundle's manifest summary")
     ins.add_argument("bundle", type=Path)
+    _add_max_bytes(ins)
     return parser
+
+
+_LEVEL_TEXT = {
+    "portable": "expected to work (not verified against a real Chrome)",
+    "same_machine_only": "only on the original machine and OS user",
+    "incompatible": "cookies will not decrypt",
+    "unknown": "unknown",
+}
 
 
 def _describe(manifest: Manifest) -> str:
@@ -136,61 +174,83 @@ def _describe(manifest: Manifest) -> str:
     )
 
 
+def _compat(manifest: Manifest, target: OsName) -> Compatibility:
+    return assess_compatibility(
+        manifest.source_os,
+        manifest.password_store,
+        target,
+        prefixes=manifest.cookie_encryption_prefixes,
+    )
+
+
+def _cmd_export(ns: argparse.Namespace) -> None:
+    res = export_profile(
+        ns.profile_dir,
+        ns.bundle,
+        include_credentials=ns.include_credentials,
+        password_store=ns.password_store,
+        overwrite=ns.force,
+        ignore_lock=ns.ignore_lock,
+    )
+    for warning in res.warnings:
+        sys.stderr.write(f"warning: {warning}\n")
+    if res.skipped:
+        sys.stderr.write(
+            f"note: skipped {len(res.skipped)} symlink(s), special file(s) or "
+            "non-portable name(s)\n"
+        )
+    sys.stdout.write(f"Wrote {res.bundle}\n{_describe(res.manifest)}")
+    targets: tuple[OsName, ...] = ("linux", "macos", "windows")
+    for target in targets:
+        level = _compat(res.manifest, target).level
+        sys.stdout.write(f"  restore on {target}: {_LEVEL_TEXT[level]}\n")
+    sys.stderr.write(_BUNDLE_NOTICE)
+
+
+def _cmd_import(ns: argparse.Namespace) -> None:
+    imported = import_profile(
+        ns.bundle,
+        ns.profile_dir,
+        force=ns.force,
+        allow_incompatible=ns.allow_incompatible,
+        ignore_lock=ns.ignore_lock,
+        max_bytes=ns.max_bytes,
+    )
+    for warning in imported.warnings:
+        sys.stderr.write(f"WARNING: {warning}\n")
+    sys.stdout.write(
+        f"Restored {imported.profile_dir} (dirs 0700, files 0600)\n"
+        f"{_describe(imported.manifest)}"
+        f"  session on this {current_os()} machine: "
+        f"{_LEVEL_TEXT[imported.compatibility.level]}\n"
+        "  launch with LaunchOptions(profile_dir=...) pointing at this directory\n"
+    )
+    sys.stderr.write(
+        "SECURITY: the restored profile holds live session cookies; the bundle file still "
+        "does too.\n"
+    )
+
+
+def _cmd_inspect(ns: argparse.Namespace) -> None:
+    manifest = read_manifest(ns.bundle, max_bytes=ns.max_bytes)
+    sys.stdout.write(f"{ns.bundle}\n  created {manifest.created_at} by waybound ")
+    sys.stdout.write(f"{manifest.waybound_version}\n{_describe(manifest)}")
+    compat = _compat(manifest, current_os())
+    sys.stdout.write(
+        f"  on this {current_os()} machine: {_LEVEL_TEXT[compat.level]}: {compat.message}\n"
+    )
+
+
 def _run_profile(args: list[str]) -> int:
     try:
         ns = _profile_parser().parse_args(args)
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 2
-    out, err = sys.stdout, sys.stderr
+    commands = {"export": _cmd_export, "import": _cmd_import, "inspect": _cmd_inspect}
     try:
-        if ns.action == "export":
-            res = export_profile(
-                ns.profile_dir,
-                ns.bundle,
-                include_credentials=ns.include_credentials,
-                password_store=ns.password_store,
-                overwrite=ns.force,
-            )
-            for warning in res.warnings:
-                err.write(f"warning: {warning}\n")
-            if res.skipped:
-                err.write(f"note: skipped {len(res.skipped)} symlink(s)/special file(s)\n")
-            out.write(f"Wrote {res.bundle}\n{_describe(res.manifest)}")
-            for target in ("linux", "macos", "windows"):
-                compat = assess_compatibility(
-                    res.manifest.source_os, res.manifest.password_store, target
-                )
-                out.write(f"  restore on {target}: {compat.level}\n")
-            err.write(_BUNDLE_NOTICE)
-        elif ns.action == "import":
-            imported = import_profile(
-                ns.bundle,
-                ns.profile_dir,
-                force=ns.force,
-                allow_incompatible=ns.allow_incompatible,
-                max_bytes=ns.max_bytes,
-            )
-            for warning in imported.warnings:
-                err.write(f"WARNING: {warning}\n")
-            out.write(
-                f"Restored {imported.profile_dir} (dirs 0700, files 0600)\n"
-                f"{_describe(imported.manifest)}"
-                f"  compatibility with this {current_os()} machine: "
-                f"{imported.compatibility.level}\n"
-                "  launch with LaunchOptions(profile_dir=...) pointing at this directory\n"
-            )
-            err.write(
-                "SECURITY: the restored profile holds live session cookies; the bundle "
-                "file still does too.\n"
-            )
-        else:
-            manifest = read_manifest(ns.bundle)
-            out.write(f"{ns.bundle}\n  created {manifest.created_at} by waybound ")
-            out.write(f"{manifest.waybound_version}\n{_describe(manifest)}")
-            compat = assess_compatibility(manifest.source_os, manifest.password_store, current_os())
-            out.write(f"  on this {current_os()} machine: {compat.level}: {compat.message}\n")
+        commands[ns.action](ns)
     except (ProfileError, OSError) as exc:
-        err.write(f"error: {exc}\n")
+        sys.stderr.write(f"error: {exc}\n")
         return 1
     return 0
 
