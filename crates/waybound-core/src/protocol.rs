@@ -1,12 +1,113 @@
 //! Line-delimited JSON IPC protocol between client SDKs and `waybound-daemon`.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::WayboundError;
 use crate::fingerprint::SessionFingerprint;
 use crate::input::{KeyCode, KeyModifier};
 use crate::locator::{AccessibilityNode, LocatorQuery};
 use crate::network::{CapturedResponse, CapturedWebSocketFrame, NetworkStats};
+
+/// Metadata describing an open browser window tracked by the backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowSummary {
+    /// Backend-assigned monotonic window identifier.
+    pub id: u64,
+    /// Current window title.
+    pub title: String,
+    /// Current application identifier (for example `xdg_toplevel` `app_id`).
+    pub app_id: String,
+    /// Window width in logical pixels.
+    pub width: u32,
+    /// Window height in logical pixels.
+    pub height: u32,
+    /// Whether the window has committed at least one readable pixel buffer.
+    pub has_buffer: bool,
+}
+
+/// Wire-level request envelope pairing an optional target `window_id` with a [`Request`].
+///
+/// Backwards-compatible with plain [`Request`] JSON objects that omit `"window_id"`.
+/// For [`Request::CloseWindow`], `"window_id"` belongs to the command payload itself and
+/// [`WireRequest::window_id`] is normalized to `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WireRequest {
+    /// Optional target window identifier scoping this request to a specific browser window.
+    pub window_id: Option<u64>,
+    /// Underlying automation request.
+    pub request: Request,
+}
+
+impl WireRequest {
+    /// Wraps `request` without a window scope.
+    #[must_use]
+    pub const fn unscoped(request: Request) -> Self {
+        Self {
+            window_id: None,
+            request,
+        }
+    }
+
+    /// Wraps `request` scoped to `window_id`.
+    #[must_use]
+    pub const fn scoped(window_id: u64, request: Request) -> Self {
+        Self {
+            window_id: Some(window_id),
+            request,
+        }
+    }
+}
+
+impl Serialize for WireRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut value = serde_json::to_value(&self.request).map_err(serde::ser::Error::custom)?;
+        if let Some(wid) = self.window_id
+            && let Some(obj) = value.as_object_mut()
+            && !obj.contains_key("window_id")
+        {
+            let _ = obj.insert("window_id".to_owned(), serde_json::Value::from(wid));
+        }
+        value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for WireRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let Some(obj) = value.as_object() else {
+            return Err(serde::de::Error::custom("expected JSON object for request"));
+        };
+        let envelope_window_id = match obj.get("window_id") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(raw) => {
+                Some(serde_json::from_value::<u64>(raw.clone()).map_err(serde::de::Error::custom)?)
+            }
+        };
+        let request: Request = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        let window_id = if matches!(request, Request::CloseWindow { .. }) {
+            None
+        } else {
+            envelope_window_id
+        };
+        Ok(Self { window_id, request })
+    }
+}
+
+/// Parses a single JSON-lines wire request with an optional top-level `window_id`.
+///
+/// # Errors
+///
+/// Returns a [`serde_json::Error`] if `line` is not a valid request object or has a
+/// malformed `window_id`.
+pub fn parse_wire_request(line: &str) -> Result<WireRequest, serde_json::Error> {
+    serde_json::from_str(line)
+}
 
 /// Wire-level request sent from a client SDK to `waybound-daemon`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -175,6 +276,22 @@ pub enum Request {
         /// Desired checked state (`true` for `check()`, `false` for `uncheck()`).
         checked: bool,
     },
+    /// List open browser windows tracked by the active backend.
+    ListWindows,
+    /// Open a new browser window in the active session, optionally navigating to `url`.
+    NewWindow {
+        /// Optional destination URL (`http://`, `https://`, or `about:blank`).
+        #[serde(default)]
+        url: Option<String>,
+        /// Whether to open the new window in incognito mode.
+        #[serde(default)]
+        incognito: bool,
+    },
+    /// Request that the browser cleanly close the window identified by `window_id`.
+    CloseWindow {
+        /// Identifier of the window to close.
+        window_id: u64,
+    },
 }
 
 /// Wire-level response returned by `waybound-daemon`.
@@ -234,6 +351,16 @@ pub enum Response {
     NetworkStats {
         /// Per-session bandwidth and connection counters.
         stats: NetworkStats,
+    },
+    /// Response to [`Request::ListWindows`].
+    Windows {
+        /// Currently open browser windows.
+        windows: Vec<WindowSummary>,
+    },
+    /// Response to [`Request::NewWindow`].
+    Window {
+        /// Newly opened browser window metadata.
+        window: WindowSummary,
     },
     /// Structured error returned when a request fails.
     Error {
@@ -506,5 +633,98 @@ mod tests {
         );
         let decoded_resp: Result<Response, _> = serde_json::from_str(&encoded_resp);
         assert_eq!(decoded_resp.ok(), Some(resp));
+    }
+
+    #[test]
+    fn wire_request_round_trips_with_and_without_window_id() {
+        let click = Request::Click {
+            query: LocatorQuery::by_role(Role::Button, Some("Submit".to_owned())),
+        };
+
+        // Without window_id (backwards-compatible plain Request JSON).
+        let plain_wire = WireRequest::unscoped(click.clone());
+        let plain_json = serde_json::to_string(&plain_wire).unwrap_or_default();
+        assert!(!plain_json.contains("window_id"));
+        let parsed_plain = parse_wire_request(&plain_json);
+        assert_eq!(parsed_plain.ok(), Some(plain_wire));
+
+        // With top-level window_id.
+        let scoped_wire = WireRequest::scoped(6, click);
+        let scoped_json = serde_json::to_string(&scoped_wire).unwrap_or_default();
+        assert!(scoped_json.contains(r#""window_id":6"#));
+        let parsed_scoped = parse_wire_request(&scoped_json);
+        assert_eq!(parsed_scoped.ok(), Some(scoped_wire));
+
+        // Explicit null window_id is treated as None.
+        let null_wid = parse_wire_request(r#"{"method":"ping","window_id":null}"#);
+        assert_eq!(null_wid.ok(), Some(WireRequest::unscoped(Request::Ping)));
+
+        // Malformed window_id fails deserialization.
+        assert!(parse_wire_request(r#"{"method":"ping","window_id":"six"}"#).is_err());
+        assert!(parse_wire_request(r#"{"method":"ping","window_id":-1}"#).is_err());
+    }
+
+    #[test]
+    fn window_requests_and_responses_round_trip_json() {
+        assert_eq!(
+            parse_wire_request(r#"{"method":"list_windows"}"#).ok(),
+            Some(WireRequest::unscoped(Request::ListWindows))
+        );
+        assert_eq!(
+            parse_wire_request(r#"{"method":"new_window"}"#).ok(),
+            Some(WireRequest::unscoped(Request::NewWindow {
+                url: None,
+                incognito: false,
+            }))
+        );
+        assert_eq!(
+            parse_wire_request(
+                r#"{"method":"new_window","url":"https://example.com","incognito":true}"#
+            )
+            .ok(),
+            Some(WireRequest::unscoped(Request::NewWindow {
+                url: Some("https://example.com".to_owned()),
+                incognito: true,
+            }))
+        );
+
+        // CloseWindow carries `window_id` as its payload field without conflicting with WireRequest.
+        let close_json = r#"{"method":"close_window","window_id":42}"#;
+        let close_wire = parse_wire_request(close_json);
+        assert_eq!(
+            close_wire.ok(),
+            Some(WireRequest::unscoped(Request::CloseWindow {
+                window_id: 42
+            }))
+        );
+        let reencoded = serde_json::to_string(&WireRequest::unscoped(Request::CloseWindow {
+            window_id: 42,
+        }))
+        .unwrap_or_default();
+        assert_eq!(reencoded, close_json);
+
+        let summary = WindowSummary {
+            id: 7,
+            title: "Waybound Window 2".to_owned(),
+            app_id: "google-chrome".to_owned(),
+            width: 1920,
+            height: 1080,
+            has_buffer: true,
+        };
+        let list_resp = Response::Windows {
+            windows: vec![summary.clone()],
+        };
+        let list_json = serde_json::to_string(&list_resp).unwrap_or_default();
+        assert_eq!(
+            serde_json::from_str::<Response>(&list_json).ok(),
+            Some(list_resp)
+        );
+
+        let single_resp = Response::Window { window: summary };
+        let single_json = serde_json::to_string(&single_resp).unwrap_or_default();
+        assert_eq!(
+            serde_json::from_str::<Response>(&single_json).ok(),
+            Some(single_resp)
+        );
     }
 }

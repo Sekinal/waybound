@@ -1,5 +1,10 @@
-//! Live smoke test driving unmodified stock Chrome/Chromium directly against
-//! `waybound-compositor` (`--ozone-platform=wayland`, zero Xvfb, zero X11, zero CDP).
+//! Live stacked multi-window smoke test driving unmodified stock Chrome/Chromium directly
+//! against `waybound-compositor` (`--ozone-platform=wayland`, zero Xvfb, zero X11, zero CDP).
+//!
+//! Opens TWO stacked `1920x1080` windows inside ONE Chrome process (via `--new-window`
+//! sharing the same `--user-data-dir`), verifies simultaneous non-occluded per-window PNG
+//! capture (blue vs. green), verifies targeted `wl_seat` input delivery to Window 2, and
+//! verifies `close_window(win2_id)` closes only Window 2 while Window 1 stays alive.
 
 #![forbid(unsafe_code)]
 
@@ -14,12 +19,31 @@ use std::time::{Duration, Instant};
 use waybound_compositor::{CompositorConfig, HeadlessCompositor};
 use waybound_core::{InputEvent, KeyCode, MouseButton, Point};
 
-const HTML_BODY: &str = r#"<!doctype html>
+const HTML_PAGE_1: &str = r#"<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Waybound Wayland Smoke</title></head>
+<head><meta charset="utf-8"><title>Waybound Window 1</title></head>
 <body style="margin:0;padding:0;background:#2266cc;color:#ffffff;font-family:sans-serif">
+  <h1 style="padding:40px">Waybound Window 1 (Blue)</h1>
+  <script>
+    const params = new URLSearchParams({
+      win: '1',
+      w: String(window.screen.width),
+      h: String(window.screen.height),
+      vis: String(document.visibilityState),
+      ext: String(Boolean(window.screen.isExtended)),
+    });
+    fetch('/report?' + params.toString());
+  </script>
+</body>
+</html>
+"#;
+
+const HTML_PAGE_2: &str = r#"<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Waybound Window 2</title></head>
+<body style="margin:0;padding:0;background:#22aa44;color:#ffffff;font-family:sans-serif">
   <button id="btn" style="width:300px;height:120px" onclick="fetch('/clicked')">Click Me</button>
-  <h1 style="padding:40px">Hello Wayland</h1>
+  <h1 style="padding:40px">Waybound Window 2 (Green)</h1>
   <script>
     window.addEventListener('pointerdown', () => {
       fetch('/input?kind=click');
@@ -28,6 +52,7 @@ const HTML_BODY: &str = r#"<!doctype html>
       fetch('/input?kind=key');
     });
     const params = new URLSearchParams({
+      win: '2',
       w: String(window.screen.width),
       h: String(window.screen.height),
       vis: String(document.visibilityState),
@@ -41,6 +66,7 @@ const HTML_BODY: &str = r#"<!doctype html>
 
 #[derive(Debug, PartialEq, Eq)]
 struct PageReport {
+    win: String,
     width: String,
     height: String,
     visibility: String,
@@ -52,6 +78,12 @@ enum PageEvent {
     Report(PageReport),
     InputClick,
     InputKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DominantColor {
+    Blue,
+    Green,
 }
 
 struct ChildGuard(Child);
@@ -93,6 +125,7 @@ fn find_chrome_binary() -> Option<PathBuf> {
 
 fn parse_report_query(path: &str) -> Option<PageReport> {
     let query = path.strip_prefix("/report?")?;
+    let mut win = String::new();
     let mut width = String::new();
     let mut height = String::new();
     let mut visibility = String::new();
@@ -101,6 +134,7 @@ fn parse_report_query(path: &str) -> Option<PageReport> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             match k {
+                "win" => v.clone_into(&mut win),
                 "w" => v.clone_into(&mut width),
                 "h" => v.clone_into(&mut height),
                 "vis" => v.clone_into(&mut visibility),
@@ -111,6 +145,7 @@ fn parse_report_query(path: &str) -> Option<PageReport> {
     }
 
     Some(PageReport {
+        win,
         width,
         height,
         visibility,
@@ -162,10 +197,16 @@ fn spawn_http_server(event_tx: mpsc::Sender<PageEvent>) -> Result<u16, String> {
                 let _ = event_tx.send(PageEvent::InputKey);
                 let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
                 let _ = writer.write_all(resp.as_bytes());
+            } else if path == "/page2" {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{HTML_PAGE_2}",
+                    HTML_PAGE_2.len()
+                );
+                let _ = writer.write_all(resp.as_bytes());
             } else {
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{HTML_BODY}",
-                    HTML_BODY.len()
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{HTML_PAGE_1}",
+                    HTML_PAGE_1.len()
                 );
                 let _ = writer.write_all(resp.as_bytes());
             }
@@ -175,7 +216,32 @@ fn spawn_http_server(event_tx: mpsc::Sender<PageEvent>) -> Result<u16, String> {
     Ok(port)
 }
 
-fn verify_png_non_blank(png_bytes: &[u8]) -> Result<(u32, u32, usize), String> {
+fn verify_report(label: &str, report: &PageReport) -> Result<(), String> {
+    if report.width != "1920" || report.height != "1080" {
+        return Err(format!(
+            "{label}: unexpected screen dimensions {}x{} (expected 1920x1080)",
+            report.width, report.height
+        ));
+    }
+    if report.visibility != "visible" {
+        return Err(format!(
+            "{label}: unexpected visibilityState {:?} (expected \"visible\")",
+            report.visibility
+        ));
+    }
+    if report.is_extended != "false" {
+        return Err(format!(
+            "{label}: unexpected screen.isExtended {:?} (expected \"false\")",
+            report.is_extended
+        ));
+    }
+    Ok(())
+}
+
+fn verify_png_color(
+    png_bytes: &[u8],
+    expected: DominantColor,
+) -> Result<(u32, u32, usize, usize), String> {
     if !png_bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err("captured bytes do not start with PNG magic header".to_owned());
     }
@@ -191,16 +257,52 @@ fn verify_png_non_blank(png_bytes: &[u8]) -> Result<(u32, u32, usize), String> {
         .map_err(|e| format!("PNG decode frame failed: {e}"))?;
 
     let (chunks, _) = pixels.as_chunks::<4>();
-    let non_black = chunks
-        .iter()
-        .filter(|&&[r, g, b, a]| a > 0 && (r > 0 || g > 0 || b > 0))
-        .count();
+    let mut non_black: usize = 0;
+    let mut blue_pixels: usize = 0;
+    let mut green_pixels: usize = 0;
+
+    for &[r, g, b, a] in chunks {
+        if a == 0 {
+            continue;
+        }
+        if r > 0 || g > 0 || b > 0 {
+            non_black += 1;
+        }
+        let r16 = u16::from(r);
+        let g16 = u16::from(g);
+        let b16 = u16::from(b);
+        if b16 > r16 + 40 && b16 > g16 + 20 {
+            blue_pixels += 1;
+        }
+        if g16 > r16 + 40 && g16 > b16 + 20 {
+            green_pixels += 1;
+        }
+    }
+
     if non_black == 0 {
         return Err(format!(
             "decoded {width}x{height} PNG has zero non-black pixels"
         ));
     }
-    Ok((width, height, non_black))
+
+    match expected {
+        DominantColor::Blue => {
+            if blue_pixels < 1_000 || blue_pixels <= green_pixels {
+                return Err(format!(
+                    "expected dominant blue pixels in {width}x{height} PNG (blue={blue_pixels}, green={green_pixels}, non_black={non_black})"
+                ));
+            }
+            Ok((width, height, non_black, blue_pixels))
+        }
+        DominantColor::Green => {
+            if green_pixels < 1_000 || green_pixels <= blue_pixels {
+                return Err(format!(
+                    "expected dominant green pixels in {width}x{height} PNG (green={green_pixels}, blue={blue_pixels}, non_black={non_black})"
+                ));
+            }
+            Ok((width, height, non_black, green_pixels))
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -231,8 +333,10 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
 
     let (event_tx, event_rx) = mpsc::channel();
     let port = spawn_http_server(event_tx)?;
-    let url = format!("http://127.0.0.1:{port}/");
+    let url1 = format!("http://127.0.0.1:{port}/page1");
+    let url2 = format!("http://127.0.0.1:{port}/page2");
 
+    // 1. Launch primary Chrome process opening Window 1 (/page1, blue).
     let child = waybound_core::process::command(&chrome_bin)
         .arg("--ozone-platform=wayland")
         .arg("--no-first-run")
@@ -242,7 +346,7 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
         .arg("--disable-dev-shm-usage")
         .arg("--no-sandbox")
         .arg(format!("--user-data-dir={}", profile_dir.display()))
-        .arg(&url)
+        .arg(&url1)
         .env("WAYLAND_DISPLAY", compositor.socket_name())
         .env("XDG_RUNTIME_DIR", compositor.runtime_dir())
         .env_remove("DISPLAY")
@@ -252,14 +356,11 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("failed to spawn Chrome: {e}"))?;
     let mut child_guard = ChildGuard(child);
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut received_report: Option<PageReport> = None;
-    let mut captured_png: Option<Vec<u8>> = None;
-    let mut target_window_id: Option<u64> = None;
-    let mut saw_click = false;
-    let mut saw_key = false;
+    let deadline1 = Instant::now() + Duration::from_secs(30);
+    let mut report1: Option<PageReport> = None;
+    let mut win1_id: Option<u64> = None;
 
-    while Instant::now() < deadline {
+    while Instant::now() < deadline1 {
         if let Ok(Some(status)) = child_guard.0.try_wait() {
             return Err(format!(
                 "Chrome exited early with {status} (windows={:?})",
@@ -267,110 +368,188 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
             ));
         }
         while let Ok(evt) = event_rx.try_recv() {
-            match evt {
-                PageEvent::Report(report) => {
-                    log_line(&format!("Received page report: {report:?}"));
-                    received_report = Some(report);
-                }
-                PageEvent::InputClick => {
-                    saw_click = true;
-                }
-                PageEvent::InputKey => {
-                    saw_key = true;
+            if let PageEvent::Report(report) = evt {
+                log_line(&format!("Received page report: {report:?}"));
+                if report.win == "1" {
+                    report1 = Some(report);
                 }
             }
         }
-
-        if captured_png.is_none()
+        if win1_id.is_none()
             && let Ok(windows) = compositor.windows()
             && let Some(win) = windows.iter().find(|w| w.has_buffer)
             && let Ok(png_bytes) = compositor.screenshot_png(Some(win.id))
-            && verify_png_non_blank(&png_bytes).is_ok()
+            && let Ok((w, h, non_black, blue)) = verify_png_color(&png_bytes, DominantColor::Blue)
         {
             log_line(&format!(
-                "Captured committed wl_buffer from window {} ({}x{}, title={:?})",
-                win.id, win.width, win.height, win.title
+                "Window 1 ready: id={}, {}x{}, title={:?} ({non_black} non-black, {blue} blue px)",
+                win.id, w, h, win.title
             ));
-            target_window_id = Some(win.id);
-            captured_png = Some(png_bytes);
+            win1_id = Some(win.id);
         }
-
-        if received_report.is_some() && captured_png.is_some() {
+        if report1.is_some() && win1_id.is_some() {
             break;
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    let report = received_report
-        .ok_or_else(|| "timed out waiting for /report callback from Chrome".to_owned())?;
-    if report.width != "1920" || report.height != "1080" {
-        return Err(format!(
-            "unexpected screen dimensions: {}x{} (expected 1920x1080)",
-            report.width, report.height
-        ));
-    }
-    if report.visibility != "visible" {
-        return Err(format!(
-            "unexpected visibilityState: {:?} (expected \"visible\")",
-            report.visibility
-        ));
-    }
-    if report.is_extended != "false" {
-        return Err(format!(
-            "unexpected screen.isExtended: {:?} (expected \"false\")",
-            report.is_extended
-        ));
-    }
-
-    let png_bytes = captured_png.ok_or_else(|| {
+    let report1 =
+        report1.ok_or_else(|| "timed out waiting for Window 1 /report callback".to_owned())?;
+    verify_report("Window 1", &report1)?;
+    let win1_id = win1_id.ok_or_else(|| {
         format!(
-            "timed out waiting for non-blank committed wl_buffer from Chrome (windows={:?})",
+            "timed out waiting for Window 1 blue wl_buffer (windows={:?})",
             compositor.windows()
         )
     })?;
-    let (w, h, non_black) = verify_png_non_blank(&png_bytes)?;
 
-    // Dispatch synthetic pointer click + keyboard press via wl_seat and verify the page receives both.
-    let win_id = target_window_id;
+    // 2. Open Window 2 (/page2, green) inside the SAME Chrome process via --new-window.
+    log_line("Spawning secondary --new-window Chrome handoff for Window 2...");
+    let helper_child = waybound_core::process::command(&chrome_bin)
+        .arg("--ozone-platform=wayland")
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-gpu")
+        .arg("--disable-gpu-compositing")
+        .arg("--disable-dev-shm-usage")
+        .arg("--no-sandbox")
+        .arg(format!("--user-data-dir={}", profile_dir.display()))
+        .arg("--new-window")
+        .arg(&url2)
+        .env("WAYLAND_DISPLAY", compositor.socket_name())
+        .env("XDG_RUNTIME_DIR", compositor.runtime_dir())
+        .env_remove("DISPLAY")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("failed to spawn secondary Chrome --new-window: {e}"))?;
+    let mut helper_guard = ChildGuard(helper_child);
+
+    let deadline2 = Instant::now() + Duration::from_secs(30);
+    let mut report2: Option<PageReport> = None;
+    let mut win2_id: Option<u64> = None;
+    let mut saw_click = false;
+    let mut saw_key = false;
+
+    while Instant::now() < deadline2 {
+        let _ = helper_guard.0.try_wait();
+        if let Ok(Some(status)) = child_guard.0.try_wait() {
+            return Err(format!(
+                "primary Chrome exited early with {status} while opening Window 2 (windows={:?})",
+                compositor.windows()
+            ));
+        }
+        while let Ok(evt) = event_rx.try_recv() {
+            match evt {
+                PageEvent::Report(report) => {
+                    log_line(&format!("Received page report: {report:?}"));
+                    if report.win == "2" {
+                        report2 = Some(report);
+                    }
+                }
+                PageEvent::InputClick => saw_click = true,
+                PageEvent::InputKey => saw_key = true,
+            }
+        }
+
+        if win2_id.is_none()
+            && let Ok(windows) = compositor.windows()
+            && let Some(win) = windows.iter().find(|w| w.id != win1_id && w.has_buffer)
+            && let Ok(png_bytes) = compositor.screenshot_png(Some(win.id))
+            && let Ok((w, h, non_black, green)) = verify_png_color(&png_bytes, DominantColor::Green)
+        {
+            log_line(&format!(
+                "Window 2 ready: id={}, {}x{}, title={:?} ({non_black} non-black, {green} green px)",
+                win.id, w, h, win.title
+            ));
+            win2_id = Some(win.id);
+        }
+
+        if report2.is_some() && win2_id.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = helper_guard.0.try_wait();
+
+    let report2 =
+        report2.ok_or_else(|| "timed out waiting for Window 2 /report callback".to_owned())?;
+    verify_report("Window 2", &report2)?;
+    let win2_id = win2_id.ok_or_else(|| {
+        format!(
+            "timed out waiting for Window 2 green wl_buffer (windows={:?})",
+            compositor.windows()
+        )
+    })?;
+
+    // 3. Verify BOTH windows exist simultaneously and yield distinct non-occluded PNGs.
+    let simultaneous_windows = compositor
+        .windows()
+        .map_err(|e| format!("failed to list windows: {e}"))?;
+    if !simultaneous_windows.iter().any(|w| w.id == win1_id)
+        || !simultaneous_windows.iter().any(|w| w.id == win2_id)
+    {
+        return Err(format!(
+            "expected both win1={win1_id} and win2={win2_id} open simultaneously; got {simultaneous_windows:?}"
+        ));
+    }
+
+    let png1 = compositor
+        .screenshot_png(Some(win1_id))
+        .map_err(|e| format!("simultaneous screenshot of Window 1 failed: {e}"))?;
+    let (w1, h1, _, blue_px) = verify_png_color(&png1, DominantColor::Blue)
+        .map_err(|e| format!("Window 1 simultaneous capture failed: {e}"))?;
+
+    let png2 = compositor
+        .screenshot_png(Some(win2_id))
+        .map_err(|e| format!("simultaneous screenshot of Window 2 failed: {e}"))?;
+    let (w2, h2, _, green_px) = verify_png_color(&png2, DominantColor::Green)
+        .map_err(|e| format!("Window 2 simultaneous capture failed: {e}"))?;
+
+    log_line(&format!(
+        "Verified simultaneous zero-occlusion capture: win1={win1_id} ({w1}x{h1}, {blue_px} blue px) + win2={win2_id} ({w2}x{h2}, {green_px} green px)"
+    ));
+
+    // 4. Dispatch synthetic pointer click + keyboard press specifically to Window 2.
     compositor
         .dispatch_input(
-            win_id,
+            Some(win2_id),
             &InputEvent::PointerMove {
                 to: Point { x: 400.0, y: 400.0 },
             },
         )
-        .map_err(|e| format!("dispatch PointerMove failed: {e}"))?;
+        .map_err(|e| format!("dispatch PointerMove to Window 2 failed: {e}"))?;
     compositor
         .dispatch_input(
-            win_id,
+            Some(win2_id),
             &InputEvent::MouseClick {
                 button: MouseButton::Left,
                 hold_ms: 20,
             },
         )
-        .map_err(|e| format!("dispatch MouseClick failed: {e}"))?;
+        .map_err(|e| format!("dispatch MouseClick to Window 2 failed: {e}"))?;
     thread::sleep(Duration::from_millis(100));
     compositor
         .dispatch_input(
-            win_id,
+            Some(win2_id),
             &InputEvent::KeyPress {
                 key: KeyCode::Char('a'),
                 modifiers: Vec::new(),
                 hold_ms: 20,
             },
         )
-        .map_err(|e| format!("dispatch KeyPress failed: {e}"))?;
+        .map_err(|e| format!("dispatch KeyPress to Window 2 failed: {e}"))?;
 
     let input_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < input_deadline && !(saw_click && saw_key) {
         while let Ok(evt) = event_rx.try_recv() {
             match evt {
                 PageEvent::InputClick => {
-                    log_line("Received synthetic pointer click callback from Chrome");
+                    log_line("Received synthetic pointer click callback from Window 2");
                     saw_click = true;
                 }
                 PageEvent::InputKey => {
-                    log_line("Received synthetic keyboard press callback from Chrome");
+                    log_line("Received synthetic keyboard press callback from Window 2");
                     saw_key = true;
                 }
                 PageEvent::Report(_) => {}
@@ -383,15 +562,52 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
     }
 
     if !saw_click {
-        return Err("timed out waiting for synthetic pointerdown callback from Chrome".to_owned());
+        return Err(
+            "timed out waiting for synthetic pointerdown callback from Window 2".to_owned(),
+        );
     }
     if !saw_key {
-        return Err("timed out waiting for synthetic keydown callback from Chrome".to_owned());
+        return Err("timed out waiting for synthetic keydown callback from Window 2".to_owned());
+    }
+
+    // 5. Close ONLY Window 2 and verify Window 1 remains alive.
+    compositor
+        .close_window(win2_id)
+        .map_err(|e| format!("close_window({win2_id}) failed: {e}"))?;
+
+    let close_deadline = Instant::now() + Duration::from_secs(10);
+    let mut win2_closed = false;
+    while Instant::now() < close_deadline {
+        let current = compositor
+            .windows()
+            .map_err(|e| format!("windows() during close poll failed: {e}"))?;
+        let has_win1 = current.iter().any(|w| w.id == win1_id);
+        let has_win2 = current.iter().any(|w| w.id == win2_id);
+        if !has_win1 {
+            return Err(format!(
+                "Window 1 ({win1_id}) disappeared after closing Window 2 ({win2_id}): {current:?}"
+            ));
+        }
+        if !has_win2 {
+            win2_closed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !win2_closed {
+        return Err(format!(
+            "timed out waiting for Window 2 ({win2_id}) to close (windows={:?})",
+            compositor.windows()
+        ));
+    }
+    if let Ok(Some(status)) = child_guard.0.try_wait() {
+        return Err(format!(
+            "primary Chrome exited ({status}) after closing only Window 2"
+        ));
     }
 
     log_line(&format!(
-        "PASS: Chrome rendered {w}x{h} PNG ({} bytes, {non_black} non-black pixels) and received synthetic wl_seat click + key press on pure-Rust Wayland compositor",
-        png_bytes.len()
+        "PASS: Stacked 1920x1080 multi-window Wayland Chrome verified (win1={win1_id} blue {w1}x{h1}, win2={win2_id} green {w2}x{h2}, targeted input delivered to win2, close_window closed only win2)"
     ));
 
     Ok(())

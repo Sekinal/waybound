@@ -186,6 +186,28 @@ impl HeadlessCompositor {
             })
         }
     }
+
+    /// Requests that the client cleanly close `window_id` via `xdg_toplevel::close`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`waybound_core::WayboundError::ElementNotFound`] if `window_id` is not tracked,
+    /// or [`waybound_core::WayboundError::BackendUnavailable`] if the compositor event loop has
+    /// stopped or is unavailable on this platform.
+    pub fn close_window(&self, window_id: u64) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.inner.close_window(window_id)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = window_id;
+            Err(waybound_core::WayboundError::BackendUnavailable {
+                backend: "wayland-compositor".to_owned(),
+                reason: "Wayland compositor is only supported on Unix platforms".to_owned(),
+            })
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -228,6 +250,10 @@ mod unix_tests {
         assert!(socket_path.exists());
         assert_eq!(compositor.socket_name(), "wl-test-0");
         assert_eq!(compositor.windows().ok(), Some(Vec::new()));
+        assert!(matches!(
+            compositor.close_window(999),
+            Err(waybound_core::WayboundError::ElementNotFound { .. })
+        ));
 
         // Perform a raw Wayland wire handshake:
         //   wl_display(1).get_registry(opcode=1, new_id=2)

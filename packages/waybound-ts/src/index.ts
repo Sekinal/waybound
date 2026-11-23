@@ -19,6 +19,7 @@ export {
   Locator,
   type NetworkIdleOptions,
   Page,
+  type PageSnapshotTreeOptions,
   type PressOptions,
   type RoleOptions,
   type ScrollOptions,
@@ -81,6 +82,8 @@ export {
 export {
   DEFAULT_TIMEOUT_MS,
   type Endpoint,
+  type NewWindowOptions,
+  type PingHealth,
   type ResponseWaiter,
   type SnapshotTreeOptions,
   Transport,
@@ -101,4 +104,5 @@ export {
   type NetworkStats,
   Role,
   type TreeSnapshot,
+  type WindowSummary,
 } from "./types.js";

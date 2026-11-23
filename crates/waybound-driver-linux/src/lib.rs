@@ -24,6 +24,7 @@ use tracing::{debug, warn};
 use waybound_compositor::HeadlessCompositor;
 use waybound_core::{
     AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Result, WayboundError,
+    WindowSummary,
 };
 
 /// Native Linux browser driver targeting unmodified Chrome/Chromium.
@@ -37,6 +38,7 @@ pub struct LinuxDriver {
     display: Option<String>,
     display_server: Option<DisplayServer>,
     compositor: Option<Arc<HeadlessCompositor>>,
+    window_id: Option<u64>,
     x11: Arc<Mutex<Option<x11_native::X11Client>>>,
     atspi: Arc<Mutex<Option<atspi_native::AtspiClient>>>,
     /// Pointer position left by the last `ydotool` move (Wayland fallback only).
@@ -52,6 +54,7 @@ impl LinuxDriver {
             display: None,
             display_server: None,
             compositor: None,
+            window_id: None,
             x11: Arc::new(Mutex::new(None)),
             atspi: Arc::new(Mutex::new(None)),
             ydotool_cursor: Arc::new(Mutex::new(None)),
@@ -67,6 +70,7 @@ impl LinuxDriver {
             display,
             display_server: None,
             compositor: None,
+            window_id: None,
             x11: Arc::new(Mutex::new(None)),
             atspi: Arc::new(Mutex::new(None)),
             ydotool_cursor: Arc::new(Mutex::new(None)),
@@ -83,6 +87,7 @@ impl LinuxDriver {
             display: None,
             display_server: Some(DisplayServer::Wayland),
             compositor: Some(compositor),
+            window_id: None,
             x11: Arc::new(Mutex::new(None)),
             atspi: Arc::new(Mutex::new(None)),
             ydotool_cursor: Arc::new(Mutex::new(None)),
@@ -100,6 +105,12 @@ impl LinuxDriver {
     #[must_use]
     pub const fn pid(&self) -> Option<i32> {
         self.pid
+    }
+
+    /// Returns the configured target Wayland window ID, if this driver is scoped to a window.
+    #[must_use]
+    pub const fn window_id(&self) -> Option<u64> {
+        self.window_id
     }
 
     /// Returns the configured X11 `DISPLAY` override, if any.
@@ -185,6 +196,29 @@ impl LinuxDriver {
             None => Ok(None),
         }
     }
+    /// Resolves `(window_title, window_index)` for `self.window_id` from the compositor.
+    ///
+    /// Returns `Ok(None)` when this driver is not window-scoped, `Ok(Some((title, idx)))` when
+    /// the target window is present, or `Err(ElementNotFound)` when `self.window_id` is set
+    /// but no longer tracked by the compositor.
+    fn resolve_window_scope(&self) -> Result<Option<(Option<String>, usize)>> {
+        let Some(wid) = self.window_id else {
+            return Ok(None);
+        };
+        let Some(ref comp) = self.compositor else {
+            return Err(WayboundError::ElementNotFound {
+                query: format!("window id {wid}"),
+            });
+        };
+        let windows = comp.windows()?;
+        let Some((idx, win)) = windows.iter().enumerate().find(|(_, w)| w.id == wid) else {
+            return Err(WayboundError::ElementNotFound {
+                query: format!("window id {wid}"),
+            });
+        };
+        let title = (!win.title.trim().is_empty()).then(|| win.title.clone());
+        Ok(Some((title, idx)))
+    }
 }
 
 impl Driver for LinuxDriver {
@@ -192,7 +226,61 @@ impl Driver for LinuxDriver {
         BackendKind::LinuxWayland
     }
 
+    fn for_window(&self, window_id: u64) -> Option<Arc<dyn Driver>> {
+        let _ = self.compositor.as_ref()?;
+        Some(Arc::new(Self {
+            window_id: Some(window_id),
+            ..self.clone()
+        }))
+    }
+
+    fn list_windows(&self) -> Result<Vec<WindowSummary>> {
+        let Some(ref comp) = self.compositor else {
+            return Ok(Vec::new());
+        };
+        Ok(comp
+            .windows()?
+            .into_iter()
+            .map(|w| WindowSummary {
+                id: w.id,
+                title: w.title,
+                app_id: w.app_id,
+                width: w.width,
+                height: w.height,
+                has_buffer: w.has_buffer,
+            })
+            .collect())
+    }
+
+    fn close_window(&self, window_id: u64) -> Result<()> {
+        let Some(ref comp) = self.compositor else {
+            return Err(WayboundError::UnsupportedInput {
+                backend: format!("{:?}", self.backend_kind()),
+                reason: format!(
+                    "window {window_id} close is not supported without --headless-wayland"
+                ),
+            });
+        };
+        comp.close_window(window_id)
+    }
+
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
+        if let Some((title, idx)) = self.resolve_window_scope()? {
+            return self
+                .native_atspi(|client| {
+                    client.snapshot_limited_for_window(
+                        self.pid,
+                        atspi::MAX_NODES,
+                        title.as_deref(),
+                        Some(idx),
+                    )
+                })?
+                .map(|snap| snap.nodes)
+                .ok_or_else(|| WayboundError::BackendUnavailable {
+                    backend: "linux".to_owned(),
+                    reason: "window-scoped snapshots require native AT-SPI2 D-Bus".to_owned(),
+                });
+        }
         if let Some(snap) = self.native_atspi(|client| client.snapshot(self.pid))? {
             return Ok(snap.nodes);
         }
@@ -201,6 +289,25 @@ impl Driver for LinuxDriver {
     }
 
     fn snapshot_tree_limited(&self, max_nodes: usize) -> Result<waybound_core::TreeSnapshot> {
+        if let Some((title, idx)) = self.resolve_window_scope()? {
+            return self
+                .native_atspi(|client| {
+                    client.snapshot_limited_for_window(
+                        self.pid,
+                        max_nodes,
+                        title.as_deref(),
+                        Some(idx),
+                    )
+                })?
+                .map(|snap| waybound_core::TreeSnapshot {
+                    nodes: snap.nodes,
+                    truncated: snap.truncated,
+                })
+                .ok_or_else(|| WayboundError::BackendUnavailable {
+                    backend: "linux".to_owned(),
+                    reason: "window-scoped snapshots require native AT-SPI2 D-Bus".to_owned(),
+                });
+        }
         if let Some(snap) =
             self.native_atspi(|client| client.snapshot_limited(self.pid, max_nodes))?
         {
@@ -218,6 +325,16 @@ impl Driver for LinuxDriver {
     }
 
     fn current_url(&self) -> Result<Option<String>> {
+        if let Some((title, idx)) = self.resolve_window_scope()? {
+            return self
+                .native_atspi(|client| {
+                    client.current_url_for_window(self.pid, title.as_deref(), Some(idx))
+                })?
+                .ok_or_else(|| WayboundError::BackendUnavailable {
+                    backend: "linux".to_owned(),
+                    reason: "window-scoped snapshots require native AT-SPI2 D-Bus".to_owned(),
+                });
+        }
         if let Some(url) = self.native_atspi(|client| client.current_url(self.pid))? {
             return Ok(url);
         }
@@ -228,16 +345,25 @@ impl Driver for LinuxDriver {
     fn viewport_bounds(&self) -> Result<Option<Bounds>> {
         if let Some(ref comp) = self.compositor
             && let Ok(windows) = comp.windows()
-            && let Some(win) = windows.last()
-            && win.width > 0
-            && win.height > 0
         {
-            return Ok(Some(Bounds {
-                x: 0.0,
-                y: 0.0,
-                width: f64::from(win.width),
-                height: f64::from(win.height),
-            }));
+            let target = self.window_id.map_or_else(
+                || windows.last(),
+                |wid| windows.iter().find(|w| w.id == wid),
+            );
+            if let Some(win) = target
+                && win.width > 0
+                && win.height > 0
+            {
+                return Ok(Some(Bounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: f64::from(win.width),
+                    height: f64::from(win.height),
+                }));
+            }
+            if self.window_id.is_some() {
+                return Ok(None);
+            }
         }
         if let Some(bounds) = self.native_atspi(|client| client.viewport_bounds(self.pid))? {
             return Ok(bounds);
@@ -248,7 +374,7 @@ impl Driver for LinuxDriver {
 
     fn screenshot(&self, output_path: &Path) -> Result<()> {
         if let Some(ref comp) = self.compositor {
-            return comp.screenshot_window(None, output_path);
+            return comp.screenshot_window(self.window_id, output_path);
         }
         if self
             .with_x11(|client| client.capture_png(output_path))
@@ -265,7 +391,7 @@ impl Driver for LinuxDriver {
 
     fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
         if let Some(ref comp) = self.compositor {
-            return comp.dispatch_input(None, event);
+            return comp.dispatch_input(self.window_id, event);
         }
         if self
             .with_x11(|client| client.dispatch_input(event))
@@ -356,6 +482,46 @@ mod tests {
         assert!(matches!(
             input_err,
             Err(WayboundError::ElementNotFound { .. })
+        ));
+
+        assert_eq!(driver.list_windows().ok(), Some(Vec::new()));
+        assert!(matches!(
+            driver.close_window(42),
+            Err(WayboundError::ElementNotFound { .. })
+        ));
+
+        // `for_window` succeeds when backed by a compositor and routes operations to that window.
+        let scoped = driver.for_window(77);
+        assert!(scoped.is_some());
+        if let Some(scoped) = scoped {
+            assert!(matches!(
+                scoped.screenshot(&out_png),
+                Err(WayboundError::ElementNotFound { ref query }) if query.contains("77")
+            ));
+            assert!(matches!(
+                scoped.dispatch_input(&InputEvent::PointerMove {
+                    to: Point { x: 1.0, y: 2.0 },
+                }),
+                Err(WayboundError::ElementNotFound { ref query }) if query.contains("77")
+            ));
+            assert!(matches!(
+                scoped.snapshot_tree(),
+                Err(WayboundError::ElementNotFound { ref query }) if query.contains("77")
+            ));
+            assert!(matches!(
+                scoped.current_url(),
+                Err(WayboundError::ElementNotFound { ref query }) if query.contains("77")
+            ));
+            assert_eq!(scoped.viewport_bounds().ok(), Some(None));
+        }
+
+        // Without a compositor, `for_window` returns None and `close_window` returns UnsupportedInput.
+        let plain = LinuxDriver::new(Some(1234));
+        assert!(plain.for_window(1).is_none());
+        assert_eq!(plain.list_windows().ok(), Some(Vec::new()));
+        assert!(matches!(
+            plain.close_window(1),
+            Err(WayboundError::UnsupportedInput { .. })
         ));
 
         drop(driver);

@@ -38,11 +38,13 @@ from waybound.types import (
     SessionFingerprint,
     SupportsTreeSnapshot,
     SupportsWebSocketFrames,
+    SupportsWindows,
     TlsFingerprint,
     Transport,
     TreeSnapshot,
     WebSocketDirection,
     WebSocketOpcode,
+    WindowSummary,
 )
 
 __all__ = [
@@ -84,6 +86,7 @@ __all__ = [
     "SessionFingerprint",
     "SupportsTreeSnapshot",
     "SupportsWebSocketFrames",
+    "SupportsWindows",
     "TlsFingerprint",
     "TraceRecorder",
     "Transport",
@@ -92,6 +95,7 @@ __all__ = [
     "WayboundDaemonError",
     "WebSocketDirection",
     "WebSocketOpcode",
+    "WindowSummary",
     "export_profile",
     "import_profile",
     "launch",

@@ -372,6 +372,7 @@ struct BackendBundle {
     // Drop Chrome before the driver/compositor and runtime dir so Chrome never sees the
     // Wayland socket disappear while it is still running.
     launched_browser: Option<launcher::LaunchedChrome>,
+    window_opener: Option<launcher::WindowOpener>,
     driver: Arc<dyn Driver>,
     use_motion: bool,
     proxy_forwarder: Option<ProxyForwarder>,
@@ -400,6 +401,7 @@ impl BackendBundle {
                 .launched_browser
                 .as_ref()
                 .map(launcher::LaunchedChrome::probe),
+            window_opener: self.window_opener.clone(),
         }
     }
 }
@@ -474,6 +476,7 @@ fn build_backend(
             driver: Arc::new(MockDriver::sample_page()),
             use_motion: false,
             launched_browser: None,
+            window_opener: None,
             proxy_forwarder: None,
             _waydroid: None,
             _xvfb: None,
@@ -523,6 +526,7 @@ fn build_backend(
                 driver: Arc::new(android),
                 use_motion: !cli.no_motion,
                 launched_browser: None,
+                window_opener: None,
                 proxy_forwarder: proxy_fwd,
                 _waydroid: waydroid_session,
                 _xvfb: None,
@@ -546,6 +550,7 @@ fn build_backend(
                 driver: Arc::new(MacOsDriver::new(target_pid)),
                 use_motion: !cli.no_motion,
                 launched_browser: launched,
+                window_opener: None,
                 proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: None,
@@ -593,6 +598,14 @@ fn build_backend(
                 (cli.pid, None, None)
             };
 
+            let window_opener = if compositor.is_some() {
+                launched
+                    .as_ref()
+                    .map(launcher::LaunchedChrome::window_opener)
+            } else {
+                None
+            };
+
             let driver: Arc<dyn Driver> = compositor.map_or_else(
                 || {
                     tracing::info!(pid = ?target_pid, ?display_env, "starting linux desktop driver");
@@ -612,6 +625,7 @@ fn build_backend(
                 driver,
                 use_motion: !cli.no_motion,
                 launched_browser: launched,
+                window_opener,
                 proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: xvfb_session,
@@ -632,6 +646,7 @@ fn build_backend(
                 driver: Arc::new(WindowsDriver::new(target_pid)),
                 use_motion: !cli.no_motion,
                 launched_browser: launched,
+                window_opener: None,
                 proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: None,

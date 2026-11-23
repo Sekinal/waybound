@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         Role,
         SessionFingerprint,
         TreeSnapshot,
+        WindowSummary,
     )
 
 
@@ -131,6 +132,27 @@ class AsyncPage:
 
     def __init__(self, inner: Page) -> None:
         self._inner = inner
+
+    @property
+    def window_id(self) -> int | None:
+        """Backend window identifier this page is scoped to, or `None` for the default window."""
+        return self._inner.window_id
+
+    async def list_windows(self) -> list[WindowSummary]:
+        """Return open browser windows tracked by the active backend."""
+        return await asyncio.to_thread(self._inner.list_windows)
+
+    async def new_page(self, url: str | None = None, *, incognito: bool = False) -> AsyncPage:
+        """Open a new browser window on this transport and return an `AsyncPage` scoped to it."""
+        page = await asyncio.to_thread(self._inner.new_page, url, incognito=incognito)
+        return AsyncPage(page)
+
+    async def close_window(self) -> None:
+        """Close the browser window this page is scoped to.
+
+        Raises `ValueError` when this page is unscoped (`window_id is None`).
+        """
+        await asyncio.to_thread(self._inner.close_window)
 
     async def url(self) -> str | None:
         """Return the active tab URL from the browser's web area, if available."""

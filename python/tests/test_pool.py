@@ -827,3 +827,301 @@ def test_linux_pool_without_launch_chrome_is_refused(display_backend: DisplayBac
                 isolated_displays=True,
             )
     BrowserPool(size=1, launch_options=LaunchOptions(backend="linux"), display_backend="wayland")
+
+
+def test_windows_per_browser_config_validation(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="windows_per_browser must be >= 1"):
+        BrowserPool(size=2, windows_per_browser=0, launch_options=LaunchOptions(backend="mock"))
+    with pytest.raises(ValueError, match="windows_per_browser must be >= 1"):
+        BrowserPool(size=2, windows_per_browser=-2, launch_options=LaunchOptions(backend="mock"))
+    with pytest.raises(ValueError, match="windows_per_browser must be >= 1"):
+        BrowserPool(size=2, windows_per_browser=True, launch_options=LaunchOptions(backend="mock"))
+    with pytest.raises(ValueError, match="windows_per_browser must be >= 1"):
+        BrowserPool(
+            size=2,
+            windows_per_browser=1.5,  # type: ignore[arg-type]
+            launch_options=LaunchOptions(backend="mock"),
+        )
+    with pytest.raises(ValueError, match="profile_dir"):
+        BrowserPool(
+            size=2,
+            windows_per_browser=2,
+            proxies=("http://127.0.0.1:18081", "http://127.0.0.1:18082"),
+            launch_options=LaunchOptions(backend="mock", profile_dir=tmp_path / "multi-proxy"),
+        )
+    with pytest.raises(ValueError, match="display_backend='wayland'"):
+        BrowserPool(
+            size=4,
+            windows_per_browser=2,
+            display_backend="xvfb",
+            isolated_displays=True,
+            launch_options=LaunchOptions(backend="linux", launch_chrome=True),
+        )
+    with pytest.raises(ValueError, match="display_backend='wayland'"):
+        BrowserPool(
+            size=2,
+            windows_per_browser=2,
+            display_backend="wayland",
+            launch_options=LaunchOptions(backend="macos", launch_chrome=True),
+        )
+    with pytest.raises(ValueError, match="launch_chrome=True"):
+        BrowserPool(
+            size=4,
+            windows_per_browser=2,
+            display_backend="wayland",
+            launch_options=LaunchOptions(backend="linux", launch_chrome=False),
+        )
+    with pytest.raises(ValueError, match="remote_workers"):
+        BrowserPool(
+            size=2,
+            windows_per_browser=2,
+            remote_workers=["127.0.0.1:49222", "127.0.0.1:49223"],
+        )
+    # Linux + Wayland + launch_chrome=True is valid, and mock backend is valid.
+    BrowserPool(
+        size=4,
+        windows_per_browser=2,
+        display_backend="wayland",
+        launch_options=LaunchOptions(backend="linux", launch_chrome=True),
+    )
+    # Single host (size <= windows_per_browser) can even use profile_dir.
+    BrowserPool(
+        size=2,
+        windows_per_browser=2,
+        launch_options=LaunchOptions(backend="mock", profile_dir=tmp_path / "single"),
+    )
+    # Multiple hosts (size > windows_per_browser) still reject shared profile_dir.
+    with pytest.raises(ValueError, match="profile_dir"):
+        BrowserPool(
+            size=3,
+            windows_per_browser=2,
+            launch_options=LaunchOptions(backend="mock", profile_dir=tmp_path / "shared"),
+        )
+
+
+async def test_stacked_pool_multiplexes_four_pages_across_two_daemons() -> None:
+    daemon_bin = _require_daemon_binary()
+    before = _live_daemon_pids(daemon_bin)
+    all_four_active = asyncio.Event()
+    active = 0
+    max_active = 0
+    observed_keys: list[tuple[int, int]] = []
+    live_daemons_at_peak = 0
+
+    async with BrowserPool(
+        size=4,
+        windows_per_browser=2,
+        launch_options=LaunchOptions(backend="mock", daemon_binary=daemon_bin),
+    ) as pool:
+
+        async def worker(idx: int) -> int:
+            nonlocal active, max_active, live_daemons_at_peak
+            async with pool.acquire() as page:
+                assert page.window_id is not None
+                observed_keys.append((id(page._inner._transport), page.window_id))
+                active += 1
+                max_active = max(max_active, active)
+                if active == 4:
+                    live_daemons_at_peak = len(_live_daemon_pids(daemon_bin) - before)
+                    all_four_active.set()
+                await asyncio.wait_for(all_four_active.wait(), timeout=10.0)
+                assert len(await page.snapshot_tree()) == 5
+                await page.get_by_role(Role.BUTTON, name="Search").click()
+                active -= 1
+                return idx
+
+        results = await asyncio.gather(*(worker(i) for i in range(4)))
+        assert sorted(results) == [0, 1, 2, 3]
+        assert max_active == 4
+        # 4 distinct (transport, window_id) leases running across ONLY 2 daemon processes.
+        assert len(set(observed_keys)) == 4
+        assert len({t_id for t_id, _ in observed_keys}) == 2
+        assert live_daemons_at_peak == 2
+
+        stats = pool.stats()
+        assert stats == PoolStats(
+            size=4,
+            active=0,
+            idle=4,
+            launched=2,
+            recycled=0,
+            failed=0,
+        )
+
+    await _assert_no_new_daemons(daemon_bin, before)
+
+
+async def test_stacked_pool_recycles_single_window_without_disrupting_sibling() -> None:
+    daemon_bin = _require_daemon_binary()
+    before = _live_daemon_pids(daemon_bin)
+    both_entered = asyncio.Event()
+    faulty_exited = asyncio.Event()
+    entered = 0
+
+    async with BrowserPool(
+        size=2,
+        windows_per_browser=2,
+        launch_options=LaunchOptions(backend="mock", daemon_binary=daemon_bin),
+    ) as pool:
+
+        async def wait_both() -> None:
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                both_entered.set()
+            await asyncio.wait_for(both_entered.wait(), timeout=10.0)
+
+        async def healthy_worker() -> int:
+            async with pool.acquire() as page:
+                await wait_both()
+                await asyncio.wait_for(faulty_exited.wait(), timeout=10.0)
+                assert len(await page.snapshot_tree()) == 5
+                assert await page.url() == "https://mock.waybound.local/"
+                assert page.window_id is not None
+                return page.window_id
+
+        async def faulty_worker() -> None:
+            try:
+                async with pool.acquire() as page:
+                    await wait_both()
+                    assert page.window_id is not None
+                    msg = "simulated page failure"
+                    raise RuntimeError(msg)
+            finally:
+                faulty_exited.set()
+
+        healthy_task = asyncio.create_task(healthy_worker())
+        with pytest.raises(RuntimeError, match="simulated page failure"):
+            await asyncio.create_task(faulty_worker())
+        healthy_wid = await healthy_task
+
+        assert pool.stats() == PoolStats(size=2, active=0, idle=1, launched=1, recycled=1, failed=0)
+
+        both_again = asyncio.Event()
+        seen_wids: list[int] = []
+
+        async def check_reuse() -> None:
+            async with pool.acquire() as page:
+                assert page.window_id is not None
+                seen_wids.append(page.window_id)
+                if len(seen_wids) == 2:
+                    both_again.set()
+                await asyncio.wait_for(both_again.wait(), timeout=10.0)
+
+        await asyncio.gather(check_reuse(), check_reuse())
+        assert healthy_wid in seen_wids
+        assert len(set(seen_wids)) == 2
+        assert pool.stats().launched == 1
+
+    await _assert_no_new_daemons(daemon_bin, before)
+
+
+async def test_stacked_pool_isolates_override_proxy_on_dedicated_host() -> None:
+    daemon_bin = _require_daemon_binary()
+    before = _live_daemon_pids(daemon_bin)
+
+    async with BrowserPool(
+        size=2,
+        windows_per_browser=2,
+        proxies=("http://127.0.0.1:18081",),
+        launch_options=LaunchOptions(backend="mock", daemon_binary=daemon_bin),
+    ) as pool:
+        async with pool.acquire() as default_page:
+            default_transport_id = id(default_page._inner._transport)
+            async with pool.acquire(proxy="http://127.0.0.1:18082") as override_page:
+                # Must NOT share Chrome/daemon process with a different proxy!
+                assert id(override_page._inner._transport) != default_transport_id
+                assert len(await override_page.snapshot_tree()) == 5
+            # Override host is destroyed on release, while default host stays open.
+            assert pool.stats().recycled == 1
+            assert len(await default_page.snapshot_tree()) == 5
+        assert pool.stats().launched == 2
+        assert pool.stats().idle == 1
+
+    await _assert_no_new_daemons(daemon_bin, before)
+
+
+async def test_stacked_pool_sole_window_recycle_retires_and_destroys_host_cleanly() -> None:
+    daemon_bin = _require_daemon_binary()
+    before = _live_daemon_pids(daemon_bin)
+
+    async with BrowserPool(
+        size=2,
+        windows_per_browser=2,
+        launch_options=LaunchOptions(backend="mock", daemon_binary=daemon_bin),
+    ) as pool:
+
+        async def fail_sole_window() -> None:
+            async with pool.acquire() as page:
+                assert page.window_id is not None
+                assert len(_live_daemon_pids(daemon_bin) - before) == 1
+                msg = "sole window boom"
+                raise RuntimeError(msg)
+
+        with pytest.raises(RuntimeError, match="sole window boom"):
+            await fail_sole_window()
+
+        # Recycling the only window on the host retires & destroys the host directly
+        # instead of closing Chrome's last window + pinging it, and never increments `failed`.
+        assert pool.stats() == PoolStats(size=2, active=0, idle=0, launched=1, recycled=1, failed=0)
+        assert not pool._hosts
+        assert not pool._retiring_hosts
+        await _assert_no_new_daemons(daemon_bin, before)
+
+        async with pool.acquire() as fresh_page:
+            assert len(await fresh_page.snapshot_tree()) == 5
+        assert pool.stats() == PoolStats(size=2, active=0, idle=1, launched=2, recycled=1, failed=0)
+
+    await _assert_no_new_daemons(daemon_bin, before)
+
+
+async def test_stacked_pool_close_tears_down_retired_hosts_with_active_windows() -> None:
+    daemon_bin = _require_daemon_binary()
+    before = _live_daemon_pids(daemon_bin)
+    entered = asyncio.Event()
+    release_window = asyncio.Event()
+
+    pool = BrowserPool(
+        size=2,
+        windows_per_browser=2,
+        launch_options=LaunchOptions(backend="mock", daemon_binary=daemon_bin),
+    )
+
+    async def hold_window() -> None:
+        async with pool.acquire() as page:
+            assert page.window_id is not None
+            entered.set()
+            await asyncio.wait_for(release_window.wait(), timeout=10.0)
+
+    holder = asyncio.create_task(hold_window())
+    await asyncio.wait_for(entered.wait(), timeout=10.0)
+    assert len(pool._hosts) == 1
+    host = pool._hosts[0]
+    assert len(_live_daemon_pids(daemon_bin) - before) == 1
+
+    # Retire the host while its window is still checked out; it stays alive in `_retiring_hosts`.
+    pool._retire_host(host)
+    assert not pool._hosts
+    assert host in pool._retiring_hosts
+    assert len(_live_daemon_pids(daemon_bin) - before) == 1
+
+    # `pool.close()` must tear down retired hosts even while their windows are still active.
+    await pool.close()
+    assert not pool._retiring_hosts
+    await _assert_no_new_daemons(daemon_bin, before)
+
+    release_window.set()
+    await holder
+    await _assert_no_new_daemons(daemon_bin, before)
+
+
+async def test_profile_dir_rejects_per_checkout_proxy_override(tmp_path: Path) -> None:
+    pool = BrowserPool(
+        size=2,
+        windows_per_browser=2,
+        launch_options=LaunchOptions(backend="mock", profile_dir=tmp_path / "single"),
+    )
+    with pytest.raises(ValueError, match="profile_dir"):
+        async with pool.acquire(proxy="http://127.0.0.1:18089"):
+            pass
+    await pool.close()

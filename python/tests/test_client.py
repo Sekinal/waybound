@@ -20,9 +20,11 @@ from waybound import (
     Role,
     SessionFingerprint,
     SupportsWebSocketFrames,
+    SupportsWindows,
     WayboundDaemonError,
     WebSocketDirection,
     WebSocketOpcode,
+    WindowSummary,
 )
 from waybound.mcp_server import handle_rpc_message
 from waybound.transport import (
@@ -660,3 +662,149 @@ async def test_async_page_links_returns_only_links_with_non_empty_url() -> None:
     found = await async_page.links()
     assert [n.id for n in found] == ["l1"]
     assert found[0].url == "https://example.com/docs"
+
+
+class _WindowRecordingTransport(UnixSocketTransport):
+    """Socket-free transport returning realistic window responses while recording payloads."""
+
+    def __init__(self) -> None:
+        self._base_timeout_s = 30.0
+        self.requests: list[dict[str, object]] = []
+
+    def _request(
+        self,
+        payload: dict[str, object],
+        *,
+        timeout_override_s: float | None = None,
+    ) -> dict[str, object]:
+        _ = timeout_override_s
+        self.requests.append(payload)
+        method = payload.get("method")
+        if method == "list_windows":
+            return {
+                "status": "windows",
+                "windows": [
+                    {
+                        "id": 1,
+                        "title": "Main",
+                        "app_id": "google-chrome",
+                        "width": 1280,
+                        "height": 800,
+                        "has_buffer": True,
+                    }
+                ],
+            }
+        if method == "new_window":
+            return {
+                "status": "window",
+                "window": {
+                    "id": 6,
+                    "title": "Second",
+                    "app_id": "google-chrome",
+                    "width": 1280,
+                    "height": 800,
+                    "has_buffer": True,
+                },
+            }
+        if method in ("snapshot_tree", "locate_all"):
+            return {"status": "tree", "nodes": [], "truncated": False}
+        if method == "current_url":
+            return {"status": "url", "url": "https://scoped.example/"}
+        if method in ("wait_for", "set_checked"):
+            return {
+                "status": "node",
+                "node": {
+                    "id": "n1",
+                    "role": "check_box",
+                    "name": "Agree",
+                    "value": None,
+                    "bounds": {"x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0},
+                    "focused": False,
+                    "checked": True,
+                },
+            }
+        return {"status": "ok"}
+
+
+def test_window_scoping_payloads_and_lifecycle() -> None:
+    transport = _WindowRecordingTransport()
+    assert isinstance(transport, SupportsWindows)
+    root = Page(transport)
+    assert root.window_id is None
+
+    # Unscoped Page omits window_id for backwards compatibility.
+    root.goto("https://default.example/")
+    root.get_by_role(Role.BUTTON, name="Go").click()
+    assert "window_id" not in transport.requests[0]
+    assert "window_id" not in transport.requests[1]
+
+    with pytest.raises(ValueError, match="unscoped"):
+        root.close_window()
+
+    wins = root.list_windows()
+    assert wins == [
+        WindowSummary(
+            id=1,
+            title="Main",
+            app_id="google-chrome",
+            width=1280,
+            height=800,
+            has_buffer=True,
+        )
+    ]
+
+    scoped = root.new_page("https://second.example/", incognito=True)
+    assert scoped.window_id == 6
+    assert transport.requests[-1] == {
+        "method": "new_window",
+        "url": "https://second.example/",
+        "incognito": True,
+    }
+
+    transport.requests.clear()
+    scoped.url()
+    scoped.goto("https://scoped.example/")
+    scoped.reload()
+    scoped.go_back()
+    scoped.go_forward()
+    scoped.scroll(delta_x=1.0, delta_y=-2.0)
+    scoped.press("enter")
+    scoped.snapshot_tree()
+    scoped.get_by_role(Role.GROUP, name="Card").get_by_role(Role.BUTTON, name="Buy").first.click()
+    scoped.get_by_text("Hello").hover()
+    scoped.get_by_role(Role.TEXTBOX, name="Q").fill("abc")
+    scoped.get_by_role(Role.CHECKBOX, name="Agree").check()
+    scoped.get_by_role(Role.BUTTON, name="A").drag_to(scoped.get_by_role(Role.BUTTON, name="B"))
+    assert all(req.get("window_id") == 6 for req in transport.requests)
+
+    scoped.close_window()
+    assert transport.requests[-1] == {"method": "close_window", "window_id": 6}
+
+
+def test_legacy_transport_without_window_support_degrades_clearly() -> None:
+    legacy = FakeTransport()
+    assert not isinstance(legacy, SupportsWindows)
+    page = Page(legacy)
+    with pytest.raises(NotImplementedError, match="list_windows"):
+        page.list_windows()
+    with pytest.raises(NotImplementedError, match="new_window"):
+        page.new_page()
+    with pytest.raises(ValueError, match="window_id"):
+        Page(legacy, window_id=-1)
+    with pytest.raises(ValueError, match="window_id"):
+        Page(legacy, window_id=1.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="window_id"):
+        Page(legacy, window_id=True)
+
+
+def test_transport_window_id_validation_and_null_summary_fields() -> None:
+    transport = _WindowRecordingTransport()
+    with pytest.raises(ValueError, match="window_id"):
+        transport.close_window(1.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="window_id"):
+        transport.close_window(True)
+
+    from waybound.transport import _parse_window_summary  # noqa: PLC0415
+
+    parsed = _parse_window_summary({"id": 3, "title": None, "app_id": None})
+    assert parsed == WindowSummary(id=3, title="", app_id="", width=0, height=0, has_buffer=False)

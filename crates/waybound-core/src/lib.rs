@@ -34,4 +34,4 @@ pub use network::{
     CapturedResponse, CapturedWebSocketFrame, HttpHeader, NetworkStats, WebSocketDirection,
     WebSocketOpcode,
 };
-pub use protocol::{Request, Response};
+pub use protocol::{Request, Response, WindowSummary, WireRequest, parse_wire_request};

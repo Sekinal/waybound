@@ -10,7 +10,13 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { resolveDaemonBinary } from "./binary.js";
 import { Page } from "./client.js";
 import { WayboundDaemonError, WayboundLaunchError } from "./errors.js";
-import { checkMs, DEFAULT_TIMEOUT_MS, type Endpoint, Transport } from "./transport.js";
+import {
+  checkMs,
+  DEFAULT_TIMEOUT_MS,
+  type Endpoint,
+  type PingHealth,
+  Transport,
+} from "./transport.js";
 import { BLOCK_PRESETS } from "./types.js";
 
 const BLOCK_PRESET_SET: ReadonlySet<string> = new Set(BLOCK_PRESETS);
@@ -281,6 +287,14 @@ export class Session {
   /** Send a health-check `ping` to the daemon and return its version string. */
   ping(timeoutMs?: number): Promise<string> {
     return this.#transport.ping(timeoutMs);
+  }
+
+  /** Send a health-check `ping` to the daemon and return version + browser liveness. */
+  pingHealth(timeoutMs?: number): Promise<PingHealth> {
+    if (hasExited(this.#child)) {
+      return Promise.reject(new Error("waybound-daemon process has exited"));
+    }
+    return this.#transport.pingHealth(timeoutMs);
   }
 
   /**

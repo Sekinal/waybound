@@ -1,5 +1,6 @@
 //! Line-delimited JSON-RPC server over a local Unix domain socket or loopback TCP socket.
 
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -18,13 +19,13 @@ use std::time::{Duration, Instant};
 
 use waybound_core::{
     BackendKind, Driver, InputEvent, KeyCode, KeyModifier, LocatorQuery, MotionConfig, MouseButton,
-    Point, Request, Response, Result, Role, SplitMix64, WayboundError, hover_pause_before_click,
-    key_delay, key_hold_ms, mouse_hold_ms, pick_click_point, plan_human_pointer_path,
-    plan_scroll_burst,
+    Point, Request, Response, Result, Role, SplitMix64, WayboundError, WindowSummary, WireRequest,
+    hover_pause_before_click, key_delay, key_hold_ms, mouse_hold_ms, parse_wire_request,
+    pick_click_point, plan_human_pointer_path, plan_scroll_burst,
 };
 use waybound_net::{FingerprintRecorder, InflightCounter, wait_for_network_idle};
 
-use crate::launcher::BrowserProbe;
+use crate::launcher::{BrowserProbe, WindowOpener, validate_window_url};
 use crate::net_tap::ResponseStore;
 use crate::proxy::ProxyStats;
 
@@ -76,6 +77,8 @@ pub struct ServerOptions {
     pub proxy_stats: Option<Arc<ProxyStats>>,
     /// Liveness probe for the browser this daemon launched, reported by `ping`.
     pub browser: Option<BrowserProbe>,
+    /// Optional Chrome `--new-window` launcher (set for `--headless-wayland --launch-chrome`).
+    pub window_opener: Option<WindowOpener>,
     /// Set when the shutdown was requested by the SDK's `shutdown` request (as opposed to a
     /// signal, the parent watchdog or an error), see `lifetime::Lifetime::finish`.
     pub sdk_shutdown: Arc<AtomicBool>,
@@ -84,6 +87,8 @@ pub struct ServerOptions {
 struct SessionState {
     /// Last pointer position sent by the daemon; `None` until the first move.
     last_cursor: Mutex<Option<Point>>,
+    /// Serializes `NewWindow` opener calls so concurrent requests never claim the same window ID.
+    new_window_lock: Mutex<()>,
     /// Mouse buttons currently held by in-flight drags; shutdown waits for this to drop to 0.
     held_buttons: AtomicUsize,
     shutdown: Arc<AtomicBool>,
@@ -99,12 +104,87 @@ impl SessionState {
     ) -> Self {
         Self {
             last_cursor: Mutex::new(None),
+            new_window_lock: Mutex::new(()),
             held_buttons: AtomicUsize::new(0),
             shutdown,
             responses,
             options,
         }
     }
+}
+
+const NEW_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const NEW_WINDOW_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn handle_wire_request(driver: &dyn Driver, state: &SessionState, wire: WireRequest) -> Response {
+    if let Some(wid) = wire.window_id {
+        let Some(scoped) = driver.for_window(wid) else {
+            return Response::from(&WayboundError::ElementNotFound {
+                query: format!("window {wid}"),
+            });
+        };
+        return handle_request(scoped.as_ref(), state, wire.request);
+    }
+    handle_request(driver, state, wire.request)
+}
+
+fn open_new_window(
+    driver: &dyn Driver,
+    state: &SessionState,
+    url: Option<&str>,
+    incognito: bool,
+) -> Result<WindowSummary> {
+    if let Some(dest) = url {
+        validate_window_url(dest)?;
+    }
+
+    if let Some(opener) = &state.options.window_opener {
+        let _guard = state
+            .new_window_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .options
+            .browser
+            .as_ref()
+            .is_some_and(|b| !b.is_alive())
+        {
+            return Err(WayboundError::BackendUnavailable {
+                backend: "wayland-compositor".to_owned(),
+                reason: "primary Chrome process is no longer running".to_owned(),
+            });
+        }
+        let existing: HashSet<u64> = driver.list_windows()?.into_iter().map(|w| w.id).collect();
+        opener.open_new_window(url, incognito)?;
+        let deadline = Instant::now() + NEW_WINDOW_TIMEOUT;
+        while Instant::now() < deadline {
+            if state.shutdown.load(Ordering::Acquire) {
+                return Err(WayboundError::Io(std::io::Error::new(
+                    ErrorKind::Interrupted,
+                    "daemon shutting down while waiting for new window",
+                )));
+            }
+            for win in driver.list_windows()? {
+                if !existing.contains(&win.id) {
+                    return Ok(win);
+                }
+            }
+            thread::sleep(NEW_WINDOW_POLL_INTERVAL);
+        }
+        return Err(WayboundError::Timeout {
+            timeout_ms: u64::try_from(NEW_WINDOW_TIMEOUT.as_millis()).unwrap_or(10_000),
+            context: "timed out waiting for new browser window to appear in compositor".to_owned(),
+        });
+    }
+
+    if let Some(window) = driver.open_window(url, incognito)? {
+        return Ok(window);
+    }
+
+    Err(WayboundError::UnsupportedInput {
+        backend: format!("{:?}", driver.backend_kind()),
+        reason: "new_window requires --headless-wayland with --launch-chrome".to_owned(),
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -300,6 +380,20 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
                 Err(err) => Response::from(&err),
             }
         }
+        Request::ListWindows => match driver.list_windows() {
+            Ok(windows) => Response::Windows { windows },
+            Err(err) => Response::from(&err),
+        },
+        Request::NewWindow { url, incognito } => {
+            match open_new_window(driver, state, url.as_deref(), incognito) {
+                Ok(window) => Response::Window { window },
+                Err(err) => Response::from(&err),
+            }
+        }
+        Request::CloseWindow { window_id } => match driver.close_window(window_id) {
+            Ok(()) => Response::Ok,
+            Err(err) => Response::from(&err),
+        },
     }
 }
 
@@ -1549,8 +1643,8 @@ fn handle_io_streams<R: Read, W: Write>(
             continue;
         }
 
-        let response = match serde_json::from_str::<Request>(trimmed) {
-            Ok(request) => handle_request(driver, state, request),
+        let response = match parse_wire_request(trimmed) {
+            Ok(wire) => handle_wire_request(driver, state, wire),
             Err(err) => Response::Error {
                 code: "invalid_request".to_owned(),
                 message: err.to_string(),
@@ -1581,6 +1675,7 @@ mod tests {
                 fingerprint: FingerprintRecorder::new(),
                 proxy_stats: None,
                 browser: None,
+                window_opener: None,
                 sdk_shutdown: Arc::new(AtomicBool::new(false)),
             },
             Arc::new(ResponseStore::default()),
@@ -1596,6 +1691,7 @@ mod tests {
                 fingerprint: FingerprintRecorder::new(),
                 proxy_stats: None,
                 browser: None,
+                window_opener: None,
                 sdk_shutdown: Arc::new(AtomicBool::new(false)),
             },
             Arc::new(ResponseStore::default()),
@@ -2814,6 +2910,7 @@ mod tests {
                 fingerprint: FingerprintRecorder::new(),
                 proxy_stats: Some(forwarder.stats_handle()),
                 browser: None,
+                window_opener: None,
                 sdk_shutdown: Arc::new(AtomicBool::new(false)),
             },
             Arc::new(ResponseStore::default()),
@@ -2849,5 +2946,335 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn multi_window_requests_and_window_id_routing_over_json_lines() {
+        let driver = MockDriver::sample_page();
+        let st = state();
+
+        // Feed a sequence of JSON-lines requests through handle_io_streams:
+        // 1. list_windows (initial 1 mock window)
+        // 2. new_window with URL and incognito
+        // 3. new_window with rejected URL scheme
+        // 4. current_url scoped to window 2
+        // 5. press scoped to window 2
+        // 6. press unscoped (backwards compatible)
+        // 7. press scoped to unknown window 999
+        // 8. close_window for window 2
+        // 9. list_windows (back to 1 window)
+        let input = [
+            r#"{"method":"list_windows"}"#,
+            r#"{"method":"new_window","url":"https://win2.example/","incognito":true}"#,
+            r#"{"method":"new_window","url":"file:///etc/passwd"}"#,
+            r#"{"method":"current_url","window_id":2}"#,
+            r#"{"method":"press","window_id":2,"key":{"char":"x"}}"#,
+            r#"{"method":"press","key":{"char":"y"}}"#,
+            r#"{"method":"press","window_id":999,"key":{"char":"z"}}"#,
+            r#"{"method":"close_window","window_id":2}"#,
+            r#"{"method":"list_windows"}"#,
+        ]
+        .join("\n")
+            + "\n";
+
+        let mut output: Vec<u8> = Vec::new();
+        let res = handle_io_streams(input.as_bytes(), &mut output, &driver, &st);
+        assert!(res.is_ok(), "{res:?}");
+
+        let text = String::from_utf8(output).unwrap_or_default();
+        let responses: Vec<Response> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Response>(line).ok())
+            .collect();
+        assert_eq!(responses.len(), 9, "raw output: {text}");
+
+        // 1. Initial window list has window 1.
+        assert!(matches!(
+            &responses[0],
+            Response::Windows { windows } if windows.len() == 1 && windows[0].id == 1
+        ));
+
+        // 2. new_window created window 2.
+        assert!(matches!(
+            &responses[1],
+            Response::Window { window }
+                if window.id == 2 && window.title.contains("Incognito")
+        ));
+
+        // 3. Invalid URL scheme rejected.
+        assert!(matches!(
+            &responses[2],
+            Response::Error { code, .. } if code == "io_error"
+        ));
+
+        // 4. current_url scoped to window 2 returns window 2's URL.
+        assert_eq!(
+            responses[3],
+            Response::Url {
+                url: Some("https://win2.example/".to_owned()),
+            }
+        );
+
+        // 5 & 6. Scoped and unscoped press succeeded.
+        assert_eq!(responses[4], Response::Ok);
+        assert_eq!(responses[5], Response::Ok);
+
+        // 7. Unknown window_id returns element_not_found.
+        assert!(matches!(
+            &responses[6],
+            Response::Error { code, .. } if code == "element_not_found"
+        ));
+
+        // 8. close_window succeeded.
+        assert_eq!(responses[7], Response::Ok);
+
+        // 9. list_windows now only contains window 1.
+        assert!(matches!(
+            &responses[8],
+            Response::Windows { windows } if windows.len() == 1 && windows[0].id == 1
+        ));
+
+        // Verify the driver recorded the exact window_id routing for the key presses.
+        let scoped = driver.recorded_scoped_events();
+        assert_eq!(scoped.len(), 2);
+        assert_eq!(scoped[0].0, Some(2));
+        assert_eq!(scoped[1].0, None);
+    }
+
+    #[test]
+    fn new_window_returns_unsupported_when_driver_and_opener_absent() {
+        let driver = FatalDriver(AtomicUsize::new(0));
+        let st = state();
+        let resp = handle_request(
+            &driver,
+            &st,
+            Request::NewWindow {
+                url: Some("about:blank".to_owned()),
+                incognito: false,
+            },
+        );
+        assert!(matches!(
+            resp,
+            Response::Error { ref code, ref message }
+                if code == "unsupported_input" && message.contains("--headless-wayland")
+        ));
+    }
+
+    #[cfg(unix)]
+    fn launch_fake_chrome_script(
+        binary: &Path,
+        profile_dir: PathBuf,
+    ) -> Result<crate::launcher::LaunchedChrome> {
+        let opts = crate::launcher::ChromeLaunchOptions {
+            binary_path: Some(binary.to_path_buf()),
+            profile_dir: Some(profile_dir),
+            ssl_keylog_file: None,
+            initial_url: None,
+            proxy_server: None,
+            timezone: None,
+            locale: None,
+            display: None,
+            wayland_display: None,
+            focus: false,
+            password_store: None,
+        };
+        for attempt in 0..20 {
+            match crate::launcher::launch_chrome(&opts) {
+                Err(WayboundError::Io(ref err))
+                    if err.kind() == ErrorKind::ExecutableFileBusy && attempt < 19 =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+        crate::launcher::launch_chrome(&opts)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_window_rejects_when_primary_browser_is_dead() {
+        let scratch = std::env::temp_dir().join(format!(
+            "wb-server-dead-browser-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        assert!(fs::create_dir_all(&scratch).is_ok());
+
+        let script = scratch.join("short-lived.sh");
+        let orphan_marker = scratch.join("short-lived.sh.orphan");
+        let body = "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--new-window\" ]; then\n    : > \"$0.orphan\"\n  fi\ndone\nexit 0\n";
+        assert!(fs::write(&script, body).is_ok());
+        assert!(fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).is_ok());
+
+        let launched = launch_fake_chrome_script(&script, scratch.join("profile"));
+        assert!(launched.is_ok(), "{:?}", launched.as_ref().err());
+        if let Ok(launched) = launched {
+            let probe = launched.probe();
+            let opener = launched.window_opener();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while probe.is_alive() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!probe.is_alive(), "short-lived fake browser did not exit");
+
+            let st = SessionState::new(
+                ServerOptions {
+                    use_motion: false,
+                    inflight: InflightCounter::default(),
+                    fingerprint: FingerprintRecorder::new(),
+                    proxy_stats: None,
+                    browser: Some(probe),
+                    window_opener: Some(opener),
+                    sdk_shutdown: Arc::new(AtomicBool::new(false)),
+                },
+                Arc::new(ResponseStore::default()),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let driver = MockDriver::sample_page();
+            let resp = handle_request(
+                &driver,
+                &st,
+                Request::NewWindow {
+                    url: Some("about:blank".to_owned()),
+                    incognito: false,
+                },
+            );
+            assert!(
+                matches!(
+                    resp,
+                    Response::Error { ref code, ref message }
+                        if code == "backend_unavailable"
+                            && message.contains("primary Chrome process is no longer running")
+                ),
+                "unexpected response: {resp:?}"
+            );
+            assert!(
+                !orphan_marker.exists(),
+                "opener must not spawn an orphan process when primary browser is dead"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(unix)]
+    struct FileBackedWindowDriver {
+        log_file: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Driver for FileBackedWindowDriver {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::LinuxWayland
+        }
+
+        fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
+            Ok(Vec::new())
+        }
+
+        fn dispatch_input(&self, _event: &InputEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn list_windows(&self) -> Result<Vec<WindowSummary>> {
+            let count =
+                fs::read_to_string(&self.log_file).map_or(0, |contents| contents.lines().count());
+            Ok((1..=count)
+                .map(|i| WindowSummary {
+                    id: u64::try_from(i).unwrap_or(u64::MAX),
+                    title: format!("Window {i}"),
+                    app_id: "google-chrome".to_owned(),
+                    width: 1920,
+                    height: 1080,
+                    has_buffer: true,
+                })
+                .collect())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_new_window_requests_are_serialized_and_return_distinct_ids() {
+        let scratch = std::env::temp_dir().join(format!(
+            "wb-server-concurrent-win-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        assert!(fs::create_dir_all(&scratch).is_ok());
+
+        let log_file = scratch.join("windows.log");
+        let script = scratch.join("multiwin-chrome.sh");
+        let body = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--new-window\" ]; then\n    sleep 0.08\n    printf '1\\n' >> '{}'\n    exit 0\n  fi\ndone\nexec sleep 30\n",
+            log_file.display()
+        );
+        assert!(fs::write(&script, body).is_ok());
+        assert!(fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).is_ok());
+
+        let launched = launch_fake_chrome_script(&script, scratch.join("profile"));
+        assert!(launched.is_ok(), "{:?}", launched.as_ref().err());
+        if let Ok(launched) = launched {
+            let probe = launched.probe();
+            let opener = launched.window_opener();
+            assert!(probe.is_alive());
+
+            let st = Arc::new(SessionState::new(
+                ServerOptions {
+                    use_motion: false,
+                    inflight: InflightCounter::default(),
+                    fingerprint: FingerprintRecorder::new(),
+                    proxy_stats: None,
+                    browser: Some(probe),
+                    window_opener: Some(opener),
+                    sdk_shutdown: Arc::new(AtomicBool::new(false)),
+                },
+                Arc::new(ResponseStore::default()),
+                Arc::new(AtomicBool::new(false)),
+            ));
+            let driver = Arc::new(FileBackedWindowDriver { log_file });
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let st_clone = Arc::clone(&st);
+                let driver_clone = Arc::clone(&driver);
+                let barrier_clone = Arc::clone(&barrier);
+                handles.push(thread::spawn(move || {
+                    let _ = barrier_clone.wait();
+                    open_new_window(
+                        driver_clone.as_ref(),
+                        st_clone.as_ref(),
+                        Some("about:blank"),
+                        false,
+                    )
+                }));
+            }
+
+            let mut ids: Vec<u64> = Vec::new();
+            for handle in handles {
+                let res = handle.join();
+                assert!(res.is_ok(), "worker thread panicked");
+                if let Ok(win_res) = res {
+                    assert!(win_res.is_ok(), "open_new_window failed: {win_res:?}");
+                    if let Ok(win) = win_res {
+                        ids.push(win.id);
+                    }
+                }
+            }
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                vec![1, 2],
+                "concurrent NewWindow requests must return distinct window IDs"
+            );
+            drop(launched);
+        }
+
+        let _ = fs::remove_dir_all(&scratch);
     }
 }

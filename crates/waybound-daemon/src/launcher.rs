@@ -59,6 +59,113 @@ pub const PASSWORD_STORES: &[&str] = &[
     "detect",
 ];
 
+/// Validates that a URL passed to `new_window` is `about:blank`, `http://`, or `https://`.
+///
+/// # Errors
+///
+/// Returns [`WayboundError::Io`] (`InvalidInput`) for any other URL scheme.
+pub fn validate_window_url(url: &str) -> Result<()> {
+    if url == "about:blank" || url.starts_with("http://") || url.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(WayboundError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "url must be about:blank or start with http:// or https://",
+        )))
+    }
+}
+
+/// How long [`WindowOpener::open_new_window`] waits for the short-lived `--new-window`
+/// handoff process to exit before detaching a reaper thread.
+const WINDOW_OPENER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Handle capable of opening additional windows inside an already-running Chrome profile.
+#[derive(Debug, Clone)]
+pub struct WindowOpener {
+    chrome_bin: PathBuf,
+    profile_dir: PathBuf,
+    wayland_display: Option<(String, PathBuf)>,
+    display: Option<String>,
+    proxy_arg: Option<String>,
+}
+
+impl WindowOpener {
+    /// Spawns a secondary Chrome invocation with `--new-window` pointing at the same
+    /// `--user-data-dir`, forwarding the request over Chrome's `SingletonSocket` so the
+    /// existing browser process opens a new window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `url` has an unsupported scheme, spawning fails, or the helper
+    /// process exits with a non-zero status.
+    pub fn open_new_window(&self, url: Option<&str>, incognito: bool) -> Result<()> {
+        if let Some(dest) = url {
+            validate_window_url(dest)?;
+        }
+
+        let mut cmd = waybound_core::process::command(&self.chrome_bin);
+        let _ = cmd
+            .arg(format!("--user-data-dir={}", self.profile_dir.display()))
+            .arg("--new-window")
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        if incognito {
+            let _ = cmd.arg("--incognito");
+        }
+        if let Some(proxy) = &self.proxy_arg {
+            let _ = cmd.arg(format!("--proxy-server={proxy}"));
+        }
+        if let Some((wayland_display, runtime_dir)) = &self.wayland_display {
+            let _ = cmd
+                .arg("--ozone-platform=wayland")
+                .arg("--disable-gpu")
+                .arg("--disable-gpu-compositing")
+                .arg("--disable-dev-shm-usage")
+                .env("WAYLAND_DISPLAY", wayland_display)
+                .env("XDG_RUNTIME_DIR", runtime_dir)
+                .env_remove("DISPLAY");
+        } else if let Some(display) = &self.display {
+            let _ = cmd.env("DISPLAY", display);
+        }
+        if let Some(dest) = url {
+            let _ = cmd.arg(dest);
+        }
+
+        let mut child = cmd.spawn().map_err(WayboundError::Io)?;
+        let deadline = std::time::Instant::now() + WINDOW_OPENER_WAIT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        return Ok(());
+                    }
+                    return Err(WayboundError::BackendUnavailable {
+                        backend: "chrome_launcher".to_owned(),
+                        reason: format!("Chrome --new-window helper exited with {status}"),
+                    });
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    // Do not hang or leave a zombie if the helper takes longer to exit.
+                    let _ = std::thread::Builder::new()
+                        .name("waybound-window-reaper".to_owned())
+                        .spawn(move || {
+                            let _ = child.wait();
+                        });
+                    return Ok(());
+                }
+                Err(err) => return Err(WayboundError::Io(err)),
+            }
+        }
+    }
+}
+
 /// RAII handle owning a spawned Google Chrome process.
 ///
 /// The `Child` is shared with [`BrowserProbe`], whose `try_wait` may *reap* the process. After
@@ -70,6 +177,7 @@ pub struct LaunchedChrome {
     pid: i32,
     /// Temporary profile owned by this launch (removed on drop), if one was created.
     temp_profile: Option<PathBuf>,
+    window_opener: WindowOpener,
 }
 
 impl LaunchedChrome {
@@ -85,6 +193,12 @@ impl LaunchedChrome {
         BrowserProbe {
             child: Arc::clone(&self.child),
         }
+    }
+
+    /// Returns a [`WindowOpener`] bound to this Chrome binary, profile, and display.
+    #[must_use]
+    pub fn window_opener(&self) -> WindowOpener {
+        self.window_opener.clone()
     }
 }
 
@@ -351,6 +465,14 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
         reason: "spawned Chrome PID exceeded i32 range".to_owned(),
     })?;
 
+    let window_opener = WindowOpener {
+        chrome_bin: binary.clone(),
+        profile_dir,
+        wayland_display: options.wayland_display.clone(),
+        display: options.display.clone(),
+        proxy_arg: options.proxy_server.clone(),
+    };
+
     tracing::info!(pid, binary = %binary.display(), "launched unmodified Google Chrome");
     if options.focus && cfg!(target_os = "macos") {
         focus_macos_pid(pid);
@@ -359,6 +481,7 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
         child: Arc::new(Mutex::new(child)),
         pid,
         temp_profile,
+        window_opener,
     })
 }
 
@@ -696,6 +819,84 @@ mod tests {
             "did not wait for a graceful exit"
         );
         assert!(elapsed < GRACEFUL_EXIT_TIMEOUT + Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn window_opener_passes_wayland_flags_and_validates_url() {
+        let scratch = create_temp_profile_dir().unwrap_or_default();
+        assert!(scratch.is_dir(), "could not create scratch dir");
+        let script = scratch.join("handoff-chrome.sh");
+        #[allow(clippy::literal_string_with_formatting_args)]
+        let body = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nprintf 'WAYLAND_DISPLAY=%s\\nXDG_RUNTIME_DIR=%s\\nDISPLAY=%s\\n' \"${WAYLAND_DISPLAY:-}\" \"${XDG_RUNTIME_DIR:-}\" \"${DISPLAY:-}\" > \"$0.env\"\nexit 0\n";
+        assert!(std::fs::write(&script, body).is_ok());
+        assert!(std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).is_ok());
+
+        let runtime_dir = scratch.join("xdg");
+        let profile_dir = scratch.join("profile");
+        assert!(std::fs::create_dir_all(&runtime_dir).is_ok());
+        assert!(std::fs::create_dir_all(&profile_dir).is_ok());
+
+        let opener = WindowOpener {
+            chrome_bin: script.clone(),
+            profile_dir: profile_dir.clone(),
+            wayland_display: Some(("wb-wl-test".to_owned(), runtime_dir.clone())),
+            display: Some(":99".to_owned()),
+            proxy_arg: Some("http://127.0.0.1:8080".to_owned()),
+        };
+
+        assert!(
+            opener
+                .open_new_window(Some("file:///etc/passwd"), false)
+                .is_err()
+        );
+        assert!(
+            opener
+                .open_new_window(Some("javascript:alert(1)"), false)
+                .is_err()
+        );
+
+        let mut open_result = Err(WayboundError::Transient {
+            backend: "test".to_owned(),
+            reason: "not run".to_owned(),
+        });
+        for attempt in 0..20 {
+            match opener.open_new_window(Some("https://example.com/win2"), true) {
+                Err(WayboundError::Io(ref err))
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 19 =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => {
+                    open_result = other;
+                    break;
+                }
+            }
+        }
+        assert!(
+            open_result.is_ok(),
+            "open_new_window failed: {open_result:?}"
+        );
+
+        let args_text =
+            std::fs::read_to_string(format!("{}.args", script.display())).unwrap_or_default();
+        let args: Vec<&str> = args_text.lines().collect();
+        assert!(args.contains(&"--new-window"));
+        assert!(args.contains(&"--incognito"));
+        assert!(args.contains(&"--ozone-platform=wayland"));
+        assert!(args.contains(&"--proxy-server=http://127.0.0.1:8080"));
+        assert!(args.contains(&"https://example.com/win2"));
+        assert!(
+            args.iter()
+                .any(|a| *a == format!("--user-data-dir={}", profile_dir.display()))
+        );
+
+        let env_text =
+            std::fs::read_to_string(format!("{}.env", script.display())).unwrap_or_default();
+        assert!(env_text.contains("WAYLAND_DISPLAY=wb-wl-test\n"));
+        assert!(env_text.contains(&format!("XDG_RUNTIME_DIR={}\n", runtime_dir.display())));
+        assert!(env_text.contains("DISPLAY=\n"));
+
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
