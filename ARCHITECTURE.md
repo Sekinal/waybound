@@ -107,10 +107,18 @@ The default walk is **pipelined**: up to 64 nodes have their calls in flight at 
 one connection, and replies are consumed in breadth-first order, so the node list (order,
 ids, fields, `max_nodes` truncation) is the same as a one-call-at-a-time walk while the
 D-Bus round trip is paid once per window instead of once per call. Nothing is cached
-between snapshots, so a snapshot always reflects the live page. If a call fails at the
-transport level (I/O error, bus limits), the snapshot is redone with the original
-**sequential** walk, which is kept as the reference. Set `WAYBOUND_ATSPI_WALK=sequential`
-in the daemon's environment to force it; the walk used is logged at `debug` level.
+between snapshots, so a snapshot always reflects the live page. The original
+**sequential** walk is kept as the reference, and the snapshot is redone with it if the bus
+refuses the pipelined walk's outstanding calls (`LimitsExceeded`). Set
+`WAYBOUND_ATSPI_WALK=sequential` in the daemon's environment to force it; the walk used is
+logged at `debug` level.
+
+**Time limits.** Each AT-SPI2 call times out after 6 s and each snapshot / URL / viewport
+lookup stops starting calls after 15 s, so a hung or stopped browser yields a `timeout`
+error within about 6 s (and never more than about 21 s, under the SDKs' 30 s request
+timeout) instead of holding the driver for the bus's 5-minute reply timeout. A stall
+shorter than 6 s only delays the snapshot. The connection stays usable after a timeout;
+a dead connection (I/O error) fails the request and the driver reconnects on the next one.
 
 `scripts/atspi_walk_bench.sh` (not run in CI) benchmarks both walks against real Chromium
 in the container and checks that they return identical snapshots. Measured on arm64

@@ -20,9 +20,11 @@ pub use xvfb::{HeadlessDisplayConfig, HeadlessDisplaySession};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use tracing::debug;
+use tracing::{debug, warn};
 use waybound_compositor::HeadlessCompositor;
-use waybound_core::{AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Result};
+use waybound_core::{
+    AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Result, WayboundError,
+};
 
 /// Native Linux browser driver targeting unmodified Chrome/Chromium.
 ///
@@ -156,7 +158,32 @@ impl LinuxDriver {
                 }
             }
         }
-        guard.as_mut().map(op)
+        let client = guard.as_mut()?;
+        let result = op(client);
+        if client.is_broken() {
+            warn!("AT-SPI2 connection lost; reconnecting on the next request");
+            *guard = None;
+        }
+        drop(guard);
+        Some(result)
+    }
+
+    /// Runs `op` on the native AT-SPI2 client. `Ok(Some(_))` is its answer; `Ok(None)` asks
+    /// the caller to fall back to the `python3` helper. A native timeout is returned as is:
+    /// a browser that stopped answering would only hang the helper for 10 s too.
+    fn native_atspi<T, F>(&self, op: F) -> Result<Option<T>>
+    where
+        F: FnOnce(&mut atspi_native::AtspiClient) -> Result<T>,
+    {
+        match self.with_atspi(op) {
+            Some(Ok(value)) => Ok(Some(value)),
+            Some(Err(err @ WayboundError::Timeout { .. })) => Err(err),
+            Some(Err(err)) => {
+                debug!(%err, "native AT-SPI2 failed; falling back to pyatspi");
+                Ok(None)
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -166,7 +193,7 @@ impl Driver for LinuxDriver {
     }
 
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
-        if let Some(Ok(snap)) = self.with_atspi(|client| client.snapshot(self.pid)) {
+        if let Some(snap) = self.native_atspi(|client| client.snapshot(self.pid))? {
             return Ok(snap.nodes);
         }
         let snapshot = atspi::query_atspi_tree(self.pid, self.display.as_deref())?;
@@ -174,8 +201,8 @@ impl Driver for LinuxDriver {
     }
 
     fn snapshot_tree_limited(&self, max_nodes: usize) -> Result<waybound_core::TreeSnapshot> {
-        if let Some(Ok(snap)) =
-            self.with_atspi(|client| client.snapshot_limited(self.pid, max_nodes))
+        if let Some(snap) =
+            self.native_atspi(|client| client.snapshot_limited(self.pid, max_nodes))?
         {
             return Ok(waybound_core::TreeSnapshot {
                 nodes: snap.nodes,
@@ -191,7 +218,7 @@ impl Driver for LinuxDriver {
     }
 
     fn current_url(&self) -> Result<Option<String>> {
-        if let Some(Ok(url)) = self.with_atspi(|client| client.current_url(self.pid)) {
+        if let Some(url) = self.native_atspi(|client| client.current_url(self.pid))? {
             return Ok(url);
         }
         let snapshot = atspi::query_atspi_tree(self.pid, self.display.as_deref())?;
@@ -212,7 +239,7 @@ impl Driver for LinuxDriver {
                 height: f64::from(win.height),
             }));
         }
-        if let Some(Ok(bounds)) = self.with_atspi(|client| client.viewport_bounds(self.pid)) {
+        if let Some(bounds) = self.native_atspi(|client| client.viewport_bounds(self.pid))? {
             return Ok(bounds);
         }
         let snapshot = atspi::query_atspi_tree(self.pid, self.display.as_deref())?;

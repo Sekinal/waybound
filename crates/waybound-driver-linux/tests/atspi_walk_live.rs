@@ -8,8 +8,11 @@
 use std::error::Error;
 use std::time::{Duration, Instant};
 
-use waybound_driver_linux::AtspiSnapshot;
-use waybound_driver_linux::atspi_native::{AtspiClient, DEFAULT_PIPELINE_WINDOW, WalkStrategy};
+use waybound_core::{Driver, WayboundError};
+use waybound_driver_linux::atspi_native::{
+    AtspiClient, CALL_TIMEOUT, DEFAULT_PIPELINE_WINDOW, OPERATION_DEADLINE, WalkStrategy,
+};
+use waybound_driver_linux::{AtspiSnapshot, LinuxDriver};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -71,7 +74,9 @@ fn first_difference(a: &AtspiSnapshot, b: &AtspiSnapshot) -> String {
     )
 }
 
-/// Every node id is `atspi-<index>`, the cap holds, and a capped walk says it truncated.
+/// Every node id is `atspi-<index>` and the cap holds. (`truncated` can be set below the
+/// cap when the queue cap drops children, so it is not checked here; the equivalence
+/// checks compare it against the sequential walk instead.)
 fn assert_well_formed(snap: &AtspiSnapshot, max_nodes: usize) {
     assert!(
         snap.nodes.len() <= max_nodes,
@@ -80,9 +85,6 @@ fn assert_well_formed(snap: &AtspiSnapshot, max_nodes: usize) {
     );
     for (idx, node) in snap.nodes.iter().enumerate() {
         assert_eq!(node.id, format!("atspi-{idx}"));
-    }
-    if snap.nodes.len() < max_nodes {
-        assert!(!snap.truncated, "truncated below the cap");
     }
 }
 
@@ -327,6 +329,127 @@ fn atspi_call_latency() -> TestResult {
         "WB_LATENCY {{\"sequential_per_call\":{},\"pipelined64_amortized_per_call_ms\":{pipelined_per_call:.4},\"current_url\":{}}}",
         summary(&mut serial),
         summary(&mut resolve)
+    );
+    Ok(())
+}
+
+fn signal(pid: &str, sig: &str) -> TestResult {
+    let status = waybound_core::process::command("kill")
+        .args([sig, pid])
+        .status()?;
+    assert!(status.success(), "kill {sig} {pid} failed");
+    Ok(())
+}
+
+/// Stops the browser (`SIGSTOP`) after `delay` and resumes it after `stall` (if any).
+fn stall_browser(
+    pid: &str,
+    delay: Duration,
+    stall: Option<Duration>,
+) -> std::thread::JoinHandle<Result<(), String>> {
+    let pid = pid.to_owned();
+    std::thread::spawn(move || -> Result<(), String> {
+        std::thread::sleep(delay);
+        signal(&pid, "-STOP").map_err(|err| err.to_string())?;
+        if let Some(stall) = stall {
+            std::thread::sleep(stall);
+            signal(&pid, "-CONT").map_err(|err| err.to_string())?;
+        }
+        Ok(())
+    })
+}
+
+fn join(handle: std::thread::JoinHandle<Result<(), String>>) -> TestResult {
+    handle
+        .join()
+        .map_err(|_| "signal thread panicked")?
+        .map_err(Into::into)
+}
+
+/// A browser that stops answering mid-walk: a stall shorter than `CALL_TIMEOUT` only
+/// delays the snapshot; a frozen browser yields `WayboundError::Timeout` within
+/// `CALL_TIMEOUT` plus a margin (through the driver, so its client mutex is released), for
+/// both walks; after `SIGCONT` the same driver and client snapshot normally again.
+/// `WB_ATSPI_CHROME_PID` is the browser process id.
+#[test]
+#[ignore = "needs a live Chromium on the AT-SPI2 bus; run scripts/atspi_walk_bench.sh"]
+fn atspi_walk_survives_hung_browser() -> TestResult {
+    let pid = env_string("WB_ATSPI_CHROME_PID").ok_or("WB_ATSPI_CHROME_PID is required")?;
+    let max_nodes = waybound_core::MAX_MAX_NODES;
+    let bound = CALL_TIMEOUT + Duration::from_secs(2);
+    let driver = LinuxDriver::new(None);
+    let mut client = AtspiClient::connect()?;
+    let baseline = client.snapshot_with_strategy(None, max_nodes, WalkStrategy::Sequential)?;
+    assert!(!baseline.nodes.is_empty(), "no web document found");
+    let mut report = Vec::new();
+
+    // 1. A stall shorter than `CALL_TIMEOUT` (`WB_ATSPI_STALL_MS`, default 5 s) mid-walk
+    //    recovers with the full, unchanged snapshot.
+    let stall = Duration::from_millis(u64::try_from(env_usize("WB_ATSPI_STALL_MS", 5_000))?);
+    let handle = stall_browser(&pid, Duration::from_millis(40), Some(stall));
+    let start = Instant::now();
+    let snap = client.snapshot_with_strategy(None, max_nodes, WalkStrategy::default())?;
+    join(handle)?;
+    report.push(format!(
+        "\"stall_{}ms_snapshot_ms\":{}",
+        stall.as_millis(),
+        start.elapsed().as_millis()
+    ));
+    assert!(
+        snap == baseline,
+        "after a short stall: {}",
+        first_difference(&baseline, &snap)
+    );
+
+    // 2. Frozen mid-walk: bounded `timeout`, for the driver (pipelined) and both walks.
+    let handle = stall_browser(&pid, Duration::from_millis(40), None);
+    let start = Instant::now();
+    let result = driver.snapshot_tree_limited(max_nodes);
+    let elapsed = start.elapsed();
+    join(handle)?;
+    report.push(format!("\"frozen_driver_ms\":{}", elapsed.as_millis()));
+    assert!(
+        matches!(result, Err(WayboundError::Timeout { .. })),
+        "frozen browser: {result:?}"
+    );
+    assert!(elapsed < bound, "driver took {elapsed:?}");
+    for strategy in [WalkStrategy::default(), WalkStrategy::Sequential] {
+        let start = Instant::now();
+        let result = client.snapshot_with_strategy(None, max_nodes, strategy);
+        let elapsed = start.elapsed();
+        report.push(format!("\"frozen_{strategy:?}_ms\":{}", elapsed.as_millis()).replace(' ', ""));
+        assert!(
+            matches!(result, Err(WayboundError::Timeout { .. })),
+            "{strategy:?}: {result:?}"
+        );
+        assert!(elapsed < bound, "{strategy:?} took {elapsed:?}");
+        assert!(
+            !client.is_broken(),
+            "a timeout must not mark the client broken"
+        );
+    }
+    let start = Instant::now();
+    let url = driver.current_url();
+    report.push(format!("\"frozen_url_ms\":{}", start.elapsed().as_millis()));
+    assert!(matches!(url, Err(WayboundError::Timeout { .. })), "{url:?}");
+
+    // 3. Resumed: the same driver (mutex free) and client work again.
+    signal(&pid, "-CONT")?;
+    std::thread::sleep(Duration::from_millis(500));
+    let after = client.snapshot_with_strategy(None, max_nodes, WalkStrategy::default())?;
+    assert!(
+        after == baseline,
+        "after SIGCONT: {}",
+        first_difference(&baseline, &after)
+    );
+    let via_driver = driver.snapshot_tree_limited(max_nodes)?;
+    assert_eq!(via_driver.nodes, baseline.nodes);
+
+    eprintln!(
+        "WB_HANG {{{},\"call_timeout_ms\":{},\"operation_deadline_ms\":{}}}",
+        report.join(","),
+        CALL_TIMEOUT.as_millis(),
+        OPERATION_DEADLINE.as_millis()
     );
     Ok(())
 }

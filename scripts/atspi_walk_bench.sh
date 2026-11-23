@@ -10,7 +10,8 @@
 # Each page is opened in a fresh Chromium. `atspi_walk_bench` prints one `WB_BENCH {json}`
 # line per page with sequential vs pipelined median / p95 latency and fails if any
 # pipelined snapshot differs from the sequential one; `atspi_walk_tracks_live_page` prints
-# `WB_FRESH {json}` after a DOM rewrite and a navigation. Extra knobs: WB_ATSPI_WINDOWS
+# `WB_FRESH {json}` after a DOM rewrite and a navigation; `atspi_walk_survives_hung_browser`
+# prints `WB_HANG {json}` after stopping Chromium (SIGSTOP) mid-walk. Extra knobs: WB_ATSPI_WINDOWS
 # (comma-separated pipeline windows), WB_PAGES (space-separated page names).
 set -euo pipefail
 
@@ -21,6 +22,7 @@ WORK=$(mktemp -d)
 CHROME=$(command -v chromium || command -v google-chrome || command -v google-chrome-stable)
 
 cleanup() {
+  pkill -CONT -f "user-data-dir=$WORK/profile" 2>/dev/null || true
   pkill -f "user-data-dir=$WORK/profile" 2>/dev/null || true
   sleep 1
   [[ -n "${HTTP_PID:-}" ]] && kill "$HTTP_PID" 2>/dev/null || true
@@ -107,6 +109,7 @@ fi
 sleep 1
 
 open_page() {
+  pkill -CONT -f "user-data-dir=$WORK/profile" 2>/dev/null || true
   pkill -f "user-data-dir=$WORK/profile" 2>/dev/null || true
   sleep 0.5
   "$CHROME" --force-renderer-accessibility --no-first-run --no-default-browser-check \
@@ -131,6 +134,14 @@ WB_ATSPI_EXPECT="after 0" WB_ATSPI_FORBID="before 0" \
 open_page nav.html 2.5
 WB_ATSPI_EXPECT="NAV PAGE B" WB_ATSPI_FORBID="NAV PAGE A" WB_ATSPI_EXPECT_URL="/navb.html" \
   "$BIN" --ignored --exact atspi_walk_tracks_live_page --nocapture 2>&1 | grep -E "WB_FRESH|panicked|stale|test result" || failures=$((failures + 1))
+
+# Hung browser: SIGSTOP Chromium mid-walk on the 5k page (the oldest process of the
+# profile is the browser process, which serves AT-SPI2).
+open_page big5k.html 6
+CHROME_PID=$(pgrep -o -f "user-data-dir=$WORK/profile")
+WB_ATSPI_CHROME_PID=$CHROME_PID \
+  "$BIN" --ignored --exact atspi_walk_survives_hung_browser --nocapture 2>&1 | grep -E "WB_HANG|panicked|test result" || failures=$((failures + 1))
+kill -CONT "$CHROME_PID" 2>/dev/null || true
 
 echo "atspi_walk_bench: $failures failing run(s)"
 exit "$((failures > 0))"
