@@ -26,3 +26,6 @@ build/
 node_modules/
 packages/waybound-ts/dist/
 packages/waybound-ts/build-test/
+
+# Crawlee local storage
+storage/
