@@ -11,6 +11,8 @@ mod input;
 mod keymap;
 #[cfg(target_os = "macos")]
 mod screenshot;
+#[cfg(any(target_os = "macos", test))]
+mod tree;
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -20,9 +22,16 @@ use waybound_core::{
 };
 
 /// Native macOS browser driver targeting a running browser process by PID.
+///
+/// Every accessibility operation checks the browser's `AXEnhancedUserInterface` /
+/// `AXManualAccessibility` flags (which make Chromium build its accessibility tree) and turns
+/// on any that are off. Dropping the driver turns back off the ones it turned on (best
+/// effort); that cannot happen if the daemon is killed with `SIGKILL` or crashes.
 pub struct MacOsDriver {
     pid: i32,
     cursor: Mutex<Point>,
+    #[cfg(target_os = "macos")]
+    ax: ax::AxState,
 }
 
 impl MacOsDriver {
@@ -32,6 +41,8 @@ impl MacOsDriver {
         Self {
             pid,
             cursor: Mutex::new(Point { x: 0.0, y: 0.0 }),
+            #[cfg(target_os = "macos")]
+            ax: ax::AxState::new(pid),
         }
     }
 
@@ -50,7 +61,7 @@ impl Driver for MacOsDriver {
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
         #[cfg(target_os = "macos")]
         {
-            ax::snapshot_application_tree(self.pid)
+            ax::snapshot_application_tree(self.pid, &self.ax)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -67,7 +78,7 @@ impl Driver for MacOsDriver {
     fn snapshot_tree_limited(&self, max_nodes: usize) -> Result<TreeSnapshot> {
         #[cfg(target_os = "macos")]
         {
-            ax::snapshot_application_tree_limited(self.pid, max_nodes)
+            ax::snapshot_application_tree_limited(self.pid, &self.ax, max_nodes)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -85,7 +96,7 @@ impl Driver for MacOsDriver {
     fn current_url(&self) -> Result<Option<String>> {
         #[cfg(target_os = "macos")]
         {
-            ax::read_current_url(self.pid)
+            ax::read_current_url(self.pid, &self.ax)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -96,7 +107,7 @@ impl Driver for MacOsDriver {
     fn viewport_bounds(&self) -> Result<Option<Bounds>> {
         #[cfg(target_os = "macos")]
         {
-            ax::read_viewport_bounds(self.pid)
+            ax::read_viewport_bounds(self.pid, &self.ax)
         }
         #[cfg(not(target_os = "macos"))]
         {
