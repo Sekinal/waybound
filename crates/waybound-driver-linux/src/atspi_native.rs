@@ -35,7 +35,7 @@
 //! reconnects.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt as _;
@@ -129,34 +129,38 @@ impl WalkStrategy {
 }
 
 /// Why an operation stopped issuing calls.
+///
+/// Ordered by severity so a bus-limit refusal never masks a timeout or lost connection when
+/// in-flight pipelined calls drain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Abort {
-    /// A call got no reply within [`CALL_TIMEOUT`] (or the bus reported `NoReply`).
-    TimedOut,
+    /// The bus refused a call for resource limits; pipelined walks retry sequentially, and a
+    /// sequential failure drops and reconnects the bus connection.
+    BusLimits,
     /// The operation ran past [`OPERATION_DEADLINE`].
     Deadline,
+    /// A call got no reply within [`CALL_TIMEOUT`] (or the bus reported `NoReply`).
+    TimedOut,
     /// The connection to the bus is gone.
     ConnectionLost,
-    /// The bus refused a call for resource limits; only fatal to the pipelined walk.
-    BusLimits,
 }
 
 impl Abort {
     const fn code(self) -> u8 {
         match self {
-            Self::TimedOut => 1,
+            Self::BusLimits => 1,
             Self::Deadline => 2,
-            Self::ConnectionLost => 3,
-            Self::BusLimits => 4,
+            Self::TimedOut => 3,
+            Self::ConnectionLost => 4,
         }
     }
 
     const fn from_code(code: u8) -> Option<Self> {
         match code {
-            1 => Some(Self::TimedOut),
+            1 => Some(Self::BusLimits),
             2 => Some(Self::Deadline),
-            3 => Some(Self::ConnectionLost),
-            4 => Some(Self::BusLimits),
+            3 => Some(Self::TimedOut),
+            4 => Some(Self::ConnectionLost),
             _ => None,
         }
     }
@@ -207,13 +211,11 @@ fn classify_failure(err: &zbus::Error) -> Option<Abort> {
 }
 
 /// Per-operation call budget shared by the sequential and pipelined walks: the deadline
-/// and the first fatal failure. Once it is set, no further call is sent.
+/// and the highest-severity fatal failure observed. Once set, no further call is sent.
 #[derive(Debug)]
 struct CallBudget {
     deadline: Instant,
     abort: AtomicU8,
-    /// Whether `BusLimits` aborts (pipelined walk) or is tolerated per node (sequential).
-    bus_limits_fatal: AtomicBool,
 }
 
 impl CallBudget {
@@ -221,7 +223,6 @@ impl CallBudget {
         Self {
             deadline,
             abort: AtomicU8::new(0),
-            bus_limits_fatal: AtomicBool::new(false),
         }
     }
 
@@ -230,20 +231,16 @@ impl CallBudget {
     }
 
     fn set_abort(&self, abort: Abort) {
-        if self
-            .abort
-            .compare_exchange(0, abort.code(), Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
+        let code = abort.code();
+        let prev = self.abort.fetch_max(code, Ordering::Relaxed);
+        if prev < code {
             debug!(?abort, "AT-SPI2 operation aborted");
         }
     }
 
     fn record(&self, err: &zbus::Error) {
-        match classify_failure(err) {
-            Some(Abort::BusLimits) if !self.bus_limits_fatal.load(Ordering::Relaxed) => {}
-            Some(abort) => self.set_abort(abort),
-            None => {}
+        if let Some(abort) = classify_failure(err) {
+            self.set_abort(abort);
         }
     }
 
@@ -328,7 +325,6 @@ impl AtspiClient {
     ) -> Result<T> {
         self.budget = CallBudget::new(Instant::now() + OPERATION_DEADLINE);
         if let WalkStrategy::Pipelined { window } = strategy {
-            self.budget.bus_limits_fatal.store(true, Ordering::Relaxed);
             let result = pipelined(self, window);
             match self.budget.abort() {
                 None => {
@@ -372,7 +368,9 @@ impl AtspiClient {
                 ),
             },
             Abort::ConnectionLost | Abort::BusLimits => {
-                self.broken = abort == Abort::ConnectionLost;
+                // Reconnect on both a dropped bus and sequential `BusLimits` so a fresh D-Bus
+                // connection clears any orphaned per-connection pending-reply slots.
+                self.broken = true;
                 warn!(?abort, what, "AT-SPI2 bus connection failed");
                 WayboundError::BackendUnavailable {
                     backend: BACKEND_NAME.to_owned(),
@@ -1387,10 +1385,17 @@ fn discover_a11y_bus_address() -> Result<String> {
         return Ok(addr);
     }
 
-    let session = Connection::session().map_err(|err| WayboundError::BackendUnavailable {
-        backend: BACKEND_NAME.to_owned(),
-        reason: format!("failed to connect to D-Bus session bus: {err}"),
-    })?;
+    let session = Builder::session()
+        .map_err(|err| WayboundError::BackendUnavailable {
+            backend: BACKEND_NAME.to_owned(),
+            reason: format!("failed to locate D-Bus session bus: {err}"),
+        })?
+        .method_timeout(CALL_TIMEOUT)
+        .build()
+        .map_err(|err| WayboundError::BackendUnavailable {
+            backend: BACKEND_NAME.to_owned(),
+            reason: format!("failed to connect to D-Bus session bus: {err}"),
+        })?;
     let msg = session
         .call_method(
             Some("org.a11y.Bus"),
@@ -1519,23 +1524,25 @@ mod tests {
     #[test]
     fn call_budget_deadline_and_bus_limit_policy() {
         let limits = zbus::Error::FDO(Box::new(zbus::fdo::Error::LimitsExceeded(String::new())));
+        let timeout = zbus::Error::FDO(Box::new(zbus::fdo::Error::NoReply(String::new())));
 
-        let tolerant = CallBudget::new(Instant::now() + Duration::from_secs(60));
-        tolerant.record(&limits);
-        assert_eq!(tolerant.abort(), None);
-        assert!(tolerant.may_call());
-
-        let fatal = CallBudget::new(Instant::now() + Duration::from_secs(60));
-        fatal.bus_limits_fatal.store(true, Ordering::Relaxed);
-        fatal.record(&limits);
-        assert_eq!(fatal.abort(), Some(Abort::BusLimits));
-        assert!(!fatal.may_call());
+        let budget = CallBudget::new(Instant::now() + Duration::from_secs(60));
+        budget.record(&limits);
+        assert_eq!(budget.abort(), Some(Abort::BusLimits));
+        assert!(!budget.may_call());
+        // Higher-severity aborts supersede `BusLimits` while draining in-flight calls.
+        budget.record(&timeout);
+        assert_eq!(budget.abort(), Some(Abort::TimedOut));
+        budget.set_abort(Abort::ConnectionLost);
+        assert_eq!(budget.abort(), Some(Abort::ConnectionLost));
+        // Lower-severity aborts never downgrade a higher-severity one.
+        budget.set_abort(Abort::Deadline);
+        assert_eq!(budget.abort(), Some(Abort::ConnectionLost));
 
         let expired = CallBudget::new(Instant::now());
         assert!(!expired.may_call());
         assert_eq!(expired.abort(), Some(Abort::Deadline));
-        // The first abort wins.
-        expired.set_abort(Abort::ConnectionLost);
+        expired.set_abort(Abort::BusLimits);
         assert_eq!(expired.abort(), Some(Abort::Deadline));
     }
 
