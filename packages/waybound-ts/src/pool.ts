@@ -260,7 +260,6 @@ function waitForExit(child: ChildProcess, ms: number): Promise<boolean> {
       child.off("exit", onExit);
       resolve(hasExited(child));
     }, ms);
-    timer.unref();
     child.once("exit", onExit);
   });
 }
