@@ -121,9 +121,15 @@ def main() -> int:
                 assert isinstance(responses, list)
 
                 page.goto(f"{base_url}/page2")
-                page2 = page.get_by_role(waybound.Role.HEADING, name="Page Two").wait_for(
-                    timeout_ms=15_000
-                )
+                try:
+                    page2 = page.get_by_role(waybound.Role.HEADING, name="Page Two").wait_for(
+                        timeout_ms=15_000
+                    )
+                except Exception:
+                    sys.stderr.write(
+                        f"DEBUG after goto: url={page.url()!r}, nodes={page.snapshot_tree()!r}\n"
+                    )
+                    raise
                 sys.stdout.write(f"7. After goto(/page2) -> HEADING: {page2.name!r}\n")
 
                 png = page.screenshot()

@@ -639,7 +639,10 @@ mod tests {
 
         let ch = build_client_hello(&client_random);
         for byte in &ch {
-            assert!(dec.feed(Direction::ClientToServer, &[*byte]).is_empty());
+            assert_eq!(
+                dec.feed(Direction::ClientToServer, &[*byte]),
+                Vec::<u8>::new()
+            );
         }
 
         let mut s2c = build_server_hello(suite);
@@ -687,8 +690,8 @@ mod tests {
         let _ = dec.feed(Direction::ServerToClient, &build_server_hello(suite));
 
         // Feed seq 0 and seq 1 before keylog is populated — both must be queued.
-        assert!(dec.feed(Direction::ServerToClient, &r0).is_empty());
-        assert!(dec.feed(Direction::ServerToClient, &r1).is_empty());
+        assert_eq!(dec.feed(Direction::ServerToClient, &r0), Vec::<u8>::new());
+        assert_eq!(dec.feed(Direction::ServerToClient, &r1), Vec::<u8>::new());
 
         // Now populate the keylog and feed seq 2; all three records flush in order.
         store.insert_for_test(client_random, client_secret, server_secret);
