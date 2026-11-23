@@ -24,6 +24,7 @@ INDEX_HTML = """<!doctype html>
   ">Fetch Data</button>
   <input aria-label="Search" value="old">
   <label><input type="checkbox" aria-label="Agree"> Agree</label>
+  <a href="/page2">Go to Page Two</a>
 </body>
 </html>
 """
@@ -120,17 +121,12 @@ def main() -> int:
                 sys.stdout.write(f"6. Passive captured_responses count: {len(responses)}\n")
                 assert isinstance(responses, list)
 
-                page.goto(f"{base_url}/page2")
-                try:
-                    page2 = page.get_by_role(waybound.Role.HEADING, name="Page Two").wait_for(
-                        timeout_ms=15_000
-                    )
-                except Exception:
-                    sys.stderr.write(
-                        f"DEBUG after goto: url={page.url()!r}, nodes={page.snapshot_tree()!r}\n"
-                    )
-                    raise
-                sys.stdout.write(f"7. After goto(/page2) -> HEADING: {page2.name!r}\n")
+                link = page.get_by_role(waybound.Role.LINK, name="Go to Page Two", strict=True)
+                link.click()
+                page2 = page.get_by_role(waybound.Role.HEADING, name="Page Two").wait_for(
+                    timeout_ms=15_000
+                )
+                sys.stdout.write(f"7. After link click (/page2) -> HEADING: {page2.name!r}\n")
 
                 png = page.screenshot()
                 assert png[:8] == b"\x89PNG\r\n\x1a\n", "screenshot must be valid PNG"
