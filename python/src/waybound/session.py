@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -167,8 +170,100 @@ def _daemon_env(
     return env
 
 
+# Strong references: an unreferenced session (`page = launch().__enter__()`) must still be
+# closed at interpreter exit. Entries are removed by `Session.close`.
+_LIVE_SESSIONS: set[Session] = set()
+_LIVE_SESSIONS_LOCK = threading.Lock()
+
+# The daemon may need several seconds to stop Chrome gracefully (the `feat/profile-export`
+# branch waits up to 5 s for Chrome before SIGKILL), so wait well past that before escalating.
+_GRACEFUL_SHUTDOWN_S = 8.0
+_TERMINATE_GRACE_S = 8.0
+_KILL_GRACE_S = 1.0
+_EXIT_POLL_S = 0.02
+
+
+def _close_live_sessions() -> None:
+    """At interpreter exit, shut down daemons whose sessions were never closed.
+
+    The daemon runs in its own process group (see `Session`), so a Ctrl-C in the terminal no
+    longer reaches it directly; this keeps an unhandled `KeyboardInterrupt` from leaving it
+    (and its browser) running. Deaths that skip `atexit` (SIGTERM, SIGHUP, SIGKILL) are covered
+    by the daemon itself, which exits when its parent process goes away.
+    """
+    with _LIVE_SESSIONS_LOCK:
+        sessions = list(_LIVE_SESSIONS)
+    for session in sessions:
+        with contextlib.suppress(Exception):
+            session.close()
+
+
+def _forget_sessions_after_fork() -> None:
+    """In a forked child, the parent's sessions are not ours to close."""
+    global _LIVE_SESSIONS_LOCK  # noqa: PLW0603 - a lock held at fork time is unusable
+    _LIVE_SESSIONS_LOCK = threading.Lock()
+    _LIVE_SESSIONS.clear()
+
+
+atexit.register(_close_live_sessions)
+if sys.platform != "win32":
+    os.register_at_fork(after_in_child=_forget_sessions_after_fork)
+
+
+def _has_exited(proc: subprocess.Popen[bytes]) -> bool:
+    """Return whether the daemon has exited, *without* reaping it where possible.
+
+    An unreaped (zombie) daemon keeps its pid, which is also its process-group id, so the
+    group can be killed afterwards without risking a reused id. Where `os.waitid` is missing
+    (macOS) this falls back to `poll()`, which reaps; the group is then killed immediately
+    afterwards, leaving only a very narrow window for the id to be reused.
+    """
+    if proc.returncode is not None:
+        return True
+    if sys.platform == "win32" or not hasattr(os, "waitid"):
+        return proc.poll() is not None
+    try:
+        result = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:  # already reaped elsewhere
+        return proc.poll() is not None
+    return result is not None
+
+
+def _wait_exited(proc: subprocess.Popen[bytes], timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while not _has_exited(proc):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_EXIT_POLL_S)
+    return True
+
+
+def _kill_process_group(pgid: int | None) -> None:
+    """SIGKILL what is left of a daemon's process group (its browser, Xvfb, helpers)."""
+    if pgid is None or sys.platform == "win32":
+        return
+    if pgid == os.getpgrp():  # never our own group
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
+
+
 class Session:
-    """Context manager that starts `waybound-daemon`, connects, and cleans up on exit."""
+    """Context manager that starts `waybound-daemon`, connects, and cleans up on exit.
+
+    On POSIX the daemon is started in a new session (its own process group) and told to exit
+    when this process does (`WAYBOUND_EXIT_WITH_PARENT=1`): it runs its normal graceful
+    shutdown as soon as its parent is gone, however the parent died (SIGINT, SIGTERM, SIGHUP
+    or SIGKILL). `close` (also run by the ``with`` block and, for sessions still open, by an
+    `atexit` hook) shuts the daemon down gracefully and then, only as a backstop once the
+    daemon has exited, kills anything left in its process group (a browser or `Xvfb` it could
+    not clean up because it was itself killed). On Windows the daemon is not detached and does
+    not watch its parent.
+
+    After `os.fork`, a session belongs to the process that created it: closing it (or the
+    child's `atexit` hook) in the child only drops the child's references and never shuts the
+    parent's daemon down.
+    """
 
     def __init__(
         self,
@@ -180,9 +275,11 @@ class Session:
         self._options = opts
         self._extra_env: dict[str, str] | None = dict(extra_env) if extra_env is not None else None
         self._daemon_binary = _resolve_daemon_binary(opts.daemon_binary)
-        self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._tmp_dir: Path | None = None
         self._proc: subprocess.Popen[bytes] | None = None
+        self._pgid: int | None = None
         self._transport: UnixSocketTransport | None = None
+        self._owner_pid = os.getpid()
 
     def _build_daemon_cmd(
         self,
@@ -240,32 +337,44 @@ class Session:
 
         opts = self._options
         use_tcp = opts.use_tcp or sys.platform == "win32" or not hasattr(socket, "AF_UNIX")
+        self._owner_pid = os.getpid()
 
         if use_tcp:
-            tmp_dir = tempfile.TemporaryDirectory(prefix="wb-")
+            tmp_dir = Path(tempfile.mkdtemp(prefix="wb-"))
             socket_path: Path | None = None
             tcp_addr: tuple[str, int] | None = ("127.0.0.1", _reserve_loopback_port())
         else:
             # Keep socket path short to stay within macOS's 104-byte AF_UNIX sun_path limit.
-            tmp_dir = tempfile.TemporaryDirectory(prefix="wb-", dir="/tmp")
-            socket_path = Path(tmp_dir.name) / "w.sock"
+            tmp_dir = Path(tempfile.mkdtemp(prefix="wb-", dir="/tmp"))
+            socket_path = tmp_dir / "w.sock"
             tcp_addr = None
 
+        # A plain directory (not `TemporaryDirectory`, whose exit-time finalizer would also
+        # run in forked children and delete the parent's socket); `close` removes it.
         self._tmp_dir = tmp_dir
-        stderr_log = Path(tmp_dir.name) / "daemon.stderr.log"
+        stderr_log = tmp_dir / "daemon.stderr.log"
         cmd = self._build_daemon_cmd(socket_path=socket_path, tcp_addr=tcp_addr)
 
         child_env = _daemon_env(opts.proxy, self._extra_env)
+        detach = sys.platform != "win32"
+        if detach:
+            # Read by daemons that support it; older daemons ignore unknown variables.
+            child_env["WAYBOUND_EXIT_WITH_PARENT"] = "1"
 
         try:
+            with _LIVE_SESSIONS_LOCK:
+                _LIVE_SESSIONS.add(self)
             with stderr_log.open("wb") as stderr_file:
                 proc = subprocess.Popen(  # noqa: S603
                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=stderr_file,
                     env=child_env,
+                    start_new_session=detach,
                 )
             self._proc = proc
+            if detach:
+                self._pgid = proc.pid
             transport = _connect_with_retry(
                 socket_path=socket_path,
                 tcp_addr=tcp_addr,
@@ -287,15 +396,74 @@ class Session:
     ) -> None:
         self.close()
 
-    def ping(self) -> str:
+    def ping(self, *, timeout_s: float | None = None) -> str:
         """Send a health-check ping to the active daemon and return its version."""
         if self._transport is None:
             msg = "Session is not active"
             raise RuntimeError(msg)
-        return self._transport.ping()
+        return self._transport.ping(timeout_s=timeout_s)
+
+    @property
+    def daemon_pid(self) -> int | None:
+        """Return the OS pid of the running `waybound-daemon`, or `None` when not started."""
+        proc = self._proc
+        return proc.pid if proc is not None else None
+
+    def _daemon_running(self) -> bool:
+        proc = self._proc
+        return proc is not None and not _has_exited(proc)
+
+    def _terminate_daemon(self) -> None:
+        """Send SIGTERM (graceful on the daemon side) without waiting; used to unblock I/O."""
+        proc = self._proc
+        if proc is not None and self._owner_pid == os.getpid() and not _has_exited(proc):
+            with contextlib.suppress(OSError):
+                proc.terminate()
+
+    def is_healthy(self, *, timeout_s: float = 2.0) -> bool:
+        """Return `True` if the daemon is running and answers a `ping` within `timeout_s`.
+
+        A session whose daemon exited, or whose connection was closed after an I/O error or
+        a request timeout (the SDK drops a connection it can no longer trust), is unhealthy
+        and stays so: it must be closed and relaunched.
+        """
+        transport = self._transport
+        if not self._daemon_running() or transport is None or transport.closed:
+            return False
+        try:
+            browser_alive = transport.browser_alive(timeout_s=timeout_s)
+        except (OSError, WayboundDaemonError):
+            return False
+        # `False` means the daemon launched a browser that has since exited (crashed, or handed
+        # off to another instance that holds the profile lock): the page is dead.
+        return browser_alive is not False
+
+    def _abandon_inherited(self) -> None:
+        """In a forked child: drop references without touching the parent's daemon.
+
+        Closing the inherited socket descriptor does not end the parent's connection (the
+        parent still holds it), and no `shutdown` request or signal is sent.
+        """
+        transport, self._transport = self._transport, None
+        if transport is not None:
+            with contextlib.suppress(OSError):
+                transport.close()
+        self._proc = None
+        self._pgid = None
+        self._tmp_dir = None
 
     def close(self) -> None:
-        """Gracefully shut down the daemon (unwinding browser & socket guards) and clean up."""
+        """Gracefully shut down the daemon (unwinding browser & socket guards) and clean up.
+
+        Idempotent. Escalation: `shutdown` request, then SIGTERM after 8 s, then SIGKILL after
+        another 8 s. Once the daemon has exited (and before it is reaped, so its process-group
+        id cannot have been reused), anything left in its process group is killed as a
+        backstop. In a forked child this only drops the child's references.
+        """
+        if self._owner_pid != os.getpid():
+            self._abandon_inherited()
+            return
+        proc = self._proc
         shutdown_sent = False
         try:
             if self._transport is not None:
@@ -305,28 +473,32 @@ class Session:
                 with contextlib.suppress(OSError):
                     self._transport.close()
                 self._transport = None
+            if proc is not None and not _has_exited(proc):
+                if shutdown_sent:
+                    _wait_exited(proc, _GRACEFUL_SHUTDOWN_S)
+                if not _has_exited(proc):
+                    with contextlib.suppress(OSError):
+                        proc.terminate()
+                    _wait_exited(proc, _TERMINATE_GRACE_S)
         finally:
             try:
-                if self._proc is not None:
-                    proc = self._proc
+                if proc is not None:
+                    if not _has_exited(proc):  # graceful path timed out or was interrupted
+                        with contextlib.suppress(OSError):
+                            proc.kill()
+                        _wait_exited(proc, _KILL_GRACE_S)
+                    # Backstop only: the daemon has exited but is not reaped yet.
+                    _kill_process_group(self._pgid)
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=_KILL_GRACE_S)
                     self._proc = None
-                    if proc.poll() is None:
-                        if shutdown_sent:
-                            with contextlib.suppress(subprocess.TimeoutExpired):
-                                proc.wait(timeout=2.0)
-                        if proc.poll() is None:
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=2.0)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                                with contextlib.suppress(subprocess.TimeoutExpired):
-                                    proc.wait(timeout=1.0)
+                self._pgid = None
             finally:
                 if self._tmp_dir is not None:
-                    with contextlib.suppress(OSError):
-                        self._tmp_dir.cleanup()
+                    shutil.rmtree(self._tmp_dir, ignore_errors=True)
                     self._tmp_dir = None
+                with _LIVE_SESSIONS_LOCK:
+                    _LIVE_SESSIONS.discard(self)
 
 
 def launch(

@@ -143,14 +143,34 @@ class UnixSocketTransport:
                         self._sock.close()
                     self._sock = None
 
-    def ping(self) -> str:
-        """Send a health-check ping and return the daemon version."""
-        response = self._request({"method": "ping"})
+    @property
+    def closed(self) -> bool:
+        """Return `True` once the connection is closed (explicitly or after an I/O failure)."""
+        return self._sock is None
+
+    def ping(self, *, timeout_s: float | None = None) -> str:
+        """Send a health-check ping and return the daemon version.
+
+        `timeout_s` overrides the transport's base timeout for this one request.
+        """
+        return self._ping(timeout_s)[0]
+
+    def browser_alive(self, *, timeout_s: float | None = None) -> bool | None:
+        """Ping the daemon and return whether the browser it launched is still running.
+
+        Returns `None` when the daemon did not launch a browser (or is too old to say).
+        Raises like `ping` when the daemon itself does not answer.
+        """
+        return self._ping(timeout_s)[1]
+
+    def _ping(self, timeout_s: float | None) -> tuple[str, bool | None]:
+        response = self._request({"method": "ping"}, timeout_override_s=timeout_s)
         version = response.get("version")
         if not isinstance(version, str):
             msg = f"unexpected ping response: {response!r}"
             raise WayboundDaemonError("protocol_error", msg)
-        return version
+        alive = response.get("browser_alive")
+        return version, alive if isinstance(alive, bool) else None
 
     def snapshot_tree(self, *, max_nodes: int | None = None) -> list[AccessibilityNode]:
         """Fetch the current accessibility tree from the daemon."""
