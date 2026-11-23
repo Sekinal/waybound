@@ -4,6 +4,7 @@
 //! client SDKs over a local Unix domain socket.
 
 mod launcher;
+mod lifetime;
 mod mock_driver;
 mod net_tap;
 mod peer;
@@ -30,6 +31,7 @@ use waybound_driver_macos::MacOsDriver;
 use waybound_driver_windows::WindowsDriver;
 
 use crate::launcher::{ChromeLaunchOptions, launch_chrome};
+use crate::lifetime::{Lifetime, ParentWatch, parse_parent_watch, parse_pgid};
 use crate::mock_driver::MockDriver;
 use crate::net_tap::{ResponseStore, start_passive_tap};
 use crate::proxy::{PassiveTapConfig, ProxyForwarder, UpstreamProxy};
@@ -67,6 +69,7 @@ struct CliArgs {
     focus: bool,
     no_motion: bool,
     replay: bool,
+    exit_with_parent: ParentWatch,
 }
 
 fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -105,6 +108,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, St
         focus: false,
         no_motion: false,
         replay: false,
+        exit_with_parent: parse_parent_watch(env::var("WAYBOUND_EXIT_WITH_PARENT").ok().as_deref()),
     };
 
     let mut args = args.into_iter();
@@ -163,6 +167,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, St
             "--locale" => cli.locale = Some(next_arg(&mut args, "--locale")?),
             "--focus" => cli.focus = true,
             "--no-motion" => cli.no_motion = true,
+            "--exit-with-parent" => cli.exit_with_parent = ParentWatch::Current,
             "--replay" => cli.replay = true,
             unknown => return Err(format!("unknown argument: {unknown}")),
         }
@@ -346,13 +351,37 @@ fn start_keylog_capture(
 struct BackendBundle {
     // Drop Chrome before the driver/compositor and runtime dir so Chrome never sees the
     // Wayland socket disappear while it is still running.
-    _launched: Option<launcher::LaunchedChrome>,
+    launched_browser: Option<launcher::LaunchedChrome>,
     driver: Arc<dyn Driver>,
     use_motion: bool,
     proxy_forwarder: Option<ProxyForwarder>,
     _waydroid: Option<WaydroidSession>,
     _xvfb: Option<HeadlessDisplaySession>,
     _wayland_runtime_dir: Option<TempDirGuard>,
+}
+
+impl BackendBundle {
+    fn server_options(
+        &self,
+        inflight: InflightCounter,
+        fingerprint: FingerprintRecorder,
+        sdk_shutdown: Arc<AtomicBool>,
+    ) -> ServerOptions {
+        ServerOptions {
+            sdk_shutdown,
+            use_motion: self.use_motion,
+            inflight,
+            fingerprint,
+            proxy_stats: self
+                .proxy_forwarder
+                .as_ref()
+                .map(ProxyForwarder::stats_handle),
+            browser: self
+                .launched_browser
+                .as_ref()
+                .map(launcher::LaunchedChrome::probe),
+        }
+    }
 }
 
 fn launch_desktop_chrome(
@@ -388,6 +417,30 @@ fn launch_desktop_chrome(
     Ok((pid, chrome, proxy_fwd))
 }
 
+/// Builds the `Xvfb` configuration for `--headless-xvfb`.
+///
+/// `--display :N` selects the virtual display number, so several daemons on one host
+/// (for example a Python `BrowserPool`) can each own a distinct `Xvfb` server instead of
+/// all colliding on the default `:99`.
+fn headless_display_config(display: Option<&str>) -> Result<HeadlessDisplayConfig, String> {
+    let mut config = HeadlessDisplayConfig::default();
+    if let Some(raw) = display {
+        let invalid =
+            || format!("--display {raw:?} must look like :N when combined with --headless-xvfb");
+        let without_colon = raw.strip_prefix(':').unwrap_or(raw);
+        let (number, screen) = match without_colon.split_once('.') {
+            Some((number, screen)) => (number, Some(screen)),
+            None => (without_colon, None),
+        };
+        let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if !all_digits(number) || screen.is_some_and(|s| !all_digits(s)) {
+            return Err(invalid());
+        }
+        config.display_num = number.parse::<u16>().map_err(|_| invalid())?;
+    }
+    Ok(config)
+}
+
 #[allow(clippy::too_many_lines)]
 fn build_backend(
     cli: CliArgs,
@@ -399,7 +452,7 @@ fn build_backend(
         "mock" => Ok(BackendBundle {
             driver: Arc::new(MockDriver::sample_page()),
             use_motion: false,
-            _launched: None,
+            launched_browser: None,
             proxy_forwarder: None,
             _waydroid: None,
             _xvfb: None,
@@ -448,7 +501,7 @@ fn build_backend(
             Ok(BackendBundle {
                 driver: Arc::new(android),
                 use_motion: !cli.no_motion,
-                _launched: None,
+                launched_browser: None,
                 proxy_forwarder: proxy_fwd,
                 _waydroid: waydroid_session,
                 _xvfb: None,
@@ -471,7 +524,7 @@ fn build_backend(
             Ok(BackendBundle {
                 driver: Arc::new(MacOsDriver::new(target_pid)),
                 use_motion: !cli.no_motion,
-                _launched: launched,
+                launched_browser: launched,
                 proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: None,
@@ -479,26 +532,27 @@ fn build_backend(
             })
         }
         "linux" => {
-            let (xvfb_session, display_env, compositor, wayland_runtime_guard) =
-                if cli.headless_wayland {
-                    let runtime_dir = create_wayland_runtime_dir().map_err(|e| e.to_string())?;
-                    let guard = TempDirGuard(runtime_dir.clone());
-                    let comp = Arc::new(
-                        HeadlessCompositor::start(CompositorConfig {
-                            runtime_dir: Some(runtime_dir),
-                            ..CompositorConfig::default()
-                        })
-                        .map_err(|e| e.to_string())?,
-                    );
-                    (None, None, Some(comp), Some(guard))
-                } else if cli.headless_xvfb {
-                    let session = HeadlessDisplaySession::start(HeadlessDisplayConfig::default())
-                        .map_err(|e| e.to_string())?;
-                    let disp = session.display();
-                    (Some(session), Some(disp), None, None)
-                } else {
-                    (None, cli.display.clone(), None, None)
-                };
+            let (xvfb_session, display_env, compositor, wayland_runtime_guard) = if cli
+                .headless_wayland
+            {
+                let runtime_dir = create_wayland_runtime_dir().map_err(|e| e.to_string())?;
+                let guard = TempDirGuard(runtime_dir.clone());
+                let comp = Arc::new(
+                    HeadlessCompositor::start(CompositorConfig {
+                        runtime_dir: Some(runtime_dir),
+                        ..CompositorConfig::default()
+                    })
+                    .map_err(|e| e.to_string())?,
+                );
+                (None, None, Some(comp), Some(guard))
+            } else if cli.headless_xvfb {
+                let config = headless_display_config(cli.display.as_deref())?;
+                let session = HeadlessDisplaySession::start(config).map_err(|e| e.to_string())?;
+                let disp = session.display();
+                (Some(session), Some(disp), None, None)
+            } else {
+                (None, cli.display.clone(), None, None)
+            };
 
             let wayland_display = compositor
                 .as_ref()
@@ -536,7 +590,7 @@ fn build_backend(
             Ok(BackendBundle {
                 driver,
                 use_motion: !cli.no_motion,
-                _launched: launched,
+                launched_browser: launched,
                 proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: xvfb_session,
@@ -556,7 +610,7 @@ fn build_backend(
             Ok(BackendBundle {
                 driver: Arc::new(WindowsDriver::new(target_pid)),
                 use_motion: !cli.no_motion,
-                _launched: launched,
+                launched_browser: launched,
                 proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: None,
@@ -589,6 +643,18 @@ fn run_replay_mode() -> ExitCode {
             "waybound-daemon was built without `--features replay`; rebuild with `cargo build -p waybound-daemon --features replay`"
         );
         ExitCode::FAILURE
+    }
+}
+
+/// Runs [`Lifetime::finish`] when `main` returns, after every RAII guard created later in
+/// `main` (Chrome, Xvfb, the socket) has been dropped: locals drop in reverse order.
+struct LifetimeGuard(Option<Lifetime>);
+
+impl Drop for LifetimeGuard {
+    fn drop(&mut self) {
+        if let Some(lifetime) = self.0.take() {
+            lifetime.finish();
+        }
     }
 }
 
@@ -634,6 +700,16 @@ fn main() -> ExitCode {
         }
     }
 
+    // Started before any child process is spawned; `finish` runs after the graceful shutdown
+    // (when `_lifetime` is dropped at the end of `main`, see `LifetimeGuard`).
+    let lifetime = Lifetime::start(
+        &shutdown,
+        cli.exit_with_parent,
+        parse_pgid(env::var("WAYBOUND_REAP_PGID").ok().as_deref()),
+    );
+    let sdk_shutdown = lifetime.sdk_shutdown_flag();
+    let _lifetime = LifetimeGuard(Some(lifetime));
+
     let responses = Arc::new(ResponseStore::default());
     let inflight = InflightCounter::default();
     let fingerprint = FingerprintRecorder::new();
@@ -654,16 +730,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let proxy_stats = bundle
-        .proxy_forwarder
-        .as_ref()
-        .map(ProxyForwarder::stats_handle);
-    let options = ServerOptions {
-        use_motion: bundle.use_motion,
-        inflight,
-        fingerprint,
-        proxy_stats,
-    };
+    let options = bundle.server_options(inflight, fingerprint, sdk_shutdown);
 
     if let Some(addr) = tcp_addr {
         if let Err(err) = server::serve_tcp(&addr, &bundle.driver, responses, options, shutdown) {
@@ -762,6 +829,44 @@ mod tests {
             "--headless-wayland".to_owned(),
         ]);
         assert!(matches!(conflict, Err(msg) if msg.contains("mutually exclusive")));
+    }
+
+    #[test]
+    fn parent_watch_and_pgid_are_parsed() {
+        assert_eq!(parse_parent_watch(None), ParentWatch::Off);
+        assert_eq!(parse_parent_watch(Some("0")), ParentWatch::Off);
+        assert_eq!(parse_parent_watch(Some("1")), ParentWatch::Current);
+        assert_eq!(parse_parent_watch(Some("yes")), ParentWatch::Current);
+        assert_eq!(parse_parent_watch(Some(" 4242 ")), ParentWatch::Pid(4242));
+        assert_eq!(parse_pgid(None), None);
+        assert_eq!(parse_pgid(Some("0")), None);
+        assert_eq!(parse_pgid(Some("1")), None);
+        assert_eq!(parse_pgid(Some("-5")), None);
+        assert_eq!(parse_pgid(Some("x")), None);
+        assert_eq!(parse_pgid(Some("777")), Some(777));
+    }
+
+    #[test]
+    fn headless_display_defaults_to_99_and_honours_display_flag() {
+        assert_eq!(headless_display_config(None).map(|c| c.display_num), Ok(99));
+        assert_eq!(
+            headless_display_config(Some(":105")).map(|c| c.display_num),
+            Ok(105)
+        );
+        assert_eq!(
+            headless_display_config(Some(":7.0")).map(|c| c.display_num),
+            Ok(7)
+        );
+        assert_eq!(
+            headless_display_config(Some("42")).map(|c| c.display_num),
+            Ok(42)
+        );
+        assert!(headless_display_config(Some("localhost:1")).is_err());
+        assert!(headless_display_config(Some(":")).is_err());
+        assert!(headless_display_config(Some(":+5")).is_err());
+        assert!(headless_display_config(Some(":1.junk")).is_err());
+        assert!(headless_display_config(Some(":1.")).is_err());
+        assert!(headless_display_config(Some(":70000")).is_err());
     }
 
     /// Attach-mode arguments with a keylog, independent of the caller's environment.

@@ -157,7 +157,15 @@ class WayboundCrawlingContext(BasicCrawlingContext):
 
 
 class WayboundCrawler(BasicCrawler[WayboundCrawlingContext, StatisticsState]):
-    """Crawlee `BasicCrawler` backed by a `waybound.BrowserPool` of real OS-driven browsers."""
+    """Crawlee `BasicCrawler` backed by a `waybound.BrowserPool` of real OS-driven browsers.
+
+    `pool_size > 1` needs slots that do not share one pointer and keyboard, so the pool
+    refuses it (with `ValueError`) for local `macos`/`windows` backends, for `linux` without
+    `isolated_displays=True`, and for a local `android` device. Use `pool_size=1`, or
+    `remote_workers=[...]` (one daemon per worker), or on Linux `isolated_displays=True`
+    (one Xvfb, D-Bus session and AT-SPI2 bus per slot). The default mock backend is
+    unaffected.
+    """
 
     def __init__(  # noqa: PLR0913
         self,
