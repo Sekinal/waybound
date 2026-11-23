@@ -97,6 +97,12 @@ export interface AccessibilityNode {
   readonly url?: string | null;
 }
 
+/** Single HTTP header field as seen on the wire (repeated names are kept separately). */
+export interface HttpHeader {
+  readonly name: string;
+  readonly value: string;
+}
+
 /** Passively decrypted HTTP/1.1, HTTP/2, or HTTP/3 response. */
 export class CapturedResponse {
   constructor(
@@ -104,6 +110,11 @@ export class CapturedResponse {
     readonly status: number,
     readonly contentType: string | null,
     readonly body: string | null,
+    readonly headers: readonly HttpHeader[] = [],
+    readonly requestMethod: string | null = null,
+    readonly requestHeaders: readonly HttpHeader[] = [],
+    readonly requestBody: string | null = null,
+    readonly capturedAtMs: number | null = null,
   ) {}
 
   /** Parse and return the captured response body as JSON. */

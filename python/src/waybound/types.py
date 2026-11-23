@@ -120,6 +120,7 @@ class CapturedResponse:
     request_method: str | None = None
     request_headers: tuple[HttpHeader, ...] = field(default=(), repr=False)
     request_body: str | None = field(default=None, repr=False)
+    captured_at_ms: int | None = None
 
     def json(self) -> object:
         """Parse and return the captured response body as JSON."""

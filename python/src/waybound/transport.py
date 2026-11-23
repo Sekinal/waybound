@@ -595,6 +595,7 @@ def _parse_http_response(item: dict[object, object]) -> CapturedResponse:
         request_method=_opt_str(item.get("request_method")),
         request_headers=_parse_headers(item.get("request_headers")),
         request_body=_opt_str(item.get("request_body")),
+        captured_at_ms=_opt_int(item.get("captured_at_ms")),
     )
 
 
