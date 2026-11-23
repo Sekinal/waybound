@@ -180,6 +180,7 @@ fn verify_png_non_blank(png_bytes: &[u8]) -> Result<(u32, u32, usize), String> {
     Ok((width, height, non_black))
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_smoke(work_dir: &Path) -> Result<(), String> {
     let runtime_dir = work_dir.join("xdg");
     let profile_dir = work_dir.join("chrome-profile");
@@ -222,16 +223,22 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
         .env("XDG_RUNTIME_DIR", compositor.runtime_dir())
         .env_remove("DISPLAY")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| format!("failed to spawn Chrome: {e}"))?;
-    let _child_guard = ChildGuard(child);
+    let mut child_guard = ChildGuard(child);
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut received_report: Option<PageReport> = None;
     let mut captured_png: Option<Vec<u8>> = None;
 
     while Instant::now() < deadline {
+        if let Ok(Some(status)) = child_guard.0.try_wait() {
+            return Err(format!(
+                "Chrome exited early with {status} (windows={:?})",
+                compositor.windows()
+            ));
+        }
         if received_report.is_none()
             && let Ok(report) = report_rx.try_recv()
         {

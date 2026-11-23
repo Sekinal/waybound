@@ -53,6 +53,7 @@ impl HeadlessCompositor {
     /// Returns [`waybound_core::WayboundError::InvalidElementState`] if `config` is invalid,
     /// [`waybound_core::WayboundError::BackendUnavailable`] on non-Unix platforms, or
     /// [`waybound_core::WayboundError::Io`] if binding the Unix socket fails.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn start(config: CompositorConfig) -> Result<Self> {
         #[cfg(unix)]
         {
@@ -71,6 +72,7 @@ impl HeadlessCompositor {
 
     /// Returns the Wayland display socket name (suitable for `WAYLAND_DISPLAY`).
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn socket_name(&self) -> &str {
         #[cfg(unix)]
         {
