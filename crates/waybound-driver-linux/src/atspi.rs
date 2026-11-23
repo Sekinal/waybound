@@ -57,6 +57,9 @@ const STATE_CHECKED: u32 = 4;
 /// `ATSPI_STATE_ENABLED`.
 const STATE_ENABLED: u32 = 8;
 /// `ATSPI_STATE_EXPANDABLE`.
+/// `ATSPI_STATE_DEFUNCT`.
+const STATE_DEFUNCT: u32 = 6;
+/// `ATSPI_STATE_EXPANDABLE`.
 const STATE_EXPANDABLE: u32 = 9;
 /// `ATSPI_STATE_EXPANDED`.
 const STATE_EXPANDED: u32 = 10;
@@ -66,6 +69,8 @@ const STATE_FOCUSED: u32 = 12;
 const STATE_PRESSED: u32 = 20;
 /// `ATSPI_STATE_SENSITIVE`.
 const STATE_SENSITIVE: u32 = 24;
+/// `ATSPI_STATE_SHOWING`.
+const STATE_SHOWING: u32 = 25;
 /// `ATSPI_STATE_INDETERMINATE` (mixed tri-state checkbox).
 const STATE_INDETERMINATE: u32 = 32;
 /// `ATSPI_STATE_CHECKABLE`.
@@ -89,6 +94,15 @@ fn has_state(words: &[u32], state: u32) -> bool {
     words
         .get(word)
         .is_some_and(|w| (w >> (state % 32)) & 1 == 1)
+}
+
+/// Returns `true` when an AT-SPI2 document node is actively showing (and not defunct).
+///
+/// Chrome keeps navigated-away documents in its Back-Forward Cache (`BFcache`) with valid
+/// bounds and role `"document web"`, but clears `ATSPI_STATE_SHOWING`.
+#[must_use]
+pub fn is_atspi_showing(words: &[u32]) -> bool {
+    !has_state(words, STATE_DEFUNCT) && has_state(words, STATE_SHOWING)
 }
 
 /// Roles for which checked / disabled / expanded states are reported.

@@ -12,8 +12,8 @@ use zbus::blocking::{Connection, connection::Builder};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 use crate::atspi::{
-    AtspiSnapshot, AtspiStates, MAX_NODES, decode_atspi_node_states, is_checkable_atspi_role,
-    map_atspi_role,
+    AtspiSnapshot, AtspiStates, MAX_NODES, decode_atspi_node_states, is_atspi_showing,
+    is_checkable_atspi_role, map_atspi_role,
 };
 use crate::process::BACKEND_NAME;
 
@@ -86,6 +86,9 @@ impl AtspiClient {
                     .map(str::trim),
                 Some("document web" | "document frame")
             )
+            && self
+                .get_state(&root.0, root.1.as_str())
+                .is_some_and(|words| is_atspi_showing(&words))
             && let Some(bounds) = self.get_extents(&root.0, root.1.as_str())
             && bounds.width > 0.0
             && bounds.height > 0.0
@@ -213,6 +216,7 @@ impl AtspiClient {
         let mut current_url: Option<String> = None;
         let mut viewport_bounds: Option<Bounds> = None;
         let mut web_root: Option<AccessibleRef> = None;
+        let mut best_showing = false;
         let mut best_area: f64 = -1.0;
 
         let mut queue: VecDeque<AccessibleRef> = VecDeque::new();
@@ -240,20 +244,29 @@ impl AtspiClient {
             }
 
             if role_raw == "document web" || role_raw == "document frame" {
+                let showing = self
+                    .get_state(&bus, path.as_str())
+                    .is_some_and(|words| is_atspi_showing(&words));
                 if let Some(bounds) = self.get_extents(&bus, path.as_str()) {
                     let area = bounds.width.max(0.0) * bounds.height.max(0.0);
-                    if area > best_area {
+                    let is_better =
+                        (showing && !best_showing) || (showing == best_showing && area > best_area);
+                    if is_better {
+                        best_showing = showing;
                         best_area = area;
                         web_root = Some((bus.clone(), path.clone()));
                         if bounds.width > 0.0 && bounds.height > 0.0 {
                             viewport_bounds = Some(bounds);
                         }
+                        if let Some(doc_url) = self.get_document_url(&bus, path.as_str()) {
+                            current_url = Some(doc_url);
+                        }
                     }
                 } else if web_root.is_none() {
                     web_root = Some((bus.clone(), path.clone()));
-                }
-                if let Some(doc_url) = self.get_document_url(&bus, path.as_str()) {
-                    current_url = Some(doc_url);
+                    if let Some(doc_url) = self.get_document_url(&bus, path.as_str()) {
+                        current_url = Some(doc_url);
+                    }
                 }
                 continue;
             }
