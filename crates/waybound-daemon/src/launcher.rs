@@ -340,14 +340,35 @@ mod tests {
         }
     }
 
+    /// Retries `launch_chrome` briefly on Linux `ETXTBSY`: another test thread in the same
+    /// `cargo test` process can `fork()` while `fake_browser` holds a writable fd to the new
+    /// shell script, leaving the script busy until the forked child completes its `execve()`.
+    fn launch_test_browser(opts: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
+        for attempt in 0..20 {
+            match launch_chrome(opts) {
+                Err(WayboundError::Io(ref err))
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 19 =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+        launch_chrome(opts)
+    }
+
     #[test]
     fn launch_without_profile_dir_uses_private_temp_profile_and_cleans_up() {
         let scratch = create_temp_profile_dir().unwrap_or_default();
         assert!(scratch.is_dir(), "could not create scratch dir");
         let script = fake_browser(&scratch);
 
-        let launched = launch_chrome(&options(&script, None));
-        assert!(launched.is_ok());
+        let launched = launch_test_browser(&options(&script, None));
+        assert!(
+            launched.is_ok(),
+            "launch_chrome failed: {:?}",
+            launched.as_ref().err()
+        );
         let profile = recorded_profile_dir(&script);
         assert!(profile.is_some(), "--user-data-dir was not passed");
 
@@ -373,9 +394,14 @@ mod tests {
         assert!(std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).is_ok());
         let long_lived = fake_browser(&scratch);
 
-        let running = launch_chrome(&options(&long_lived, Some(scratch.join("p1"))));
-        let exiting = launch_chrome(&options(&script, Some(scratch.join("p2"))));
-        assert!(running.is_ok() && exiting.is_ok());
+        let running = launch_test_browser(&options(&long_lived, Some(scratch.join("p1"))));
+        let exiting = launch_test_browser(&options(&script, Some(scratch.join("p2"))));
+        assert!(
+            running.is_ok() && exiting.is_ok(),
+            "launch_chrome failed: running={:?}, exiting={:?}",
+            running.as_ref().err(),
+            exiting.as_ref().err()
+        );
         if let (Ok(running), Ok(exiting)) = (running, exiting) {
             let probe = running.probe();
             assert!(probe.is_alive());
@@ -398,8 +424,12 @@ mod tests {
         let script = fake_browser(&scratch);
         let explicit = scratch.join("profile");
 
-        let launched = launch_chrome(&options(&script, Some(explicit.clone())));
-        assert!(launched.is_ok());
+        let launched = launch_test_browser(&options(&script, Some(explicit.clone())));
+        assert!(
+            launched.is_ok(),
+            "launch_chrome failed: {:?}",
+            launched.as_ref().err()
+        );
         assert_eq!(recorded_profile_dir(&script), Some(explicit.clone()));
 
         drop(launched);
@@ -422,8 +452,12 @@ mod tests {
         opts.display = Some(":99".to_owned());
         opts.wayland_display = Some(("wayland-wb-0".to_owned(), runtime_dir.clone()));
 
-        let launched = launch_chrome(&opts);
-        assert!(launched.is_ok());
+        let launched = launch_test_browser(&opts);
+        assert!(
+            launched.is_ok(),
+            "launch_chrome failed: {:?}",
+            launched.as_ref().err()
+        );
         // Wait for fake script to write both .args and .env.
         assert!(recorded_profile_dir(&script).is_some());
 

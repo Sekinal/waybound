@@ -325,7 +325,9 @@ class Session:
             msg = f"extra_env must not set {sorted(reserved)}; the SDK manages them"
             raise ValueError(msg)
         if _reap_pgid is not None and (
-            _reap_pgid <= 1 or _reap_pgid in (os.getpgrp(), os.getpid())
+            _reap_pgid <= 1
+            or _reap_pgid == os.getpid()
+            or (sys.platform != "win32" and _reap_pgid == os.getpgrp())
         ):
             msg = f"refusing to reap process group {_reap_pgid}: it is not a helper group"
             raise ValueError(msg)
