@@ -2,7 +2,9 @@
 
 use serde::Deserialize;
 use tracing::debug;
-use waybound_core::{AccessibilityNode, Bounds, Result, Role, WayboundError};
+use waybound_core::{
+    AccessibilityNode, Bounds, MAX_MAX_NODES, MIN_MAX_NODES, Result, Role, WayboundError,
+};
 
 use crate::process::{BACKEND_NAME, DEFAULT_TIMEOUT, run_with_timeout, truncate_for_log};
 
@@ -12,8 +14,10 @@ pub const MAX_NODES: usize = 4_000;
 /// Parsed snapshot of a Linux browser's AT-SPI2 accessibility tree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AtspiSnapshot {
-    /// Flattened accessibility nodes, capped at [`MAX_NODES`].
+    /// Flattened accessibility nodes, capped at the requested node limit.
     pub nodes: Vec<AccessibilityNode>,
+    /// `true` when traversal stopped early because the node cap was reached.
+    pub truncated: bool,
     /// URL of the active web document, if exposed by AT-SPI2.
     pub current_url: Option<String>,
     /// Screen-space bounding rectangle of the active web viewport, if available.
@@ -53,6 +57,9 @@ const STATE_CHECKED: u32 = 4;
 /// `ATSPI_STATE_ENABLED`.
 const STATE_ENABLED: u32 = 8;
 /// `ATSPI_STATE_EXPANDABLE`.
+/// `ATSPI_STATE_DEFUNCT`.
+const STATE_DEFUNCT: u32 = 6;
+/// `ATSPI_STATE_EXPANDABLE`.
 const STATE_EXPANDABLE: u32 = 9;
 /// `ATSPI_STATE_EXPANDED`.
 const STATE_EXPANDED: u32 = 10;
@@ -62,6 +69,8 @@ const STATE_FOCUSED: u32 = 12;
 const STATE_PRESSED: u32 = 20;
 /// `ATSPI_STATE_SENSITIVE`.
 const STATE_SENSITIVE: u32 = 24;
+/// `ATSPI_STATE_SHOWING`.
+const STATE_SHOWING: u32 = 25;
 /// `ATSPI_STATE_INDETERMINATE` (mixed tri-state checkbox).
 const STATE_INDETERMINATE: u32 = 32;
 /// `ATSPI_STATE_CHECKABLE`.
@@ -85,6 +94,15 @@ fn has_state(words: &[u32], state: u32) -> bool {
     words
         .get(word)
         .is_some_and(|w| (w >> (state % 32)) & 1 == 1)
+}
+
+/// Returns `true` when an AT-SPI2 document node is actively showing (and not defunct).
+///
+/// Chrome keeps navigated-away documents in its Back-Forward Cache (`BFcache`) with valid
+/// bounds and role `"document web"`, but clears `ATSPI_STATE_SHOWING`.
+#[must_use]
+pub fn is_atspi_showing(words: &[u32]) -> bool {
+    !has_state(words, STATE_DEFUNCT) && has_state(words, STATE_SHOWING)
 }
 
 /// Roles for which checked / disabled / expanded states are reported.
@@ -162,6 +180,8 @@ struct RawAtspiSnapshot {
     #[serde(default)]
     nodes: Vec<RawAtspiNode>,
     #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
     current_url: Option<String>,
     #[serde(default)]
     viewport_bounds: Option<Bounds>,
@@ -212,19 +232,32 @@ fn clean_optional_string(value: Option<String>) -> Option<String> {
 ///
 /// Returns [`WayboundError::BackendUnavailable`] if `raw` is not valid snapshot JSON.
 pub fn parse_atspi_snapshot_json(raw: &str) -> Result<AtspiSnapshot> {
+    parse_atspi_snapshot_json_limited(raw, MAX_NODES)
+}
+
+/// Parses an AT-SPI2 snapshot JSON payload into an [`AtspiSnapshot`], capping retained
+/// nodes at `max_nodes` (clamped to `1..=20_000`) and reporting truncation.
+///
+/// # Errors
+///
+/// Returns [`WayboundError::BackendUnavailable`] if `raw` is not valid snapshot JSON.
+pub fn parse_atspi_snapshot_json_limited(raw: &str, max_nodes: usize) -> Result<AtspiSnapshot> {
+    let limit = max_nodes.clamp(MIN_MAX_NODES, MAX_MAX_NODES);
     let parsed: RawAtspiSnapshot =
         serde_json::from_str(raw).map_err(|err| WayboundError::BackendUnavailable {
             backend: BACKEND_NAME.to_owned(),
             reason: format!("failed to parse AT-SPI2 snapshot JSON: {err}"),
         })?;
 
-    let mut nodes = Vec::with_capacity(parsed.nodes.len().min(MAX_NODES));
+    let mut nodes = Vec::with_capacity(parsed.nodes.len().min(limit));
+    let mut truncated = parsed.truncated;
     for raw_node in parsed.nodes {
-        if nodes.len() >= MAX_NODES {
-            break;
-        }
         if !is_valid_bounds(&raw_node.bounds) {
             continue;
+        }
+        if nodes.len() >= limit {
+            truncated = true;
+            break;
         }
         let role = map_atspi_role(&raw_node.role);
         let states = raw_node.states.as_deref().map_or_else(
@@ -252,6 +285,7 @@ pub fn parse_atspi_snapshot_json(raw: &str) -> Result<AtspiSnapshot> {
 
     Ok(AtspiSnapshot {
         nodes,
+        truncated,
         current_url,
         viewport_bounds,
     })
@@ -272,7 +306,9 @@ except Exception as exc:
     sys.stderr.write(f"gi.repository.Atspi unavailable: {exc}\n")
     sys.exit(2)
 
-MAX_NODES = 4000
+_max_nodes_raw = os.environ.get("WAYBOUND_MAX_NODES", "").strip()
+MAX_NODES = max(1, min(20000, int(_max_nodes_raw))) if _max_nodes_raw.isdigit() else 4000
+SCAN_LIMIT = 4000
 CHROME_NAMES = ("chrome", "chromium", "google-chrome", "brave")
 
 target_pid_raw = os.environ.get("WAYBOUND_TARGET_PID", "").strip()
@@ -332,7 +368,7 @@ best_area = -1.0
 scan_queue = collections.deque([target_app])
 scanned = 0
 
-while scan_queue and scanned < MAX_NODES:
+while scan_queue and scanned < SCAN_LIMIT:
     acc = scan_queue.popleft()
     if acc is None:
         continue
@@ -392,6 +428,7 @@ while scan_queue and scanned < MAX_NODES:
             continue
 
 nodes = []
+truncated = False
 queue = collections.deque([web_root if web_root is not None else target_app])
 
 while queue and len(nodes) < MAX_NODES:
@@ -473,6 +510,7 @@ while queue and len(nodes) < MAX_NODES:
 
     for idx in range(child_count):
         if len(nodes) + len(queue) >= MAX_NODES * 2:
+            truncated = True
             break
         try:
             child = acc.get_child_at_index(idx)
@@ -481,8 +519,12 @@ while queue and len(nodes) < MAX_NODES:
         except Exception:
             continue
 
+if queue:
+    truncated = True
+
 print(json.dumps({
     "nodes": nodes,
+    "truncated": truncated,
     "current_url": current_url,
     "viewport_bounds": viewport_bounds,
 }))
@@ -499,9 +541,24 @@ print(json.dumps({
 /// is unavailable or returns invalid JSON, or [`WayboundError::Timeout`] if the query
 /// exceeds 10 seconds.
 pub fn query_atspi_tree(pid: Option<i32>, display_env: Option<&str>) -> Result<AtspiSnapshot> {
+    query_atspi_tree_limited(pid, display_env, MAX_NODES)
+}
+
+/// Queries Chrome's live AT-SPI2 accessibility tree up to `max_nodes` nodes.
+///
+/// # Errors
+///
+/// Same as [`query_atspi_tree`].
+pub fn query_atspi_tree_limited(
+    pid: Option<i32>,
+    display_env: Option<&str>,
+    max_nodes: usize,
+) -> Result<AtspiSnapshot> {
+    let limit = max_nodes.clamp(MIN_MAX_NODES, MAX_MAX_NODES);
+    let limit_str = limit.to_string();
     let args = vec!["-c".to_owned(), ATSPI_QUERY_SCRIPT.to_owned()];
     let pid_str = pid.map(|p| p.to_string());
-    let mut envs: Vec<(&str, &str)> = Vec::new();
+    let mut envs: Vec<(&str, &str)> = vec![("WAYBOUND_MAX_NODES", limit_str.as_str())];
     if let Some(pid_val) = pid_str.as_deref() {
         envs.push(("WAYBOUND_TARGET_PID", pid_val));
     }
@@ -509,7 +566,12 @@ pub fn query_atspi_tree(pid: Option<i32>, display_env: Option<&str>) -> Result<A
         envs.push(("DISPLAY", disp));
     }
 
-    debug!(?pid, ?display_env, "querying AT-SPI2 accessibility tree");
+    debug!(
+        ?pid,
+        ?display_env,
+        limit,
+        "querying AT-SPI2 accessibility tree"
+    );
     let output = run_with_timeout(
         "python3",
         &args,
@@ -531,7 +593,7 @@ pub fn query_atspi_tree(pid: Option<i32>, display_env: Option<&str>) -> Result<A
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_atspi_snapshot_json(&stdout)
+    parse_atspi_snapshot_json_limited(&stdout, limit)
 }
 
 #[cfg(test)]

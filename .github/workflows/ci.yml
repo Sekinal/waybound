@@ -91,6 +91,53 @@ jobs:
         working-directory: python
         run: uv run python ../scripts/windows_live_smoke.py
 
+  linux-live-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+      - name: Install Linux display and AT-SPI2 dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            at-spi2-core \
+            dbus-x11 \
+            gir1.2-atspi-2.0 \
+            openbox \
+            python3-gi \
+            scrot \
+            xclip \
+            xdotool \
+            xvfb
+          if ! command -v google-chrome >/dev/null 2>&1 && ! command -v chromium >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends chromium-browser
+          fi
+      - name: Build waybound-daemon
+        run: cargo build -p waybound-daemon
+      - name: Sync Python SDK
+        working-directory: python
+        run: uv sync --dev
+      - name: Run live Linux Chrome AT-SPI2 + X11 smoke test
+        working-directory: python
+        env:
+          ACCESSIBILITY_ENABLED: "1"
+          GTK_MODULES: "gail:atk-bridge"
+          QT_ACCESSIBILITY: "1"
+        run: |
+          xvfb-run -a -s "-screen 0 1280x800x24" dbus-run-session -- bash -c '
+            openbox >/dev/null 2>&1 &
+            if [ -x /usr/libexec/at-spi-bus-launcher ]; then
+              /usr/libexec/at-spi-bus-launcher --launch-immediately >/dev/null 2>&1 &
+            elif [ -x /usr/lib/at-spi2-core/at-spi-bus-launcher ]; then
+              /usr/lib/at-spi2-core/at-spi-bus-launcher --launch-immediately >/dev/null 2>&1 &
+            fi
+            sleep 0.5
+            uv run python ../scripts/linux_live_smoke.py
+          '
+
   typescript:
     strategy:
       fail-fast: false

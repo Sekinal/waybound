@@ -359,6 +359,14 @@ class SessionFingerprint:
 
 
 @dataclass(frozen=True, slots=True)
+class TreeSnapshot:
+    """Accessibility tree snapshot along with truncation metadata."""
+
+    nodes: list[AccessibilityNode]
+    truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class LocatorQuery:
     """Semantic query resolved by the Rust control daemon."""
 
@@ -367,6 +375,7 @@ class LocatorQuery:
     exact: bool = False
     nth: int = 0
     within: LocatorQuery | None = None
+    strict: bool = False
 
 
 class Transport(Protocol):
@@ -497,4 +506,13 @@ class SupportsWebSocketFrames(Protocol):
         self, *, url_contains: str | None = None, limit: int | None = None
     ) -> list[CapturedWebSocketFrame]:
         """Return captured WebSocket messages (oldest first), at most the newest `limit`."""
+        ...
+
+
+@runtime_checkable
+class SupportsTreeSnapshot(Protocol):
+    """Optional transport capability: accessibility tree snapshots with truncation metadata."""
+
+    def snapshot_tree_with_meta(self, *, max_nodes: int | None = None) -> TreeSnapshot:
+        """Return a `TreeSnapshot` capped at `max_nodes` (if given), with `truncated` flag."""
         ...

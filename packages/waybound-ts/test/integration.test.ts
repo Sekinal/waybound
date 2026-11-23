@@ -427,4 +427,56 @@ describe("launch() against misbehaving endpoints", { skip: process.platform === 
     });
     await assertGone(Number(readFileSync(pidFile, "utf8").trim()));
   });
+
+  it("supports snapshotTree maxNodes, truncation metadata, and strict locator mode", async () => {
+    const session = await launch({ backend: "mock", daemonBinary: DAEMON_BIN });
+    try {
+      const { page } = session;
+
+      const full = await page.snapshotTreeWithMeta({ maxNodes: 20 });
+      assert.equal(full.nodes.length, 5);
+      assert.equal(full.truncated, false);
+      assert.equal(page.lastTreeTruncated, false);
+
+      const capped = await page.snapshotTreeWithMeta({ maxNodes: 2 });
+      assert.equal(capped.nodes.length, 2);
+      assert.equal(capped.truncated, true);
+      assert.equal(page.lastTreeTruncated, true);
+
+      const nodes = await page.snapshotTree({ maxNodes: 3 });
+      assert.equal(nodes.length, 3);
+      assert.equal(page.lastTreeTruncated, true);
+
+      const single = await page
+        .getByRole(Role.BUTTON, { strict: true })
+        .waitFor({ timeoutMs: 1_000 });
+      assert.equal(single.id, "btn-search");
+
+      await assert.rejects(
+        () => page.getByRole(Role.CHECKBOX, { strict: true }).click(),
+        (err: unknown) =>
+          err instanceof WayboundDaemonError &&
+          err.code === "strict_mode_violation" &&
+          err.message.includes("2 elements"),
+      );
+
+      // `.first` and `.nth(i)` disambiguate a strict locator without raising.
+      const strictFirst = await page
+        .getByRole(Role.CHECKBOX, { strict: true })
+        .first.waitFor({ timeoutMs: 1_000 });
+      assert.equal(strictFirst.id, "chk-nonstop");
+
+      const strictSecond = await page
+        .getByRole(Role.CHECKBOX, { strict: true })
+        .nth(1)
+        .waitFor({ timeoutMs: 1_000 });
+      assert.equal(strictSecond.id, "chk-insurance");
+
+      // Non-strict mode still resolves the first match.
+      const firstCheckbox = await page.getByRole(Role.CHECKBOX).waitFor({ timeoutMs: 1_000 });
+      assert.equal(firstCheckbox.id, "chk-nonstop");
+    } finally {
+      await session.close();
+    }
+  });
 });

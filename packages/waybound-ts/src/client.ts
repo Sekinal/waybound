@@ -5,7 +5,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { WayboundDaemonError } from "./errors.js";
-import { checkMs, type ResponseWaiter, type Transport } from "./transport.js";
+import {
+  checkMs,
+  type ResponseWaiter,
+  type SnapshotTreeOptions,
+  type Transport,
+} from "./transport.js";
 import type {
   AccessibilityNode,
   CapturedResponse,
@@ -13,6 +18,7 @@ import type {
   LocatorQuery,
   NamedKey,
   Role,
+  TreeSnapshot,
 } from "./types.js";
 
 const URL_POLL_INTERVAL_MS = 75;
@@ -22,11 +28,15 @@ export interface RoleOptions {
   readonly name?: string | null;
   /** Require an exact, case-sensitive name match. */
   readonly exact?: boolean;
+  /** Fail with `strict_mode_violation` if more than one element matches. */
+  readonly strict?: boolean;
 }
 
 export interface TextOptions {
   /** Require an exact, case-sensitive match. */
   readonly exact?: boolean;
+  /** Fail with `strict_mode_violation` if more than one element matches. */
+  readonly strict?: boolean;
 }
 
 export interface TimeoutOptions {
@@ -68,8 +78,9 @@ function makeQuery(
   name: string | null,
   exact: boolean,
   within: LocatorQuery | null,
+  strict: boolean,
 ): LocatorQuery {
-  return Object.freeze({ role, name, exact, nth: 0, within });
+  return Object.freeze({ role, name, exact, nth: 0, within, strict });
 }
 
 /**
@@ -96,20 +107,32 @@ export class Locator {
     if (!Number.isSafeInteger(index) || index < 0) {
       throw new RangeError(`nth index must be a non-negative integer, got ${index}`);
     }
-    return new Locator(this.#transport, Object.freeze({ ...this.query, nth: index }));
+    return new Locator(
+      this.#transport,
+      Object.freeze({ ...this.query, nth: index, strict: false }),
+    );
   }
 
   /** A child locator matched by role, spatially scoped inside this element. */
   getByRole(role: Role, options: RoleOptions = {}): Locator {
     return new Locator(
       this.#transport,
-      makeQuery(role, options.name ?? null, options.exact ?? false, this.query),
+      makeQuery(
+        role,
+        options.name ?? null,
+        options.exact ?? false,
+        this.query,
+        options.strict ?? false,
+      ),
     );
   }
 
   /** A child locator matched by accessible text, spatially scoped inside this element. */
   getByText(text: string, options: TextOptions = {}): Locator {
-    return new Locator(this.#transport, makeQuery(null, text, options.exact ?? false, this.query));
+    return new Locator(
+      this.#transport,
+      makeQuery(null, text, options.exact ?? false, this.query, options.strict ?? false),
+    );
   }
 
   /** All nodes matching this locator (ignoring `nth`). */
@@ -174,6 +197,7 @@ export class Locator {
 /** High-level semantic interface to a controlled browser session. */
 export class Page {
   readonly #transport: Transport;
+  #lastTreeTruncated = false;
 
   constructor(transport: Transport) {
     this.#transport = transport;
@@ -182,6 +206,11 @@ export class Page {
   /** The underlying daemon connection. */
   get transport(): Transport {
     return this.#transport;
+  }
+
+  /** Whether the most recent `snapshotTree()` call was truncated at the node cap. */
+  get lastTreeTruncated(): boolean {
+    return this.#lastTreeTruncated;
   }
 
   /** Active tab URL, if available. */
@@ -248,7 +277,10 @@ export class Page {
     text: string,
     options: TextOptions & TimeoutOptions = {},
   ): Promise<AccessibilityNode> {
-    return this.getByText(text, { exact: options.exact ?? false }).waitFor({
+    return this.getByText(text, {
+      exact: options.exact ?? false,
+      strict: options.strict ?? false,
+    }).waitFor({
       timeoutMs: options.timeoutMs ?? 10_000,
     });
   }
@@ -264,8 +296,15 @@ export class Page {
   }
 
   /** Snapshot of the live accessibility tree. */
-  snapshotTree(): Promise<AccessibilityNode[]> {
-    return this.#transport.snapshotTree();
+  async snapshotTree(options: SnapshotTreeOptions = {}): Promise<AccessibilityNode[]> {
+    return (await this.snapshotTreeWithMeta(options)).nodes;
+  }
+
+  /** Snapshot of the live accessibility tree along with truncation metadata. */
+  async snapshotTreeWithMeta(options: SnapshotTreeOptions = {}): Promise<TreeSnapshot> {
+    const snap = await this.#transport.snapshotTreeWithMeta(options);
+    this.#lastTreeTruncated = snap.truncated;
+    return snap;
   }
 
   /** Passively captured HTTP responses, optionally filtered by URL substring. */
@@ -325,12 +364,15 @@ export class Page {
   getByRole(role: Role, options: RoleOptions = {}): Locator {
     return new Locator(
       this.#transport,
-      makeQuery(role, options.name ?? null, options.exact ?? false, null),
+      makeQuery(role, options.name ?? null, options.exact ?? false, null, options.strict ?? false),
     );
   }
 
   /** Locator targeting an element by accessible text. */
   getByText(text: string, options: TextOptions = {}): Locator {
-    return new Locator(this.#transport, makeQuery(null, text, options.exact ?? false, null));
+    return new Locator(
+      this.#transport,
+      makeQuery(null, text, options.exact ?? false, null, options.strict ?? false),
+    );
   }
 }

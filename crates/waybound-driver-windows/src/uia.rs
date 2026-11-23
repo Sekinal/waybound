@@ -1,7 +1,9 @@
 //! Windows `UIAutomation` tree querying and JSON snapshot parsing.
 
 use serde::Deserialize;
-use waybound_core::{AccessibilityNode, Bounds, Result, Role, WayboundError};
+use waybound_core::{
+    AccessibilityNode, Bounds, MAX_MAX_NODES, MIN_MAX_NODES, Result, Role, WayboundError,
+};
 
 /// Prefix of the positional ids used when an element has no UIA runtime id.
 pub const POSITIONAL_ID_PREFIX: &str = "uia-pos-";
@@ -12,8 +14,10 @@ pub const MAX_NODES: usize = 4_000;
 /// Parsed snapshot of a Windows `UIAutomation` tree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UiaSnapshot {
-    /// Flattened accessibility nodes up to [`MAX_NODES`].
+    /// Flattened accessibility nodes up to the requested node limit.
     pub nodes: Vec<AccessibilityNode>,
+    /// `true` when traversal stopped early because the node cap was reached.
+    pub truncated: bool,
     /// Current URL extracted from the browser address bar, if available.
     pub current_url: Option<String>,
     /// Visible screen-space bounds of the active web viewport, if available.
@@ -87,6 +91,8 @@ pub fn map_uia_control_type(control_type: &str, localized: Option<&str>) -> Role
 struct RawUiaSnapshot {
     #[serde(default)]
     nodes: Vec<RawUiaNode>,
+    #[serde(default)]
+    truncated: bool,
     #[serde(default)]
     current_url: Option<String>,
     #[serde(default)]
@@ -193,6 +199,18 @@ fn normalize_non_empty(value: Option<String>) -> Option<String> {
 /// Returns [`WayboundError::Io`] with [`std::io::ErrorKind::InvalidData`] if `raw` is not valid
 /// UIA snapshot JSON.
 pub fn parse_uia_snapshot_json(raw: &str) -> Result<UiaSnapshot> {
+    parse_uia_snapshot_json_limited(raw, MAX_NODES)
+}
+
+/// Parses a JSON payload emitted by the Windows `UIAutomation` tree walker into a
+/// validated [`UiaSnapshot`], enforcing `max_nodes` (clamped to `1..=20_000`) and finite bounds.
+///
+/// # Errors
+///
+/// Returns [`WayboundError::Io`] with [`std::io::ErrorKind::InvalidData`] if `raw` is not valid
+/// UIA snapshot JSON.
+pub fn parse_uia_snapshot_json_limited(raw: &str, max_nodes: usize) -> Result<UiaSnapshot> {
+    let limit = max_nodes.clamp(MIN_MAX_NODES, MAX_MAX_NODES);
     let parsed: RawUiaSnapshot = serde_json::from_str(raw.trim()).map_err(|err| {
         WayboundError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -200,10 +218,11 @@ pub fn parse_uia_snapshot_json(raw: &str) -> Result<UiaSnapshot> {
         ))
     })?;
 
-    let mut nodes = Vec::with_capacity(parsed.nodes.len().min(MAX_NODES));
+    let mut nodes = Vec::with_capacity(parsed.nodes.len().min(limit));
     let mut inferred_viewport: Option<Bounds> = None;
+    let mut truncated = parsed.truncated;
 
-    for (idx, raw_node) in parsed.nodes.into_iter().take(MAX_NODES).enumerate() {
+    for (idx, raw_node) in parsed.nodes.into_iter().enumerate() {
         let bounds = Bounds {
             x: raw_node.x,
             y: raw_node.y,
@@ -212,6 +231,10 @@ pub fn parse_uia_snapshot_json(raw: &str) -> Result<UiaSnapshot> {
         };
         if !is_valid_bounds(&bounds) {
             continue;
+        }
+        if nodes.len() >= limit {
+            truncated = true;
+            break;
         }
 
         let role = map_uia_control_type(
@@ -259,6 +282,7 @@ pub fn parse_uia_snapshot_json(raw: &str) -> Result<UiaSnapshot> {
 
     Ok(UiaSnapshot {
         nodes,
+        truncated,
         current_url: normalize_non_empty(parsed.current_url),
         viewport_bounds: explicit_viewport.or(inferred_viewport),
     })
@@ -275,6 +299,13 @@ Add-Type -AssemblyName UIAutomationTypes
 
 $targetPidRaw = $env:WAYBOUND_TARGET_PID
 $maxNodes = 4000
+if ($env:WAYBOUND_MAX_NODES -and $env:WAYBOUND_MAX_NODES -match '^\d+$') {
+    $parsedMax = [int]$env:WAYBOUND_MAX_NODES
+    if ($parsedMax -lt 1) { $parsedMax = 1 }
+    if ($parsedMax -gt 20000) { $parsedMax = 20000 }
+    $maxNodes = $parsedMax
+}
+$truncated = $false
 $root = [System.Windows.Automation.AutomationElement]::RootElement
 $targetWindow = $null
 
@@ -443,15 +474,24 @@ while ($queue.Count -gt 0 -and $nodes.Count -lt $maxNodes) {
         })
 
         $child = $walker.GetFirstChild($el)
-        while ($null -ne $child -and ($nodes.Count + $queue.Count) -lt $maxNodes) {
+        while ($null -ne $child) {
+            if (($nodes.Count + $queue.Count) -ge $maxNodes) {
+                $truncated = $true
+                break
+            }
             $queue.Enqueue($child)
             $child = $walker.GetNextSibling($child)
         }
     } catch {}
 }
 
+if ($queue.Count -gt 0) {
+    $truncated = $true
+}
+
 @{
     nodes = $nodes
+    truncated = $truncated
     current_url = $currentUrl
     viewport_bounds = $viewportBounds
 } | ConvertTo-Json -Depth 4 -Compress
@@ -468,11 +508,22 @@ while ($queue.Count -gt 0 -and $nodes.Count -lt $maxNodes) {
 /// [`WayboundError::Io`] on process spawning or JSON parsing failures.
 #[cfg(target_os = "windows")]
 pub fn query_uia_tree(pid: Option<i32>) -> Result<UiaSnapshot> {
+    query_uia_tree_limited(pid, MAX_NODES)
+}
+
+/// Queries the live Windows `UIAutomation` tree capped at `max_nodes`.
+///
+/// # Errors
+///
+/// Same as [`query_uia_tree`].
+#[cfg(target_os = "windows")]
+pub fn query_uia_tree_limited(pid: Option<i32>, max_nodes: usize) -> Result<UiaSnapshot> {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    tracing::debug!(?pid, "querying Windows UIAutomation tree");
+    let limit = max_nodes.clamp(MIN_MAX_NODES, MAX_MAX_NODES);
+    tracing::debug!(?pid, limit, "querying Windows UIAutomation tree");
 
     let mut cmd = waybound_core::process::command("powershell.exe");
     let _ = cmd
@@ -480,6 +531,7 @@ pub fn query_uia_tree(pid: Option<i32>) -> Result<UiaSnapshot> {
         .arg("-NonInteractive")
         .arg("-Command")
         .arg(UIA_POWERSHELL_SCRIPT)
+        .env("WAYBOUND_MAX_NODES", limit.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -550,7 +602,7 @@ pub fn query_uia_tree(pid: Option<i32>) -> Result<UiaSnapshot> {
         });
     }
 
-    parse_uia_snapshot_json(&stdout)
+    parse_uia_snapshot_json_limited(&stdout, limit)
 }
 
 #[cfg(test)]

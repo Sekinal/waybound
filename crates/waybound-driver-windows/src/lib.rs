@@ -61,6 +61,23 @@ impl Driver for WindowsDriver {
         }
     }
 
+    fn snapshot_tree_limited(&self, max_nodes: usize) -> Result<waybound_core::TreeSnapshot> {
+        #[cfg(target_os = "windows")]
+        {
+            uia::query_uia_tree_limited(self.pid, max_nodes).map(|snapshot| {
+                waybound_core::TreeSnapshot {
+                    nodes: snapshot.nodes,
+                    truncated: snapshot.truncated,
+                }
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = max_nodes;
+            Err(unavailable_error())
+        }
+    }
+
     fn current_url(&self) -> Result<Option<String>> {
         #[cfg(target_os = "windows")]
         {

@@ -12,8 +12,8 @@ use zbus::blocking::{Connection, connection::Builder};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 use crate::atspi::{
-    AtspiSnapshot, AtspiStates, MAX_NODES, decode_atspi_node_states, is_checkable_atspi_role,
-    map_atspi_role,
+    AtspiSnapshot, AtspiStates, MAX_NODES, decode_atspi_node_states, is_atspi_showing,
+    is_checkable_atspi_role, map_atspi_role,
 };
 use crate::process::BACKEND_NAME;
 
@@ -34,15 +34,11 @@ type AccessibleRef = (String, OwnedObjectPath);
 /// Persistent pure-Rust D-Bus client connected to the AT-SPI2 accessibility bus.
 pub struct AtspiClient {
     conn: Connection,
-    /// Cached `(target_pid, web_root)` so subsequent snapshots skip walking browser chrome.
-    cached_web_root: Option<(Option<i32>, AccessibleRef)>,
 }
 
 impl std::fmt::Debug for AtspiClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AtspiClient")
-            .field("has_cached_web_root", &self.cached_web_root.is_some())
-            .finish_non_exhaustive()
+        f.debug_struct("AtspiClient").finish_non_exhaustive()
     }
 }
 
@@ -67,34 +63,19 @@ impl AtspiClient {
                 reason: format!("failed to connect to AT-SPI2 bus: {err}"),
             })?;
         debug!(addr = %addr, "connected native pure-Rust AtspiClient");
-        Ok(Self {
-            conn,
-            cached_web_root: None,
-        })
+        Ok(Self { conn })
     }
 
-    /// Resolves the active `document web` node, reusing the cached reference when still alive.
+    /// Resolves the currently attached `document web` node from the live application tree.
+    ///
+    /// We intentionally avoid caching the document object path across calls: Chrome keeps
+    /// navigated-away documents alive in its `BFcache` answering D-Bus queries (`GetRoleName`,
+    /// `GetState`, `GetExtents`, `GetChildren`) with frozen state even after detaching them
+    /// from the active window hierarchy.
     fn resolve_web_root(
-        &mut self,
+        &self,
         target_pid: Option<i32>,
     ) -> Result<(Option<AccessibleRef>, Option<String>, Option<Bounds>)> {
-        if let Some((cached_pid, ref root)) = self.cached_web_root
-            && cached_pid == target_pid
-            && matches!(
-                self.get_role_name(&root.0, root.1.as_str())
-                    .as_deref()
-                    .map(str::trim),
-                Some("document web" | "document frame")
-            )
-            && let Some(bounds) = self.get_extents(&root.0, root.1.as_str())
-            && bounds.width > 0.0
-            && bounds.height > 0.0
-        {
-            let url = self.get_document_url(&root.0, root.1.as_str());
-            return Ok((Some(root.clone()), url, Some(bounds)));
-        }
-
-        self.cached_web_root = None;
         let apps = self
             .get_children(REGISTRY_BUS, REGISTRY_ROOT)
             .map_err(|err| WayboundError::BackendUnavailable {
@@ -106,11 +87,7 @@ impl AtspiClient {
             return Ok((None, None, None));
         };
 
-        let (web_root, current_url, viewport_bounds) = self.locate_web_document(&target_app);
-        if let Some(ref root) = web_root {
-            self.cached_web_root = Some((target_pid, root.clone()));
-        }
-        Ok((web_root, current_url, viewport_bounds))
+        Ok(self.locate_web_document(&target_app))
     }
 
     /// Fast-path URL lookup on the active web document without walking DOM children.
@@ -139,22 +116,39 @@ impl AtspiClient {
     ///
     /// Returns [`WayboundError::BackendUnavailable`] if the AT-SPI2 registry cannot be queried.
     pub fn snapshot(&mut self, target_pid: Option<i32>) -> Result<AtspiSnapshot> {
+        self.snapshot_limited(target_pid, MAX_NODES)
+    }
+
+    /// Captures an accessibility snapshot of the active browser web document capped at
+    /// `max_nodes`, reporting whether traversal was truncated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WayboundError::BackendUnavailable`] if the AT-SPI2 registry cannot be queried.
+    pub fn snapshot_limited(
+        &mut self,
+        target_pid: Option<i32>,
+        max_nodes: usize,
+    ) -> Result<AtspiSnapshot> {
+        let limit = max_nodes.clamp(waybound_core::MIN_MAX_NODES, waybound_core::MAX_MAX_NODES);
         let (web_root, mut current_url, viewport_bounds) = self.resolve_web_root(target_pid)?;
         let Some(root) = web_root else {
             return Ok(AtspiSnapshot {
                 nodes: Vec::new(),
+                truncated: false,
                 current_url,
                 viewport_bounds,
             });
         };
 
-        let nodes = self.walk_web_document(&root);
+        let (nodes, truncated) = self.walk_web_document(&root, limit);
         if current_url.as_deref().is_some_and(|u| u.trim().is_empty()) {
             current_url = None;
         }
 
         Ok(AtspiSnapshot {
             nodes,
+            truncated,
             current_url,
             viewport_bounds,
         })
@@ -196,6 +190,7 @@ impl AtspiClient {
         let mut current_url: Option<String> = None;
         let mut viewport_bounds: Option<Bounds> = None;
         let mut web_root: Option<AccessibleRef> = None;
+        let mut best_showing = false;
         let mut best_area: f64 = -1.0;
 
         let mut queue: VecDeque<AccessibleRef> = VecDeque::new();
@@ -223,20 +218,29 @@ impl AtspiClient {
             }
 
             if role_raw == "document web" || role_raw == "document frame" {
+                let showing = self
+                    .get_state(&bus, path.as_str())
+                    .is_some_and(|words| is_atspi_showing(&words));
                 if let Some(bounds) = self.get_extents(&bus, path.as_str()) {
                     let area = bounds.width.max(0.0) * bounds.height.max(0.0);
-                    if area > best_area {
+                    let is_better =
+                        (showing && !best_showing) || (showing == best_showing && area > best_area);
+                    if is_better {
+                        best_showing = showing;
                         best_area = area;
                         web_root = Some((bus.clone(), path.clone()));
                         if bounds.width > 0.0 && bounds.height > 0.0 {
                             viewport_bounds = Some(bounds);
                         }
+                        if let Some(doc_url) = self.get_document_url(&bus, path.as_str()) {
+                            current_url = Some(doc_url);
+                        }
                     }
                 } else if web_root.is_none() {
                     web_root = Some((bus.clone(), path.clone()));
-                }
-                if let Some(doc_url) = self.get_document_url(&bus, path.as_str()) {
-                    current_url = Some(doc_url);
+                    if let Some(doc_url) = self.get_document_url(&bus, path.as_str()) {
+                        current_url = Some(doc_url);
+                    }
                 }
                 continue;
             }
@@ -253,13 +257,19 @@ impl AtspiClient {
         (web_root, current_url, viewport_bounds)
     }
 
-    fn walk_web_document(&self, root: &AccessibleRef) -> Vec<AccessibilityNode> {
+    fn walk_web_document(
+        &self,
+        root: &AccessibleRef,
+        max_nodes: usize,
+    ) -> (Vec<AccessibilityNode>, bool) {
         let mut nodes = Vec::new();
+        let mut truncated = false;
         let mut queue: VecDeque<AccessibleRef> = VecDeque::new();
         queue.push_back(root.clone());
 
         while let Some((bus, path)) = queue.pop_front() {
-            if nodes.len() >= MAX_NODES {
+            if nodes.len() >= max_nodes {
+                truncated = true;
                 break;
             }
 
@@ -314,7 +324,7 @@ impl AtspiClient {
             }
         }
 
-        nodes
+        (nodes, truncated)
     }
 
     fn bus_pid(&self, bus: &str) -> Option<u32> {

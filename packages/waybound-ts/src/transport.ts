@@ -12,6 +12,7 @@ import {
   NAMED_KEYS,
   type NamedKey,
   parseRole,
+  type TreeSnapshot,
 } from "./types.js";
 
 /** Where the daemon listens: a Unix socket path, or a loopback TCP host/port. */
@@ -25,6 +26,11 @@ export interface TransportOptions {
 }
 
 export type JsonObject = Record<string, unknown>;
+
+export interface SnapshotTreeOptions {
+  /** Optional maximum number of nodes to return (clamped to `1..=20_000` by the daemon). */
+  readonly maxNodes?: number | null;
+}
 
 /** An armed `wait_for_response`; see `Transport.expectResponse()`. */
 export interface ResponseWaiter {
@@ -305,8 +311,24 @@ export class Transport {
   }
 
   /** Fetch the current accessibility tree. */
-  async snapshotTree(): Promise<AccessibilityNode[]> {
-    return parseNodes(await this.request({ method: "snapshot_tree" }), "tree");
+  async snapshotTree(options: SnapshotTreeOptions = {}): Promise<AccessibilityNode[]> {
+    return (await this.snapshotTreeWithMeta(options)).nodes;
+  }
+
+  /** Fetch the current accessibility tree along with truncation metadata. */
+  async snapshotTreeWithMeta(options: SnapshotTreeOptions = {}): Promise<TreeSnapshot> {
+    const payload: JsonObject = { method: "snapshot_tree" };
+    if (options.maxNodes !== undefined && options.maxNodes !== null) {
+      if (!Number.isSafeInteger(options.maxNodes) || options.maxNodes < 1) {
+        throw new RangeError(`maxNodes must be a positive integer, got ${options.maxNodes}`);
+      }
+      payload.max_nodes = options.maxNodes;
+    }
+    const response = await this.request(payload);
+    return {
+      nodes: parseNodes(response, "tree"),
+      truncated: response.truncated === true,
+    };
   }
 
   /** Return every node matching `query` (`nth` is ignored by the daemon). */
@@ -578,6 +600,9 @@ export function encodeQuery(query: LocatorQuery): JsonObject {
   };
   if (query.within !== null) {
     payload.within = encodeQuery(query.within);
+  }
+  if (query.strict === true) {
+    payload.strict = true;
   }
   return payload;
 }

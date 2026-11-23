@@ -179,6 +179,10 @@ pub struct LocatorQuery {
     /// Optional parent container query; matches are spatially scoped inside the resolved parent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub within: Option<Box<Self>>,
+    /// When `true`, resolving a single element fails with [`crate::WayboundError::StrictModeViolation`]
+    /// if more than one node matches.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict: bool,
 }
 
 impl LocatorQuery {
@@ -191,6 +195,7 @@ impl LocatorQuery {
             exact: false,
             nth: 0,
             within: None,
+            strict: false,
         }
     }
 
@@ -236,6 +241,72 @@ impl LocatorQuery {
         self.resolve_all_with_depth(nodes, 0)
             .into_iter()
             .nth(self.nth)
+    }
+
+    /// Resolves a single matching node, returning [`crate::WayboundError::StrictModeViolation`]
+    /// when `self.strict` (or a `within` parent's `strict`) is `true` and more than one node
+    /// matches, or [`crate::WayboundError::ElementNotFound`] when fewer than `self.nth + 1`
+    /// nodes match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::WayboundError::StrictModeViolation`] or [`crate::WayboundError::ElementNotFound`].
+    pub fn resolve_checked<'a>(
+        &self,
+        nodes: &'a [AccessibilityNode],
+    ) -> crate::Result<&'a AccessibilityNode> {
+        self.resolve_checked_with_depth(nodes, 0)
+    }
+
+    fn resolve_checked_with_depth<'a>(
+        &self,
+        nodes: &'a [AccessibilityNode],
+        depth: usize,
+    ) -> crate::Result<&'a AccessibilityNode> {
+        let matches = self.resolve_all_checked_with_depth(nodes, depth)?;
+        if self.strict && matches.len() > 1 {
+            return Err(crate::WayboundError::StrictModeViolation {
+                query: format!("{self:?}"),
+                count: matches.len(),
+            });
+        }
+        matches
+            .into_iter()
+            .nth(self.nth)
+            .ok_or_else(|| crate::WayboundError::ElementNotFound {
+                query: format!("{self:?}"),
+            })
+    }
+
+    fn resolve_all_checked_with_depth<'a>(
+        &self,
+        nodes: &'a [AccessibilityNode],
+        depth: usize,
+    ) -> crate::Result<Vec<&'a AccessibilityNode>> {
+        if depth > MAX_SCOPE_DEPTH {
+            return Ok(Vec::new());
+        }
+
+        let parent = match &self.within {
+            None => None,
+            Some(parent_query) => match parent_query.resolve_checked_with_depth(nodes, depth + 1) {
+                Ok(resolved) => Some(resolved),
+                Err(crate::WayboundError::ElementNotFound { .. }) => return Ok(Vec::new()),
+                Err(err) => return Err(err),
+            },
+        };
+
+        Ok(nodes
+            .iter()
+            .filter(|node| {
+                if let Some(container) = parent
+                    && (node.id == container.id || !container.bounds.contains_center(&node.bounds))
+                {
+                    return false;
+                }
+                self.matches(node)
+            })
+            .collect())
     }
 
     fn resolve_all_with_depth<'a>(
@@ -378,6 +449,7 @@ mod tests {
                 Role::Dialog,
                 Some("Settings".to_owned()),
             ))),
+            strict: false,
         };
 
         let resolved = query.resolve_one(&nodes);
@@ -452,5 +524,70 @@ mod tests {
         assert!(json.contains(r#""expanded":false"#));
         let back: Result<AccessibilityNode, _> = serde_json::from_str(&json);
         assert!(matches!(back, Ok(ref parsed) if *parsed == node));
+    }
+
+    #[test]
+    fn strict_locator_rejects_ambiguous_matches_and_accepts_unique_match() {
+        let b1 = AccessibilityNode::new(
+            "b1".to_owned(),
+            Role::Button,
+            Some("Save".to_owned()),
+            None,
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 50.0,
+                height: 20.0,
+            },
+        );
+        let b2 = AccessibilityNode::new(
+            "b2".to_owned(),
+            Role::Button,
+            Some("Save".to_owned()),
+            None,
+            Bounds {
+                x: 60.0,
+                y: 0.0,
+                width: 50.0,
+                height: 20.0,
+            },
+        );
+        let unique = AccessibilityNode::new(
+            "b3".to_owned(),
+            Role::Button,
+            Some("Cancel".to_owned()),
+            None,
+            Bounds {
+                x: 120.0,
+                y: 0.0,
+                width: 50.0,
+                height: 20.0,
+            },
+        );
+        let nodes = vec![b1, b2, unique];
+
+        let mut ambiguous = LocatorQuery::by_role(Role::Button, Some("Save".to_owned()));
+        ambiguous.strict = true;
+        assert!(matches!(
+            ambiguous.resolve_checked(&nodes),
+            Err(crate::WayboundError::StrictModeViolation { count: 2, .. })
+        ));
+
+        let mut single = LocatorQuery::by_role(Role::Button, Some("Cancel".to_owned()));
+        single.strict = true;
+        assert_eq!(
+            single.resolve_checked(&nodes).ok().map(|n| n.id.as_str()),
+            Some("b3")
+        );
+
+        // Non-strict query still picks the first match.
+        let non_strict = LocatorQuery::by_role(Role::Button, Some("Save".to_owned()));
+        assert_eq!(
+            non_strict
+                .resolve_checked(&nodes)
+                .ok()
+                .map(|n| n.id.as_str()),
+            Some("b1")
+        );
     }
 }

@@ -17,7 +17,9 @@ from waybound.types import (
     LocatorQuery,
     Role,
     SessionFingerprint,
+    SupportsTreeSnapshot,
     SupportsWebSocketFrames,
+    TreeSnapshot,
 )
 
 if TYPE_CHECKING:
@@ -44,20 +46,41 @@ class Locator:
         if index < 0:
             msg = f"nth index must be non-negative, got {index}"
             raise ValueError(msg)
-        return Locator(_transport=self._transport, query=replace(self.query, nth=index))
+        return Locator(
+            _transport=self._transport, query=replace(self.query, nth=index, strict=False)
+        )
 
-    def get_by_role(self, role: Role, *, name: str | None = None, exact: bool = False) -> Locator:
+    def get_by_role(
+        self,
+        role: Role,
+        *,
+        name: str | None = None,
+        exact: bool = False,
+        strict: bool = False,
+    ) -> Locator:
         """Return a child locator scoped spatially inside this container element."""
         return Locator(
             _transport=self._transport,
-            query=LocatorQuery(role=role, name=name, exact=exact, within=self.query),
+            query=LocatorQuery(
+                role=role,
+                name=name,
+                exact=exact,
+                within=self.query,
+                strict=strict,
+            ),
         )
 
-    def get_by_text(self, text: str, *, exact: bool = False) -> Locator:
+    def get_by_text(self, text: str, *, exact: bool = False, strict: bool = False) -> Locator:
         """Return a child locator matching accessible text inside this container element."""
         return Locator(
             _transport=self._transport,
-            query=LocatorQuery(role=None, name=text, exact=exact, within=self.query),
+            query=LocatorQuery(
+                role=None,
+                name=text,
+                exact=exact,
+                within=self.query,
+                strict=strict,
+            ),
         )
 
     def all(self) -> list[AccessibilityNode]:
@@ -159,6 +182,12 @@ class Page:
 
     def __init__(self, transport: Transport) -> None:
         self._transport = transport
+        self._last_tree_truncated = False
+
+    @property
+    def last_tree_truncated(self) -> bool:
+        """Whether the most recent `snapshot_tree()` call was truncated at the node cap."""
+        return self._last_tree_truncated
 
     def url(self) -> str | None:
         """Return the active tab URL from the browser's web area, if available."""
@@ -237,9 +266,26 @@ class Page:
         """Emit a native key press (`enter`, `tab`, `escape`, `backspace`, or single char)."""
         self._transport.press(key, modifiers=modifiers)
 
-    def snapshot_tree(self) -> list[AccessibilityNode]:
+    def snapshot_tree(self, *, max_nodes: int | None = None) -> list[AccessibilityNode]:
         """Return a snapshot of the live web-content accessibility tree."""
-        return self._transport.snapshot_tree()
+        return self.snapshot_tree_with_meta(max_nodes=max_nodes).nodes
+
+    def snapshot_tree_with_meta(self, *, max_nodes: int | None = None) -> TreeSnapshot:
+        """Return a `TreeSnapshot` with `nodes` and `truncated` metadata."""
+        if max_nodes is not None and max_nodes < 1:
+            msg = f"max_nodes must be a positive integer, got {max_nodes}"
+            raise ValueError(msg)
+        transport = self._transport
+        if isinstance(transport, SupportsTreeSnapshot):
+            snap = transport.snapshot_tree_with_meta(max_nodes=max_nodes)
+        else:
+            nodes = transport.snapshot_tree()
+            truncated = max_nodes is not None and len(nodes) > max_nodes
+            if truncated and max_nodes is not None:
+                nodes = nodes[:max_nodes]
+            snap = TreeSnapshot(nodes=nodes, truncated=truncated)
+        self._last_tree_truncated = snap.truncated
+        return snap
 
     def captured_responses(self, *, url_contains: str | None = None) -> list[CapturedResponse]:
         """Return passively captured HTTP responses, optionally filtered by URL substring."""
@@ -317,16 +363,23 @@ class Page:
             self._transport.screenshot(str(out_path))
             return out_path.read_bytes()
 
-    def get_by_role(self, role: Role, *, name: str | None = None, exact: bool = False) -> Locator:
+    def get_by_role(
+        self,
+        role: Role,
+        *,
+        name: str | None = None,
+        exact: bool = False,
+        strict: bool = False,
+    ) -> Locator:
         """Return a locator targeting an element by its semantic accessibility role."""
         return Locator(
             _transport=self._transport,
-            query=LocatorQuery(role=role, name=name, exact=exact),
+            query=LocatorQuery(role=role, name=name, exact=exact, strict=strict),
         )
 
-    def get_by_text(self, text: str, *, exact: bool = False) -> Locator:
+    def get_by_text(self, text: str, *, exact: bool = False, strict: bool = False) -> Locator:
         """Return a locator matching an element by its accessible text."""
         return Locator(
             _transport=self._transport,
-            query=LocatorQuery(role=None, name=text, exact=exact),
+            query=LocatorQuery(role=None, name=text, exact=exact, strict=strict),
         )

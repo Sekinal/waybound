@@ -420,76 +420,380 @@ fn parse_server_hello_cipher_suite(payload: &[u8]) -> Option<Tls13CipherSuite> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use waybound_core::CapturedResponse;
+
     use super::*;
+    use crate::{HttpConnectionCorrelator, InflightCounter, PassiveConnectionTap};
+
+    const fn suite_id(suite: Tls13CipherSuite) -> u16 {
+        match suite {
+            Tls13CipherSuite::Aes128GcmSha256 => 0x1301,
+            Tls13CipherSuite::Aes256GcmSha384 => 0x1302,
+            Tls13CipherSuite::ChaCha20Poly1305Sha256 => 0x1303,
+        }
+    }
+
+    fn build_client_hello(client_random: &[u8; 32]) -> Vec<u8> {
+        let mut ch = vec![CONTENT_TYPE_HANDSHAKE, 0x03, 0x01, 0x00, 38];
+        ch.extend_from_slice(&[HANDSHAKE_CLIENT_HELLO, 0, 0, 34, 0x03, 0x03]);
+        ch.extend_from_slice(client_random);
+        ch
+    }
+
+    fn build_server_hello(suite: Tls13CipherSuite) -> Vec<u8> {
+        // ServerHello body: legacy_version (2) + random (32) + sid_len (1) +
+        // cipher_suite (2) + compression (1) + extensions_len (2) + supported_versions ext (6).
+        let mut body = Vec::with_capacity(46);
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0x99u8; 32]);
+        body.push(0); // session_id_len = 0
+        body.extend_from_slice(&suite_id(suite).to_be_bytes());
+        body.push(0); // legacy_compression_method = 0
+        // extensions: supported_versions (0x002b), len 2, version 0x0304 (TLS 1.3)
+        body.extend_from_slice(&6u16.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+
+        let body_len = u8::try_from(body.len()).unwrap_or(0);
+        let rec_len = u16::try_from(4 + body.len()).unwrap_or(0);
+        let mut sh = vec![CONTENT_TYPE_HANDSHAKE, 0x03, 0x03];
+        sh.extend_from_slice(&rec_len.to_be_bytes());
+        sh.extend_from_slice(&[HANDSHAKE_SERVER_HELLO, 0, 0, body_len]);
+        sh.extend_from_slice(&body);
+        sh
+    }
+
+    fn seal_record(
+        ks: &TrafficKeyState,
+        seq: u64,
+        inner_ct: u8,
+        plaintext: &[u8],
+        padding: usize,
+    ) -> Option<Vec<u8>> {
+        let mut inner = Vec::with_capacity(plaintext.len() + 1 + padding);
+        inner.extend_from_slice(plaintext);
+        inner.push(inner_ct);
+        inner.resize(inner.len() + padding, 0);
+
+        let ct_len = u16::try_from(inner.len() + 16).ok()?;
+        let [len_hi, len_lo] = ct_len.to_be_bytes();
+        let header = [CONTENT_TYPE_APPLICATION_DATA, 0x03, 0x03, len_hi, len_lo];
+        let nonce = xor_nonce(ks.iv, seq);
+        let payload = Payload {
+            msg: &inner,
+            aad: &header,
+        };
+        let ct = match ks.suite {
+            Tls13CipherSuite::Aes128GcmSha256 => {
+                let cipher = Aes128Gcm::new_from_slice(&ks.key).ok()?;
+                cipher.encrypt(Nonce::from_slice(&nonce), payload).ok()?
+            }
+            Tls13CipherSuite::Aes256GcmSha384 => {
+                let cipher = Aes256Gcm::new_from_slice(&ks.key).ok()?;
+                cipher.encrypt(Nonce::from_slice(&nonce), payload).ok()?
+            }
+            Tls13CipherSuite::ChaCha20Poly1305Sha256 => {
+                let cipher = ChaCha20Poly1305::new_from_slice(&ks.key).ok()?;
+                cipher.encrypt(Nonce::from_slice(&nonce), payload).ok()?
+            }
+        };
+
+        let mut rec = Vec::with_capacity(5 + ct.len());
+        rec.extend_from_slice(&header);
+        rec.extend_from_slice(&ct);
+        Some(rec)
+    }
 
     #[test]
-    fn decrypts_tls13_aes128_gcm_application_record() {
-        let suite = Tls13CipherSuite::Aes128GcmSha256;
-        let client_random = [0x42u8; 32];
-        let server_secret = vec![0x11u8; 32];
-        let client_secret = vec![0x22u8; 32];
+    fn decrypts_all_three_supported_cipher_suites() {
+        let suites = [
+            Tls13CipherSuite::Aes128GcmSha256,
+            Tls13CipherSuite::Aes256GcmSha384,
+            Tls13CipherSuite::ChaCha20Poly1305Sha256,
+        ];
 
-        // Derive the exact server key/iv to encrypt a synthetic TLS 1.3 record.
+        for (idx, suite) in suites.into_iter().enumerate() {
+            let tag = u8::try_from(idx + 1).unwrap_or(1);
+            let client_random = [0x40u8.wrapping_add(tag); 32];
+            let server_secret = vec![0x10u8.wrapping_add(tag); suite.hash_len()];
+            let client_secret = vec![0x20u8.wrapping_add(tag); suite.hash_len()];
+
+            let ks = TrafficKeyState::from_secret(suite, server_secret.clone());
+            assert!(ks.is_some());
+            let Some(ks) = ks else {
+                return;
+            };
+
+            let expected = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+            let rec = seal_record(&ks, 0, CONTENT_TYPE_APPLICATION_DATA, expected, 2);
+            assert!(rec.is_some());
+            let Some(rec) = rec else {
+                return;
+            };
+
+            let store = KeyLogStore::new("/nonexistent/test.keylog");
+            store.insert_for_test(client_random, client_secret, server_secret);
+            let mut dec = PassiveTls13Decoder::new(store);
+
+            assert_eq!(
+                dec.feed(
+                    Direction::ClientToServer,
+                    &build_client_hello(&client_random)
+                ),
+                Vec::<u8>::new()
+            );
+            assert_eq!(
+                dec.feed(Direction::ServerToClient, &build_server_hello(suite)),
+                Vec::<u8>::new()
+            );
+
+            // Include a bogus encrypted handshake record to verify it is skipped while seq stays 0.
+            let mut s2c = vec![CONTENT_TYPE_APPLICATION_DATA, 0x03, 0x03, 0x00, 20];
+            s2c.extend_from_slice(&[0xABu8; 20]);
+            s2c.extend_from_slice(&rec);
+
+            let plain = dec.feed(Direction::ServerToClient, &s2c);
+            assert_eq!(plain, expected, "suite {suite:?}");
+        }
+    }
+
+    #[test]
+    fn handles_key_update_mid_stream() {
+        let suite = Tls13CipherSuite::Aes256GcmSha384;
+        let client_random = [0x55u8; 32];
+        let server_secret = vec![0x33u8; suite.hash_len()];
+        let client_secret = vec![0x44u8; suite.hash_len()];
+
+        let ks0 = TrafficKeyState::from_secret(suite, server_secret.clone());
+        assert!(ks0.is_some());
+        let Some(mut ks) = ks0 else {
+            return;
+        };
+
+        let r0 = seal_record(&ks, 0, CONTENT_TYPE_APPLICATION_DATA, b"before-", 0);
+        // RFC 8446 §4.6.3 KeyUpdate handshake message: type=24, length=1, request_update=0.
+        let ku = seal_record(
+            &ks,
+            1,
+            CONTENT_TYPE_HANDSHAKE,
+            &[HANDSHAKE_KEY_UPDATE, 0, 0, 1, 0],
+            0,
+        );
+        ks.key_update();
+        let r1 = seal_record(&ks, 0, CONTENT_TYPE_APPLICATION_DATA, b"after-update", 1);
+        let r2 = seal_record(&ks, 1, CONTENT_TYPE_APPLICATION_DATA, b"-and-more", 0);
+
+        assert!(r0.is_some());
+        assert!(ku.is_some());
+        assert!(r1.is_some());
+        assert!(r2.is_some());
+        let (Some(r0), Some(ku), Some(r1), Some(r2)) = (r0, ku, r1, r2) else {
+            return;
+        };
+
+        let store = KeyLogStore::new("/nonexistent/test.keylog");
+        store.insert_for_test(client_random, client_secret, server_secret);
+        let mut dec = PassiveTls13Decoder::new(store);
+
+        let _ = dec.feed(
+            Direction::ClientToServer,
+            &build_client_hello(&client_random),
+        );
+        let _ = dec.feed(Direction::ServerToClient, &build_server_hello(suite));
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&r0);
+        stream.extend_from_slice(&ku);
+        stream.extend_from_slice(&r1);
+        stream.extend_from_slice(&r2);
+
+        let plain = dec.feed(Direction::ServerToClient, &stream);
+        assert_eq!(plain, b"before-after-update-and-more");
+    }
+
+    #[test]
+    fn handles_byte_by_byte_fragmented_tcp_feeds() {
+        let suite = Tls13CipherSuite::ChaCha20Poly1305Sha256;
+        let client_random = [0x66u8; 32];
+        let server_secret = vec![0x77u8; suite.hash_len()];
+        let client_secret = vec![0x88u8; suite.hash_len()];
+
         let ks = TrafficKeyState::from_secret(suite, server_secret.clone());
         assert!(ks.is_some());
         let Some(ks) = ks else {
             return;
         };
 
-        let mut inner = b"HTTP/1.1 200 OK\r\n\r\nhello".to_vec();
-        inner.push(CONTENT_TYPE_APPLICATION_DATA);
-        inner.push(0); // padding byte
-
-        let header = [
-            CONTENT_TYPE_APPLICATION_DATA,
-            0x03,
-            0x03,
-            0x00,
-            u8::try_from(inner.len() + 16).unwrap_or(0),
-        ];
-        let nonce = xor_nonce(ks.iv, 0);
-        let cipher = Aes128Gcm::new_from_slice(&ks.key);
-        assert!(cipher.is_ok());
-        let Ok(cipher) = cipher else {
-            return;
-        };
-        let ct = cipher.encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &inner,
-                aad: &header,
-            },
-        );
-        assert!(ct.is_ok());
-        let Ok(ct) = ct else {
+        let r0 = seal_record(&ks, 0, CONTENT_TYPE_APPLICATION_DATA, b"chunk-one:", 0);
+        let r1 = seal_record(&ks, 1, CONTENT_TYPE_APPLICATION_DATA, b"chunk-two", 3);
+        assert!(r0.is_some());
+        assert!(r1.is_some());
+        let (Some(r0), Some(r1)) = (r0, r1) else {
             return;
         };
 
-        // Feed synthetic ClientHello, ServerHello, 1 skipped handshake record, and encrypted app record.
         let store = KeyLogStore::new("/nonexistent/test.keylog");
         store.insert_for_test(client_random, client_secret, server_secret);
         let mut dec = PassiveTls13Decoder::new(store);
 
-        let mut ch = vec![CONTENT_TYPE_HANDSHAKE, 0x03, 0x01, 0x00, 38];
-        ch.extend_from_slice(&[HANDSHAKE_CLIENT_HELLO, 0, 0, 34, 0x03, 0x03]);
-        ch.extend_from_slice(&client_random);
-        assert_eq!(dec.feed(Direction::ClientToServer, &ch), Vec::<u8>::new());
+        let ch = build_client_hello(&client_random);
+        for byte in &ch {
+            assert_eq!(
+                dec.feed(Direction::ClientToServer, &[*byte]),
+                Vec::<u8>::new()
+            );
+        }
 
-        let mut sh = vec![CONTENT_TYPE_HANDSHAKE, 0x03, 0x03, 0x00, 41];
-        sh.extend_from_slice(&[HANDSHAKE_SERVER_HELLO, 0, 0, 37, 0x03, 0x03]);
-        sh.extend_from_slice(&[0x99u8; 32]); // server random
-        sh.push(0); // session_id_len = 0
-        sh.extend_from_slice(&0x1301u16.to_be_bytes()); // TLS_AES_128_GCM_SHA256
-        assert_eq!(dec.feed(Direction::ServerToClient, &sh), Vec::<u8>::new());
+        let mut s2c = build_server_hello(suite);
+        s2c.extend_from_slice(&r0);
+        s2c.extend_from_slice(&r1);
 
-        // Bogus encrypted handshake record (skipped gracefully because seq stays 0).
-        let fake_hs = [CONTENT_TYPE_APPLICATION_DATA, 0x03, 0x03, 0x00, 20];
-        let mut s2c = fake_hs.to_vec();
-        s2c.extend_from_slice(&[0xABu8; 20]);
-        s2c.extend_from_slice(&header);
-        s2c.extend_from_slice(&ct);
+        let mut out = Vec::new();
+        for byte in &s2c {
+            out.extend_from_slice(&dec.feed(Direction::ServerToClient, &[*byte]));
+        }
+        assert_eq!(out, b"chunk-one:chunk-two");
+    }
 
-        let plain = dec.feed(Direction::ServerToClient, &s2c);
-        assert_eq!(plain, b"HTTP/1.1 200 OK\r\n\r\nhello");
+    #[test]
+    fn progresses_sequence_numbers_and_queues_records_until_late_keylog() {
+        let suite = Tls13CipherSuite::Aes128GcmSha256;
+        let client_random = [0x71u8; 32];
+        let server_secret = vec![0x91u8; suite.hash_len()];
+        let client_secret = vec![0xA1u8; suite.hash_len()];
+
+        let ks = TrafficKeyState::from_secret(suite, server_secret.clone());
+        assert!(ks.is_some());
+        let Some(ks) = ks else {
+            return;
+        };
+
+        let r0 = seal_record(&ks, 0, CONTENT_TYPE_APPLICATION_DATA, b"rec0-", 0);
+        let r1 = seal_record(&ks, 1, CONTENT_TYPE_APPLICATION_DATA, b"rec1-", 0);
+        let r2 = seal_record(&ks, 2, CONTENT_TYPE_APPLICATION_DATA, b"rec2", 0);
+        assert!(r0.is_some());
+        assert!(r1.is_some());
+        assert!(r2.is_some());
+        let (Some(r0), Some(r1), Some(r2)) = (r0, r1, r2) else {
+            return;
+        };
+
+        // Start with an empty keylog store; secrets arrive late.
+        let store = KeyLogStore::new("/nonexistent/test.keylog");
+        let mut dec = PassiveTls13Decoder::new(store.clone());
+
+        let _ = dec.feed(
+            Direction::ClientToServer,
+            &build_client_hello(&client_random),
+        );
+        let _ = dec.feed(Direction::ServerToClient, &build_server_hello(suite));
+
+        // Feed seq 0 and seq 1 before keylog is populated — both must be queued.
+        assert_eq!(dec.feed(Direction::ServerToClient, &r0), Vec::<u8>::new());
+        assert_eq!(dec.feed(Direction::ServerToClient, &r1), Vec::<u8>::new());
+
+        // Now populate the keylog and feed seq 2; all three records flush in order.
+        store.insert_for_test(client_random, client_secret, server_secret);
+        let flushed = dec.feed(Direction::ServerToClient, &r2);
+        assert_eq!(flushed, b"rec0-rec1-rec2");
+    }
+
+    #[test]
+    fn correlates_bidirectional_http_over_passive_tls13_tap() {
+        let suite = Tls13CipherSuite::Aes128GcmSha256;
+        let client_random = [0x99u8; 32];
+        let client_secret = vec![0xB1u8; suite.hash_len()];
+        let server_secret = vec![0xC2u8; suite.hash_len()];
+
+        let c_ks = TrafficKeyState::from_secret(suite, client_secret.clone());
+        let s_ks = TrafficKeyState::from_secret(suite, server_secret.clone());
+        assert!(c_ks.is_some());
+        assert!(s_ks.is_some());
+        let (Some(c_ks), Some(s_ks)) = (c_ks, s_ks) else {
+            return;
+        };
+
+        let http_req = b"GET /api/items HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let http_resp =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
+
+        let req_rec = seal_record(&c_ks, 0, CONTENT_TYPE_APPLICATION_DATA, http_req, 0);
+        let resp_rec = seal_record(&s_ks, 0, CONTENT_TYPE_APPLICATION_DATA, http_resp, 0);
+        assert!(req_rec.is_some());
+        assert!(resp_rec.is_some());
+        let (Some(req_rec), Some(resp_rec)) = (req_rec, resp_rec) else {
+            return;
+        };
+
+        // 1. Direct PassiveTls13Decoder + HttpConnectionCorrelator correlation.
+        let store = KeyLogStore::new("/nonexistent/test.keylog");
+        store.insert_for_test(client_random, client_secret, server_secret);
+        let mut dec = PassiveTls13Decoder::new(store.clone());
+
+        let captured: Arc<Mutex<Vec<CapturedResponse>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        let mut http = HttpConnectionCorrelator::new(
+            "example.test".to_owned(),
+            1,
+            InflightCounter::default(),
+            Arc::new(move |_seq, resp| {
+                if let Ok(mut guard) = sink.lock() {
+                    guard.push(resp);
+                }
+            }),
+        );
+
+        let _ = dec.feed(
+            Direction::ClientToServer,
+            &build_client_hello(&client_random),
+        );
+        let _ = dec.feed(Direction::ServerToClient, &build_server_hello(suite));
+
+        let c2s_plain = dec.feed(Direction::ClientToServer, &req_rec);
+        assert_eq!(c2s_plain, http_req);
+        http.feed_client(&c2s_plain);
+
+        let s2c_plain = dec.feed(Direction::ServerToClient, &resp_rec);
+        assert_eq!(s2c_plain, http_resp);
+        http.feed_server(&s2c_plain);
+
+        let responses = captured.lock().map(|g| g.clone()).unwrap_or_default();
+        assert_eq!(responses.len(), 1);
+        if let Some(resp) = responses.first() {
+            assert_eq!(resp.url, "https://example.test/api/items");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body.as_deref(), Some("{\"ok\":true}"));
+        }
+
+        // 2. Full PassiveConnectionTap end-to-end (version detection -> TLS 1.3 -> HTTP).
+        let tap_captured: Arc<Mutex<Vec<CapturedResponse>>> = Arc::new(Mutex::new(Vec::new()));
+        let tap_sink = Arc::clone(&tap_captured);
+        let tap = PassiveConnectionTap::new(
+            "example.test".to_owned(),
+            store,
+            InflightCounter::default(),
+            Arc::new(move |_seq, resp| {
+                if let Ok(mut guard) = tap_sink.lock() {
+                    guard.push(resp);
+                }
+            }),
+        );
+
+        tap.observe(
+            Direction::ClientToServer,
+            &build_client_hello(&client_random),
+        );
+        tap.observe(Direction::ServerToClient, &build_server_hello(suite));
+        tap.observe(Direction::ClientToServer, &req_rec);
+        tap.observe(Direction::ServerToClient, &resp_rec);
+
+        let tap_responses = tap_captured.lock().map(|g| g.clone()).unwrap_or_default();
+        assert_eq!(tap_responses.len(), 1);
+        if let Some(resp) = tap_responses.first() {
+            assert_eq!(resp.url, "https://example.test/api/items");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body.as_deref(), Some("{\"ok\":true}"));
+        }
     }
 }

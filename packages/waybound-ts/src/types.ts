@@ -114,6 +114,12 @@ export class CapturedResponse {
   }
 }
 
+/** Accessibility tree snapshot along with truncation metadata. */
+export interface TreeSnapshot {
+  readonly nodes: AccessibilityNode[];
+  readonly truncated: boolean;
+}
+
 /** Semantic query resolved by the daemon. */
 export interface LocatorQuery {
   readonly role: Role | null;
@@ -121,4 +127,5 @@ export interface LocatorQuery {
   readonly exact: boolean;
   readonly nth: number;
   readonly within: LocatorQuery | null;
+  readonly strict?: boolean;
 }
