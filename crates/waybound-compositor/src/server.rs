@@ -8,6 +8,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -279,13 +280,13 @@ struct PopupData {
     surface_id: u64,
 }
 
-struct ShmPool {
+struct ShmPoolBacking {
     file: File,
-    size: u64,
+    size: AtomicU64,
 }
 
 struct ShmBuffer {
-    pool_id: u64,
+    pool: Arc<ShmPoolBacking>,
     offset: u64,
     width: u32,
     height: u32,
@@ -340,7 +341,7 @@ struct CompositorState {
     start_instant: Instant,
     next_id: u64,
     next_serial: u32,
-    pools: HashMap<u64, ShmPool>,
+    pools: HashMap<u64, Arc<ShmPoolBacking>>,
     buffers: HashMap<u64, ShmBuffer>,
     surfaces: HashMap<u64, SurfaceState>,
     windows: HashMap<u64, WindowState>,
@@ -497,13 +498,13 @@ impl CompositorState {
     fn snapshot_buffer(&self, wl_buffer: &WlBuffer) -> Option<CommittedFrame> {
         let buf_data = wl_buffer.data::<BufferData>()?;
         let buf = self.buffers.get(&buf_data.0)?;
-        let pool = self.pools.get(&buf.pool_id)?;
+        let pool_size = buf.pool.size.load(Ordering::Relaxed);
         let byte_len =
-            validate_buffer_bounds(buf.offset, buf.width, buf.height, buf.stride, pool.size)
+            validate_buffer_bounds(buf.offset, buf.width, buf.height, buf.stride, pool_size)
                 .ok()?;
 
         let mut raw = vec![0_u8; byte_len];
-        if let Err(err) = pool.file.read_exact_at(&mut raw, buf.offset) {
+        if let Err(err) = buf.pool.file.read_exact_at(&mut raw, buf.offset) {
             warn!(?err, "failed to read wl_shm buffer bytes");
             return None;
         }
@@ -1265,10 +1266,10 @@ impl Dispatch<WlShm, ()> for CompositorState {
             let size_u64 = u64::try_from(size).unwrap_or(0);
             let _ = state.pools.insert(
                 pool_id,
-                ShmPool {
+                Arc::new(ShmPoolBacking {
                     file: File::from(fd),
-                    size: size_u64,
-                },
+                    size: AtomicU64::new(size_u64),
+                }),
             );
             let _ = data_init.init(id, PoolData(pool_id));
         }
@@ -1300,25 +1301,26 @@ impl Dispatch<WlShmPool, PoolData> for CompositorState {
                     WEnum::Value(f) => f,
                     WEnum::Unknown(_) => wl_shm::Format::Argb8888,
                 };
-                let _ = state.buffers.insert(
-                    buf_id,
-                    ShmBuffer {
-                        pool_id,
-                        offset: u64::try_from(offset).unwrap_or(0),
-                        width: u32::try_from(width).unwrap_or(0),
-                        height: u32::try_from(height).unwrap_or(0),
-                        stride: u32::try_from(stride).unwrap_or(0),
-                        format: fmt,
-                    },
-                );
+                if let Some(pool) = state.pools.get(&pool_id).cloned() {
+                    let _ = state.buffers.insert(
+                        buf_id,
+                        ShmBuffer {
+                            pool,
+                            offset: u64::try_from(offset).unwrap_or(0),
+                            width: u32::try_from(width).unwrap_or(0),
+                            height: u32::try_from(height).unwrap_or(0),
+                            stride: u32::try_from(stride).unwrap_or(0),
+                            format: fmt,
+                        },
+                    );
+                }
                 let _ = data_init.init(id, BufferData(buf_id));
             }
             wl_shm_pool::Request::Resize { size } => {
                 if let Ok(new_size) = u64::try_from(size)
-                    && let Some(pool) = state.pools.get_mut(&pool_id)
-                    && new_size > pool.size
+                    && let Some(pool) = state.pools.get(&pool_id)
                 {
-                    pool.size = new_size;
+                    let _ = pool.size.fetch_max(new_size, Ordering::Relaxed);
                 }
             }
             wl_shm_pool::Request::Destroy => {
