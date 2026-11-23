@@ -348,13 +348,14 @@ key is portable.
 
 ## Relation to `ProfileStore` (issue #69)
 
-Issue #69 proposes a copy-on-write `ProfileStore` that clones pre-warmed profiles for worker
-pools, keeping HTTP and V8 caches, and can archive them across container restarts. This module
-does something different: a minimal, verified, security-reviewed bundle for moving a *login*
-between machines, with caches deliberately left out. The names do not overlap (`waybound.profile`,
-`export_profile`, `import_profile`, `waybound profile ...`). A future `ProfileStore` could reuse
-the safe import path (staging, hash checks, atomic swap) and the lock checks here, but it
-would need a wider include policy for warm caches.
+`waybound.profiles.ProfileStore` (#69) manages named profiles for worker pools: copy-on-write
+clones that keep warm caches, plus `export_snapshot`/`import_snapshot` archives of whole
+profiles. This page's `waybound.profile` module (singular; `export_profile`, `import_profile`,
+`waybound profile export|import|inspect`) is the narrower tool for moving a *login* to another
+machine or container: an allowlist without caches, a manifest with hashes and the cookie key
+store, compatibility checks, and the hardened import described above. The names do not clash.
+To use a restored session as a named `ProfileStore` profile, import it into
+`store.profile_path(name)`; Chrome must not be using a profile while either tool copies it.
 
 ## What was tested on real Linux
 
