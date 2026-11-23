@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import dataclasses
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,7 @@ _DEFAULT_DISPLAY_DEPTH = 24
 _MAX_PORT = 65_535
 _MAX_DISPLAY_SCAN = 10_000
 _XVFB_READY_TIMEOUT_S = 3.0
+_DBUS_READY_TIMEOUT_S = 3.0
 _XVFB_POLL_INTERVAL_S = 0.05
 _ATSPI_SETTLE_DELAY_S = 0.2
 _CHILD_STOP_TIMEOUT_S = 2.0
@@ -285,15 +287,40 @@ class _IsolatedDisplayStack:
             raise RuntimeError(msg)
 
     @staticmethod
-    def _read_dbus_address(proc: subprocess.Popen[bytes]) -> str:
+    def _read_dbus_address(
+        proc: subprocess.Popen[bytes],
+        *,
+        timeout_s: float = _DBUS_READY_TIMEOUT_S,
+    ) -> str:
         stdout = proc.stdout
         if stdout is None:
             msg = "dbus-daemon stdout pipe unavailable"
             raise RuntimeError(msg)
-        raw_line = stdout.readline()
-        with contextlib.suppress(OSError):
-            stdout.close()
-        address = raw_line.decode("utf-8", errors="replace").strip()
+        fd = stdout.fileno()
+        chunks = bytearray()
+        deadline = time.monotonic() + timeout_s
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    msg = f"timed out after {timeout_s:.1f}s waiting for dbus-daemon bus address"
+                    raise TimeoutError(msg)
+                ready, _, _ = select.select([fd], [], [], remaining)
+                if not ready:
+                    msg = f"timed out after {timeout_s:.1f}s waiting for dbus-daemon bus address"
+                    raise TimeoutError(msg)
+                data = os.read(fd, 4096)
+                if not data:
+                    break
+                chunks.extend(data)
+                if b"\n" in chunks:
+                    break
+        finally:
+            with contextlib.suppress(OSError):
+                stdout.close()
+
+        first_line = bytes(chunks).split(b"\n", 1)[0]
+        address = first_line.decode("utf-8", errors="replace").strip()
         if not address:
             msg = f"dbus-daemon failed to emit session bus address (code {proc.poll()})"
             raise RuntimeError(msg)
@@ -315,6 +342,7 @@ class _PoolSlot:
         *,
         page: AsyncPage,
         proxy: str | None,
+        override_proxy: bool = False,
         session: Session | None = None,
         remote_transport: UnixSocketTransport | None = None,
         remote_worker: str | None = None,
@@ -323,6 +351,7 @@ class _PoolSlot:
     ) -> None:
         self.page = page
         self.proxy = proxy
+        self.override_proxy = override_proxy
         self.uses = 0
         self.remote_worker = remote_worker
         self.display_num = display_num
@@ -374,9 +403,15 @@ class BrowserPool:
         acquire_timeout_s: float = 60.0,
     ) -> None:
         parsed_remotes: list[tuple[str, tuple[str, int]]] = []
+        seen_remotes: set[tuple[str, int]] = set()
         if remote_workers is not None:
             for raw in remote_workers:
-                parsed_remotes.append((raw, parse_remote_worker(raw)))
+                parsed = parse_remote_worker(raw)
+                if parsed in seen_remotes:
+                    msg = f"duplicate remote worker endpoint: {raw!r}"
+                    raise ValueError(msg)
+                seen_remotes.add(parsed)
+                parsed_remotes.append((raw, parsed))
 
         resolved_size = size if size is not None else (len(parsed_remotes) or 1)
         if resolved_size < 1:
@@ -386,6 +421,14 @@ class BrowserPool:
             msg = (
                 f"size ({resolved_size}) cannot exceed number of remote_workers "
                 f"({len(parsed_remotes)})"
+            )
+            raise ValueError(msg)
+
+        resolved_options = launch_options if launch_options is not None else LaunchOptions()
+        if not parsed_remotes and resolved_size > 1 and resolved_options.profile_dir is not None:
+            msg = (
+                "launch_options.profile_dir cannot be set when size > 1 "
+                "(multiple Chrome slots cannot share one --user-data-dir)"
             )
             raise ValueError(msg)
         if max_uses_per_slot is not None and max_uses_per_slot < 1:
@@ -399,7 +442,7 @@ class BrowserPool:
             raise ValueError(msg)
 
         self._size = resolved_size
-        self._launch_options = launch_options if launch_options is not None else LaunchOptions()
+        self._launch_options = resolved_options
         self._proxies: tuple[str, ...] = tuple(proxies) if proxies is not None else ()
         self._isolated_displays = isolated_displays
         self._display_base = display_base
@@ -408,7 +451,8 @@ class BrowserPool:
         self._max_uses_per_slot = max_uses_per_slot
         self._acquire_timeout_s = acquire_timeout_s
 
-        self._semaphore = asyncio.Semaphore(resolved_size)
+        self._available_permits = resolved_size
+        self._waiters: deque[asyncio.Future[None]] = deque()
         self._idle: deque[_PoolSlot] = deque()
         self._active_slots: set[_PoolSlot] = set()
         self._reserved_displays: set[int] = set()
@@ -454,14 +498,46 @@ class BrowserPool:
             failed=self._failed,
         )
 
-    def _next_proxy(self, override: str | None) -> str | None:
+    async def _acquire_permit(self, timeout_s: float) -> None:
+        if self._available_permits > 0:
+            self._available_permits -= 1
+            return
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[None] = loop.create_future()
+        self._waiters.append(waiter)
+        try:
+            await asyncio.wait_for(waiter, timeout=timeout_s)
+        except BaseException:
+            with contextlib.suppress(ValueError):
+                self._waiters.remove(waiter)
+            # If a permit was handed to `waiter` concurrently with timeout/cancellation, return it.
+            if waiter.done() and not waiter.cancelled() and waiter.exception() is None:
+                self._release_permit()
+            raise
+
+    def _release_permit(self) -> None:
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                waiter.set_result(None)
+                return
+        self._available_permits += 1
+
+    def _is_override_proxy(self, proxy: str | None) -> bool:
+        if proxy is None:
+            return False
+        if self._proxies:
+            return proxy not in self._proxies
+        return proxy != self._launch_options.proxy
+
+    def _next_proxy(self, override: str | None) -> tuple[str | None, bool]:
         if override is not None:
-            return override
+            return (override, self._is_override_proxy(override))
         if self._proxies:
             proxy = self._proxies[self._proxy_cursor % len(self._proxies)]
             self._proxy_cursor += 1
-            return proxy
-        return self._launch_options.proxy
+            return (proxy, False)
+        return (self._launch_options.proxy, False)
 
     def _release_slot_resources(self, slot: _PoolSlot) -> None:
         if slot.display_num is not None:
@@ -502,6 +578,10 @@ class BrowserPool:
                 self._recycled += 1
                 await self._destroy_slot(slot)
                 continue
+
+            if self._is_closed():
+                await self._destroy_slot(slot)
+                return None
             return slot
         return None
 
@@ -542,7 +622,7 @@ class BrowserPool:
         )
 
     async def _launch_local_slot(self, *, proxy: str | None) -> _PoolSlot:
-        effective_proxy = self._next_proxy(proxy)
+        effective_proxy, is_override = self._next_proxy(proxy)
         self._slot_counter += 1
         use_isolated = self._isolated_displays and sys.platform.startswith("linux")
 
@@ -574,6 +654,7 @@ class BrowserPool:
                 return _PoolSlot(
                     page=AsyncPage(page),
                     proxy=effective_proxy,
+                    override_proxy=is_override,
                     session=session,
                     display_stack=display_stack,
                     display_num=display_num,
@@ -614,7 +695,7 @@ class BrowserPool:
             msg = f"timeout_s must be > 0, got {effective_timeout}"
             raise ValueError(msg)
 
-        await asyncio.wait_for(self._semaphore.acquire(), timeout=effective_timeout)
+        await self._acquire_permit(effective_timeout)
         slot: _PoolSlot | None = None
         try:
             if self._is_closed():
@@ -622,17 +703,27 @@ class BrowserPool:
                 raise RuntimeError(msg)
 
             slot = await self._pop_healthy_idle(proxy)
+            if self._is_closed():
+                if slot is not None:
+                    await self._destroy_slot(slot)
+                msg = "BrowserPool is closed"
+                raise RuntimeError(msg)
+
             if slot is None:
                 try:
                     slot = await self._launch_slot(proxy=proxy)
                 except BaseException:
                     self._failed += 1
                     raise
+                if self._is_closed():
+                    await self._destroy_slot(slot)
+                    msg = "BrowserPool is closed"
+                    raise RuntimeError(msg)
 
             self._active_slots.add(slot)
             slot.uses += 1
         except BaseException:
-            self._semaphore.release()
+            self._release_permit()
             raise
 
         had_error = False
@@ -646,17 +737,17 @@ class BrowserPool:
             try:
                 await self._return_or_recycle(slot, had_error=had_error)
             finally:
-                self._semaphore.release()
+                self._release_permit()
 
     async def _return_or_recycle(self, slot: _PoolSlot, *, had_error: bool) -> None:
-        if self._closed:
+        if self._is_closed():
             await self._destroy_slot(slot)
             return
 
         reached_max_uses = (
             self._max_uses_per_slot is not None and slot.uses >= self._max_uses_per_slot
         )
-        if had_error or reached_max_uses:
+        if had_error or reached_max_uses or slot.override_proxy:
             self._recycled += 1
             await self._destroy_slot(slot)
             return
@@ -669,6 +760,10 @@ class BrowserPool:
             await self._destroy_slot(slot)
             return
 
+        if self._is_closed():
+            await self._destroy_slot(slot)
+            return
+
         self._idle.append(slot)
 
     async def close(self) -> None:
@@ -676,6 +771,11 @@ class BrowserPool:
         if self._closed:
             return
         self._closed = True
+
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                waiter.set_exception(RuntimeError("BrowserPool is closed"))
 
         slots_to_close: list[_PoolSlot] = list(self._idle)
         self._idle.clear()

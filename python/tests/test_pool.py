@@ -98,7 +98,7 @@ def test_find_free_display_num_skips_reserved_and_existing_locks(tmp_path: Path)
         find_free_display_num(-5, lock_dir=tmp_path)
 
 
-def test_pool_config_validation() -> None:
+def test_pool_config_validation(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="size must be >= 1"):
         BrowserPool(size=0)
     with pytest.raises(ValueError, match="cannot exceed number of remote_workers"):
@@ -109,6 +109,13 @@ def test_pool_config_validation() -> None:
         BrowserPool(size=1, acquire_timeout_s=0)
     with pytest.raises(ValueError, match="display_base must be >= 0"):
         BrowserPool(size=1, display_base=-1)
+    with pytest.raises(ValueError, match="duplicate remote worker"):
+        BrowserPool(remote_workers=["127.0.0.1:49222", " 127.0.0.1:49222 "])
+    with pytest.raises(ValueError, match="profile_dir"):
+        BrowserPool(
+            size=2,
+            launch_options=LaunchOptions(backend="mock", profile_dir=tmp_path / "shared"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -302,3 +309,71 @@ async def test_pool_close_rejects_further_acquire() -> None:
     with pytest.raises(RuntimeError, match="closed"):
         async with pool.acquire():
             pass
+
+
+async def test_pool_close_unblocks_queued_waiters_immediately() -> None:
+    _require_daemon_binary()
+    pool = BrowserPool(
+        size=1,
+        launch_options=LaunchOptions(backend="mock"),
+        acquire_timeout_s=30.0,
+    )
+    entered = asyncio.Event()
+
+    async def waiter_task() -> None:
+        async with pool.acquire():
+            pass
+
+    async with pool.acquire() as page:
+        assert len(await page.snapshot_tree()) > 0
+        entered.set()
+        queued = asyncio.create_task(waiter_task())
+        await asyncio.sleep(0.05)
+
+        started_close = time.monotonic()
+        await pool.close()
+        elapsed = time.monotonic() - started_close
+        assert elapsed < 5.0
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await queued
+
+    stats = pool.stats()
+    assert stats.active == 0
+    assert stats.idle == 0
+
+
+async def test_pool_close_during_inflight_acquire_cleans_up_without_leaking() -> None:
+    _require_daemon_binary()
+    pool = BrowserPool(size=1, launch_options=LaunchOptions(backend="mock"))
+
+    async def slow_acquire() -> None:
+        async with pool.acquire() as page:
+            await page.snapshot_tree()
+
+    task = asyncio.create_task(slow_acquire())
+    await asyncio.sleep(0.01)
+    await pool.close()
+    with contextlib.suppress(RuntimeError):
+        await task
+
+    stats = pool.stats()
+    assert stats.active == 0
+    assert stats.idle == 0
+
+
+async def test_pool_proxy_override_recycles_and_does_not_leak() -> None:
+    _require_daemon_binary()
+
+    async with BrowserPool(size=1, launch_options=LaunchOptions(backend="mock")) as pool:
+        async with pool.acquire(proxy="http://127.0.0.1:18080") as page:
+            assert len(await page.snapshot_tree()) > 0
+
+        # Override proxy slot must be recycled rather than left in idle for default callers.
+        assert pool.stats() == PoolStats(size=1, active=0, idle=0, launched=1, recycled=1, failed=0)
+
+        # Next default acquire launches a fresh slot with the pool's default proxy (None).
+        async with pool.acquire() as page:
+            assert len(await page.snapshot_tree()) > 0
+
+        assert pool.stats() == PoolStats(size=1, active=0, idle=1, launched=2, recycled=1, failed=0)

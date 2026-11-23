@@ -139,6 +139,21 @@ describe("BrowserPool pure helpers", () => {
     assert.throws(() => new BrowserPool({ size: 1, maxUsesPerSlot: 0 }), RangeError);
     assert.throws(() => new BrowserPool({ size: 1, acquireTimeoutMs: 0 }), RangeError);
     assert.throws(() => new BrowserPool({ size: 1, displayBase: -1 }), RangeError);
+    assert.throws(
+      () =>
+        new BrowserPool({
+          remoteWorkers: ["127.0.0.1:49222", " 127.0.0.1:49222 "],
+        }),
+      RangeError,
+    );
+    assert.throws(
+      () =>
+        new BrowserPool({
+          size: 2,
+          launchOptions: { backend: "mock", profileDir: "/tmp/shared" },
+        }),
+      RangeError,
+    );
   });
 });
 
@@ -349,5 +364,62 @@ describe("BrowserPool live daemon integration", { skip }, () => {
     });
     await pool.close();
     await assert.rejects(pool.acquire(), /closed/);
+  });
+
+  it("unblocks queued waiters and cleans up active slots when close() is called", async () => {
+    const pool = new BrowserPool({
+      size: 1,
+      launchOptions: { backend: "mock", daemonBinary: DAEMON_BIN },
+      acquireTimeoutMs: 30_000,
+    });
+
+    const held = await pool.acquire();
+    assert.ok((await held.page.snapshotTree()).length > 0);
+
+    const queuedAssert = assert.rejects(pool.acquire(), /closed/);
+    await sleep(30);
+
+    await pool.close();
+    await queuedAssert;
+    await held.release();
+
+    assert.equal(pool.stats().active, 0);
+    assert.equal(pool.stats().idle, 0);
+  });
+
+  it("recycles per-checkout proxy overrides so they never leak to default acquire()", async () => {
+    await using pool = new BrowserPool({
+      size: 1,
+      launchOptions: { backend: "mock", daemonBinary: DAEMON_BIN },
+    });
+
+    await pool.withPage(
+      async (page) => {
+        assert.ok((await page.snapshotTree()).length > 0);
+      },
+      { proxy: "http://127.0.0.1:18080" },
+    );
+
+    assert.deepEqual(pool.stats(), {
+      size: 1,
+      active: 0,
+      idle: 0,
+      launched: 1,
+      recycled: 1,
+      failed: 0,
+    });
+
+    await pool.withPage(async (page) => {
+      assert.ok((await page.snapshotTree()).length > 0);
+    });
+
+    assert.deepEqual(pool.stats(), {
+      size: 1,
+      active: 0,
+      idle: 1,
+      launched: 2,
+      recycled: 1,
+      failed: 0,
+    });
   });
 });

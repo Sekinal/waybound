@@ -27,6 +27,7 @@ const DEFAULT_ACQUIRE_TIMEOUT_MS = 60_000;
 const MAX_PORT = 65_535;
 const MAX_DISPLAY_SCAN = 10_000;
 const XVFB_READY_TIMEOUT_MS = 3_000;
+const DBUS_READY_TIMEOUT_MS = 3_000;
 const XVFB_POLL_INTERVAL_MS = 50;
 const ATSPI_SETTLE_DELAY_MS = 200;
 const CHILD_STOP_TIMEOUT_MS = 2_000;
@@ -295,16 +296,28 @@ class IsolatedDisplayStack {
       const xvfb = spawn("Xvfb", buildXvfbArgs(displayNum), {
         stdio: ["ignore", "ignore", "ignore"],
       });
+      let xvfbError: Error | null = null;
+      xvfb.on("error", (err) => {
+        xvfbError = err;
+      });
       xvfb.unref();
       children.push(xvfb);
-      await IsolatedDisplayStack.#waitForXvfb(xvfb, displayNum);
+      await IsolatedDisplayStack.#waitForXvfb(xvfb, displayNum, () => xvfbError);
 
       const dbus = spawn("dbus-daemon", buildDbusArgs(), {
         stdio: ["ignore", "pipe", "ignore"],
       });
+      let dbusError: Error | null = null;
+      dbus.on("error", (err) => {
+        dbusError = err;
+      });
       dbus.unref();
       children.push(dbus);
-      const dbusAddress = await IsolatedDisplayStack.#readDbusAddress(dbus);
+      const dbusAddress = await IsolatedDisplayStack.#readDbusAddress(
+        dbus,
+        () => dbusError,
+        DBUS_READY_TIMEOUT_MS,
+      );
 
       const slotEnv = buildSlotEnv({ display, dbusAddress });
       const childEnv: NodeJS.ProcessEnv = { ...process.env, ...slotEnv };
@@ -315,6 +328,7 @@ class IsolatedDisplayStack {
           stdio: ["ignore", "ignore", "ignore"],
           env: childEnv,
         });
+        openbox.on("error", () => undefined);
         openbox.unref();
         children.push(openbox);
       }
@@ -325,6 +339,7 @@ class IsolatedDisplayStack {
           stdio: ["ignore", "ignore", "ignore"],
           env: childEnv,
         });
+        atspi.on("error", () => undefined);
         atspi.unref();
         children.push(atspi);
         await sleep(ATSPI_SETTLE_DELAY_MS);
@@ -339,10 +354,18 @@ class IsolatedDisplayStack {
     }
   }
 
-  static async #waitForXvfb(proc: ChildProcess, displayNum: number): Promise<void> {
+  static async #waitForXvfb(
+    proc: ChildProcess,
+    displayNum: number,
+    spawnError: () => Error | null,
+  ): Promise<void> {
     const sockPath = path.join("/tmp", ".X11-unix", `X${displayNum}`);
     const deadline = performance.now() + XVFB_READY_TIMEOUT_MS;
     while (performance.now() < deadline) {
+      const err = spawnError();
+      if (err !== null) {
+        throw new Error(`failed to spawn Xvfb :${displayNum}: ${err.message}`, { cause: err });
+      }
       if (hasExited(proc)) {
         throw new Error(
           `Xvfb :${displayNum} exited prematurely (code ${proc.exitCode ?? proc.signalCode})`,
@@ -353,6 +376,10 @@ class IsolatedDisplayStack {
       }
       await sleep(XVFB_POLL_INTERVAL_MS);
     }
+    const err = spawnError();
+    if (err !== null) {
+      throw new Error(`failed to spawn Xvfb :${displayNum}: ${err.message}`, { cause: err });
+    }
     if (hasExited(proc)) {
       throw new Error(
         `Xvfb :${displayNum} exited prematurely (code ${proc.exitCode ?? proc.signalCode})`,
@@ -360,26 +387,90 @@ class IsolatedDisplayStack {
     }
   }
 
-  static async #readDbusAddress(proc: ChildProcess): Promise<string> {
+  static #readDbusAddress(
+    proc: ChildProcess,
+    spawnError: () => Error | null,
+    timeoutMs: number,
+  ): Promise<string> {
+    const initialErr = spawnError();
+    if (initialErr !== null) {
+      return Promise.reject(
+        new Error(`failed to spawn dbus-daemon: ${initialErr.message}`, { cause: initialErr }),
+      );
+    }
     const stdout = proc.stdout;
     if (stdout === null) {
-      throw new Error("dbus-daemon stdout pipe unavailable");
+      return Promise.reject(new Error("dbus-daemon stdout pipe unavailable"));
     }
-    const rl = createInterface({ input: stdout });
-    try {
-      for await (const line of rl) {
+
+    return new Promise<string>((resolve, reject) => {
+      const rl = createInterface({ input: stdout });
+      let settled = false;
+
+      const finish = (cb: () => void): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        proc.off("error", onError);
+        proc.off("exit", onExit);
+        rl.off("line", onLine);
+        rl.off("close", onClose);
+        rl.close();
+        stdout.destroy();
+        cb();
+      };
+
+      const onLine = (line: string): void => {
         const trimmed = line.trim();
         if (trimmed.length > 0) {
-          return trimmed;
+          finish(() => resolve(trimmed));
         }
-      }
-    } finally {
-      rl.close();
-      stdout.destroy();
-    }
-    throw new Error(
-      `dbus-daemon failed to emit session bus address (code ${proc.exitCode ?? proc.signalCode})`,
-    );
+      };
+
+      const onError = (err: Error): void => {
+        finish(() =>
+          reject(new Error(`failed to spawn dbus-daemon: ${err.message}`, { cause: err })),
+        );
+      };
+
+      const onExit = (): void => {
+        finish(() =>
+          reject(
+            new Error(
+              `dbus-daemon failed to emit session bus address (code ${proc.exitCode ?? proc.signalCode})`,
+            ),
+          ),
+        );
+      };
+
+      const onClose = (): void => {
+        finish(() =>
+          reject(
+            new Error(
+              `dbus-daemon closed stdout before emitting bus address (code ${proc.exitCode ?? proc.signalCode})`,
+            ),
+          ),
+        );
+      };
+
+      const timer = setTimeout(() => {
+        finish(() =>
+          reject(
+            createTimeoutError(
+              `timed out after ${timeoutMs}ms waiting for dbus-daemon bus address`,
+            ),
+          ),
+        );
+      }, timeoutMs);
+      timer.unref();
+
+      proc.once("error", onError);
+      proc.once("exit", onExit);
+      rl.on("line", onLine);
+      rl.once("close", onClose);
+    });
   }
 
   async close(): Promise<void> {
@@ -393,6 +484,7 @@ class IsolatedDisplayStack {
 interface PoolSlot {
   readonly page: Page;
   readonly proxy: string | undefined;
+  readonly overrideProxy: boolean;
   uses: number;
   remoteWorker: string | undefined;
   displayNum: number | undefined;
@@ -403,6 +495,7 @@ interface PoolSlot {
 function makeLocalSlot(args: {
   session: Session;
   proxy: string | undefined;
+  overrideProxy: boolean;
   displayStack: IsolatedDisplayStack | null;
   displayNum: number | undefined;
 }): PoolSlot {
@@ -411,6 +504,7 @@ function makeLocalSlot(args: {
   return {
     page: args.session.page,
     proxy: args.proxy,
+    overrideProxy: args.overrideProxy,
     uses: 0,
     remoteWorker: undefined,
     displayNum: args.displayNum,
@@ -443,6 +537,7 @@ function makeRemoteSlot(args: { transport: Transport; remoteWorker: string }): P
   return {
     page: new Page(args.transport),
     proxy: undefined,
+    overrideProxy: false,
     uses: 0,
     remoteWorker: args.remoteWorker,
     displayNum: undefined,
@@ -500,9 +595,15 @@ export class BrowserPool implements AsyncDisposable {
   #failed = 0;
 
   constructor(options: BrowserPoolOptions = {}) {
+    const seenNormalized = new Set<string>();
     if (options.remoteWorkers !== undefined) {
       for (const raw of options.remoteWorkers) {
         const parsed = parseRemoteWorker(raw);
+        const key = `${parsed.host}:${parsed.port}`;
+        if (seenNormalized.has(key)) {
+          throw new RangeError(`duplicate remote worker endpoint: ${JSON.stringify(raw)}`);
+        }
+        seenNormalized.add(key);
         this.#remoteEndpoints.set(raw, parsed);
         this.#availableRemotes.push(raw);
       }
@@ -516,6 +617,17 @@ export class BrowserPool implements AsyncDisposable {
     if (this.#remoteEndpoints.size > 0 && resolvedSize > this.#remoteEndpoints.size) {
       throw new RangeError(
         `size (${resolvedSize}) cannot exceed number of remoteWorkers (${this.#remoteEndpoints.size})`,
+      );
+    }
+
+    const resolvedLaunchOptions = options.launchOptions ?? {};
+    if (
+      this.#remoteEndpoints.size === 0 &&
+      resolvedSize > 1 &&
+      resolvedLaunchOptions.profileDir !== undefined
+    ) {
+      throw new RangeError(
+        "launchOptions.profileDir cannot be set when size > 1 (multiple Chrome slots cannot share one --user-data-dir)",
       );
     }
     if (
@@ -538,7 +650,7 @@ export class BrowserPool implements AsyncDisposable {
 
     this.#size = resolvedSize;
     this.#availablePermits = resolvedSize;
-    this.#launchOptions = options.launchOptions ?? {};
+    this.#launchOptions = resolvedLaunchOptions;
     this.#proxies = options.proxies !== undefined ? [...options.proxies] : [];
     this.#isolatedDisplays = options.isolatedDisplays ?? false;
     this.#displayBase = displayBase;
@@ -597,6 +709,12 @@ export class BrowserPool implements AsyncDisposable {
         throw new Error("BrowserPool is closed");
       }
       const reused = await this.#popHealthyIdle(options?.proxy);
+      if (this.#closed) {
+        if (reused !== null) {
+          await this.#destroySlot(reused);
+        }
+        throw new Error("BrowserPool is closed");
+      }
       if (reused !== null) {
         slot = reused;
       } else {
@@ -605,6 +723,10 @@ export class BrowserPool implements AsyncDisposable {
         } catch (err) {
           this.#failed += 1;
           throw err;
+        }
+        if (this.#closed) {
+          await this.#destroySlot(slot);
+          throw new Error("BrowserPool is closed");
         }
       }
       this.#activeSlots.add(slot);
@@ -713,16 +835,29 @@ export class BrowserPool implements AsyncDisposable {
     this.#availablePermits += 1;
   }
 
-  #nextProxy(override: string | undefined): string | undefined {
+  #isOverrideProxy(proxy: string | undefined): boolean {
+    if (proxy === undefined) {
+      return false;
+    }
+    if (this.#proxies.length > 0) {
+      return !this.#proxies.includes(proxy);
+    }
+    return proxy !== this.#launchOptions.proxy;
+  }
+
+  #nextProxy(override: string | undefined): {
+    readonly proxy: string | undefined;
+    readonly overrideProxy: boolean;
+  } {
     if (override !== undefined) {
-      return override;
+      return { proxy: override, overrideProxy: this.#isOverrideProxy(override) };
     }
     if (this.#proxies.length > 0) {
       const proxy = this.#proxies[this.#proxyCursor % this.#proxies.length];
       this.#proxyCursor += 1;
-      return proxy;
+      return { proxy, overrideProxy: false };
     }
-    return this.#launchOptions.proxy;
+    return { proxy: this.#launchOptions.proxy, overrideProxy: false };
   }
 
   #releaseSlotResources(slot: PoolSlot): void {
@@ -769,12 +904,18 @@ export class BrowserPool implements AsyncDisposable {
 
       try {
         await slot.ping();
-        return slot;
       } catch {
         this.#failed += 1;
         this.#recycled += 1;
         await this.#destroySlot(slot);
+        continue;
       }
+
+      if (this.#closed) {
+        await this.#destroySlot(slot);
+        return null;
+      }
+      return slot;
     }
     return null;
   }
@@ -819,7 +960,7 @@ export class BrowserPool implements AsyncDisposable {
   }
 
   async #launchLocalSlot(proxy: string | undefined): Promise<PoolSlot> {
-    const effectiveProxy = this.#nextProxy(proxy);
+    const { proxy: effectiveProxy, overrideProxy } = this.#nextProxy(proxy);
     const useIsolated = this.#isolatedDisplays && process.platform === "linux";
 
     let displayNum: number | undefined;
@@ -850,6 +991,7 @@ export class BrowserPool implements AsyncDisposable {
       return makeLocalSlot({
         session,
         proxy: effectiveProxy,
+        overrideProxy,
         displayStack,
         displayNum,
       });
@@ -871,7 +1013,7 @@ export class BrowserPool implements AsyncDisposable {
     }
 
     const reachedMaxUses = this.#maxUsesPerSlot !== undefined && slot.uses >= this.#maxUsesPerSlot;
-    if (forceRecycle || reachedMaxUses) {
+    if (forceRecycle || reachedMaxUses || slot.overrideProxy) {
       this.#recycled += 1;
       await this.#destroySlot(slot);
       return;
@@ -882,6 +1024,11 @@ export class BrowserPool implements AsyncDisposable {
     } catch {
       this.#failed += 1;
       this.#recycled += 1;
+      await this.#destroySlot(slot);
+      return;
+    }
+
+    if (this.#closed) {
       await this.#destroySlot(slot);
       return;
     }
