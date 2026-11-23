@@ -126,6 +126,19 @@ def _connect_with_retry(
     raise TimeoutError(msg)
 
 
+def _daemon_env(proxy: str | None) -> dict[str, str]:
+    """Builds the daemon's environment.
+
+    The proxy URL may embed credentials, so it travels in the environment (readable only by
+    the same user) rather than in argv (world-readable via `ps`). The daemon strips it from
+    the environment of every process it spawns in turn.
+    """
+    env = os.environ.copy()
+    if proxy is not None:
+        env["WAYBOUND_PROXY"] = proxy
+    return env
+
+
 class Session:
     """Context manager that starts `waybound-daemon`, connects, and cleans up on exit."""
 
@@ -204,10 +217,7 @@ class Session:
         stderr_log = Path(tmp_dir.name) / "daemon.stderr.log"
         cmd = self._build_daemon_cmd(socket_path=socket_path, tcp_addr=tcp_addr)
 
-        child_env = os.environ.copy()
-        if opts.proxy is not None:
-            # Pass proxy via env var so credentials do not appear in process argv (`ps`).
-            child_env["WAYBOUND_PROXY"] = opts.proxy
+        child_env = _daemon_env(opts.proxy)
 
         try:
             with stderr_log.open("wb") as stderr_file:

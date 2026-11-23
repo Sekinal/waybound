@@ -45,6 +45,11 @@ impl Driver for WindowsDriver {
         BackendKind::WindowsNative
     }
 
+    /// UIA runtime ids stay stable for an element's lifetime; positional fallback ids do not.
+    fn is_stable_node_id(&self, id: &str) -> bool {
+        !id.starts_with(uia::POSITIONAL_ID_PREFIX)
+    }
+
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
         #[cfg(target_os = "windows")]
         {
@@ -112,6 +117,13 @@ mod tests {
         let driver = WindowsDriver::new(Some(1337));
         assert_eq!(driver.pid(), Some(1337));
         assert_eq!(driver.backend_kind(), BackendKind::WindowsNative);
+    }
+
+    #[test]
+    fn positional_fallback_ids_are_not_stable() {
+        let driver = WindowsDriver::default();
+        assert!(driver.is_stable_node_id("42-7-1001"));
+        assert!(!driver.is_stable_node_id("uia-pos-3"));
     }
 
     #[test]

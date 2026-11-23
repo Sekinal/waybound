@@ -40,6 +40,10 @@ pub enum Request {
         query: LocatorQuery,
     },
     /// Locate an element matching `query` and double-click its center.
+    ///
+    /// The wire name is `dbl_click`; `dblclick` is accepted as an alias because the
+    /// Python SDK up to v0.4.0 sent that spelling.
+    #[serde(alias = "dblclick")]
     DblClick {
         /// Semantic locator query.
         query: LocatorQuery,
@@ -119,7 +123,8 @@ pub enum Request {
         /// Maximum wait time in milliseconds.
         timeout_ms: u64,
     },
-    /// Capture a native OS PNG screenshot of the browser window to `path`.
+    /// Capture a native OS PNG screenshot to `path` (the browser window on macOS, the whole
+    /// display on Linux, the primary screen on Windows, the device screen on Android).
     Screenshot {
         /// Destination PNG file path.
         path: String,
@@ -137,6 +142,20 @@ pub enum Request {
         /// (defaults to the daemon's standard action auto-wait).
         #[serde(default)]
         timeout_ms: Option<u64>,
+    },
+    /// Idempotently drive a checkbox / radio / switch to `checked`.
+    ///
+    /// Auto-waits for the element like `click` (and, when a click is needed, for it to be
+    /// enabled), refuses elements without a checked state and unchecking a radio button,
+    /// clicks only when the current state differs, then re-reads the node and fails if the
+    /// state did not change. A mixed checkbox counts as unchecked, so `checked: false` leaves
+    /// it mixed without clicking. Answered with [`Response::Node`] carrying the node as
+    /// re-read after the action.
+    SetChecked {
+        /// Semantic locator query.
+        query: LocatorQuery,
+        /// Desired checked state (`true` for `check()`, `false` for `uncheck()`).
+        checked: bool,
     },
 }
 
@@ -192,6 +211,10 @@ impl From<&WayboundError> for Response {
             WayboundError::BackendUnavailable { .. } => "backend_unavailable",
             WayboundError::Timeout { .. } => "timeout",
             WayboundError::Io(_) => "io_error",
+            WayboundError::Transient { .. } => "transient",
+            WayboundError::UnsupportedInput { .. } => "unsupported_input",
+            WayboundError::ElementDisabled { .. } => "element_disabled",
+            WayboundError::InvalidElementState { .. } => "invalid_element_state",
         };
         Self::Error {
             code: code.to_owned(),
@@ -250,5 +273,74 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn dbl_click_accepts_canonical_and_legacy_method_names() {
+        let expected = Request::DblClick {
+            query: LocatorQuery::by_role(Role::Button, Some("Search".to_owned())),
+        };
+        let encoded = serde_json::to_value(&expected).unwrap_or_default();
+        assert_eq!(encoded["method"], "dbl_click");
+
+        for method in ["dbl_click", "dblclick"] {
+            let mut legacy = encoded.clone();
+            legacy["method"] = serde_json::Value::String(method.to_owned());
+            let decoded: Result<Request, _> = serde_json::from_value(legacy);
+            assert_eq!(decoded.ok(), Some(expected.clone()), "method {method}");
+        }
+    }
+
+    #[test]
+    fn transient_and_unsupported_input_errors_have_distinct_codes() {
+        let transient = WayboundError::Transient {
+            backend: "android_waydroid".to_owned(),
+            reason: "ERROR: could not get idle state.".to_owned(),
+        };
+        assert!(transient.is_transient());
+        assert_eq!(
+            Response::from(&transient),
+            Response::Error {
+                code: "transient".to_owned(),
+                message:
+                    "transient backend failure: android_waydroid (ERROR: could not get idle state.)"
+                        .to_owned(),
+            }
+        );
+
+        let unsupported = WayboundError::UnsupportedInput {
+            backend: "android_waydroid".to_owned(),
+            reason: "Control+a needs API 31".to_owned(),
+        };
+        assert!(!unsupported.is_transient());
+        assert!(matches!(
+            Response::from(&unsupported),
+            Response::Error { code, .. } if code == "unsupported_input"
+        ));
+    }
+
+    #[test]
+    fn set_checked_request_uses_snake_case_method() {
+        let raw = r#"{"method":"set_checked","query":{"role":"check_box","name":"Agree","exact":false},"checked":true}"#;
+        let decoded: Result<Request, _> = serde_json::from_str(raw);
+        assert!(matches!(
+            decoded,
+            Ok(Request::SetChecked { checked: true, .. })
+        ));
+    }
+
+    #[test]
+    fn state_errors_map_to_stable_codes() {
+        let disabled = Response::from(&WayboundError::ElementDisabled {
+            action: "check".to_owned(),
+            query: "q".to_owned(),
+        });
+        assert!(matches!(disabled, Response::Error { ref code, .. } if code == "element_disabled"));
+        let invalid = Response::from(&WayboundError::InvalidElementState {
+            detail: "d".to_owned(),
+        });
+        assert!(
+            matches!(invalid, Response::Error { ref code, .. } if code == "invalid_element_state")
+        );
     }
 }

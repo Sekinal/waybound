@@ -9,9 +9,11 @@ pub use waydroid::{WaydroidConfig, WaydroidSession};
 
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use waybound_core::{
-    AccessibilityNode, BackendKind, Driver, InputEvent, MouseButton, Point, Result, WayboundError,
+    AccessibilityNode, BackendKind, Driver, InputEvent, LocatorQuery, MouseButton, Point, Result,
+    WayboundError,
 };
 
 /// Android / Waydroid browser driver communicating with an unmodified Android Chrome
@@ -22,6 +24,11 @@ pub struct AndroidDriver {
     drag: Mutex<adb::DragGesture>,
     /// Device API level, probed on the first drag release and cached once read.
     sdk_level: OnceLock<u32>,
+    /// Serialises `uiautomator dump`: two concurrent dumps on one device make each other
+    /// fail (`UiAutomationService ... already registered`).
+    dump_lock: Mutex<()>,
+    /// Device API level decides how modifier chords are sent; probed once on first use.
+    chords: adb::ChordSupportCache,
 }
 
 impl AndroidDriver {
@@ -36,6 +43,8 @@ impl AndroidDriver {
             cursor: Mutex::new(Point { x: 0.0, y: 0.0 }),
             drag: Mutex::new(adb::DragGesture::Idle),
             sdk_level: OnceLock::new(),
+            dump_lock: Mutex::new(()),
+            chords: adb::ChordSupportCache::new(),
         }
     }
 
@@ -53,6 +62,30 @@ impl AndroidDriver {
     /// or if `adb` fails to launch the intent.
     pub fn open_url(&self, url: &str) -> Result<()> {
         adb::open_chrome_url(self.serial.as_deref(), url)
+    }
+
+    /// Dumps the UI hierarchy, retrying transient `uiautomator` failures.
+    ///
+    /// The retry budget is [`adb::snapshot_retry_budget`] of `caller_remaining`.
+    ///
+    /// The dump lock is taken per attempt, so another connection can dump between this
+    /// call's retries instead of queueing behind the whole loop.
+    fn dump_xml(&self, caller_remaining: Option<Duration>) -> Result<String> {
+        let serial = self.serial.as_deref();
+        adb::retry_dump(
+            &adb::SystemClock,
+            adb::snapshot_retry_budget(caller_remaining),
+            || {
+                let _guard =
+                    self.dump_lock
+                        .lock()
+                        .map_err(|_| WayboundError::BackendUnavailable {
+                            backend: "android_waydroid".to_owned(),
+                            reason: "uiautomator dump mutex poisoned".to_owned(),
+                        })?;
+                adb::dump_ui_xml(serial)
+            },
+        )
     }
 }
 
@@ -76,12 +109,27 @@ impl Driver for AndroidDriver {
     }
 
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
-        let raw_xml = adb::dump_ui_xml(self.serial.as_deref())?;
+        let raw_xml = self.dump_xml(None)?;
         Ok(xml::parse_uiautomator_xml(&raw_xml))
     }
 
+    fn locate_within(
+        &self,
+        query: &LocatorQuery,
+        remaining: Duration,
+    ) -> Result<AccessibilityNode> {
+        let raw_xml = self.dump_xml(Some(remaining))?;
+        let nodes = xml::parse_uiautomator_xml(&raw_xml);
+        query
+            .resolve_one(&nodes)
+            .cloned()
+            .ok_or_else(|| WayboundError::ElementNotFound {
+                query: format!("{query:?}"),
+            })
+    }
+
     fn current_url(&self) -> Result<Option<String>> {
-        let raw_xml = adb::dump_ui_xml(self.serial.as_deref())?;
+        let raw_xml = self.dump_xml(None)?;
         Ok(xml::extract_chrome_url(&raw_xml))
     }
 
@@ -108,9 +156,14 @@ impl Driver for AndroidDriver {
             .drag
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        adb::dispatch_input(self.serial.as_deref(), event, &mut guard, &mut drag, || {
-            self.sdk_level()
-        })
+        adb::dispatch_input(
+            self.serial.as_deref(),
+            event,
+            &mut guard,
+            &self.chords,
+            &mut drag,
+            || self.sdk_level(),
+        )
     }
 
     /// Drops the buffered drag without sending anything: the finger never touched the

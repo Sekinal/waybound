@@ -6,15 +6,36 @@
 //! This module binds a loopback-only unauthenticated listener (`127.0.0.1:0`) and
 //! handles upstream authentication transparently — without extensions, auth prompts,
 //! or TLS MITM.
+//!
+//! # Local exposure
+//!
+//! Because the listener needs no credentials, anything that can connect to it can relay
+//! traffic through the user's authenticated upstream proxy. Every accepted connection is
+//! therefore checked by a [`PeerVerifier`] before a single byte is read: refused clients get
+//! `403 Forbidden`, no upstream connection is opened and no credentials are sent.
+//!
+//! - **Linux:** only sockets owned by the daemon's effective UID are admitted (looked up in
+//!   `/proc/net/tcp{,6}`). Other users are locked out; other processes of the *same* user
+//!   are not, as they could read the credentials from the daemon's environment anyway.
+//!   Caveats, each logged as a startup warning: if the daemon cannot see its own listener
+//!   in `/proc/net/tcp` it runs unrestricted, and as root (UID 0) or the overflow UID 65534
+//!   the UID check does not separate users.
+//! - **macOS / Windows:** no check is possible without FFI or a per-connection subprocess,
+//!   so any local process, under any user, can use the forwarder while a session runs.
+//!
+//! See [`crate::peer`] for the details and rationale. Child processes never inherit the
+//! `WAYBOUND_PROXY` variable (see [`waybound_core::process`]).
 
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use waybound_core::Result;
+
+use crate::peer::{PeerDecision, PeerVerifier, platform_verifier};
 use waybound_net::{
     Direction, HostBlocker, InflightCounter, KeyLogStore, PassiveConnectionTap, ResponseCallback,
 };
@@ -27,6 +48,26 @@ const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HEADER_LINES: usize = 128;
 const MAX_CONCURRENT_TUNNELS: usize = 128;
+const MAX_REASON_PHRASE_CHARS: usize = 64;
+const CONNECT_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+/// How long a refused client gets to finish sending its request before the socket closes
+/// (closing with unread data would reset the connection and could discard the `403`).
+const REJECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// Minimum spacing of refusal warnings, so another local user cannot flood the log.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Read-only observer of the bytes relayed through a `CONNECT` tunnel.
+///
+/// Production code uses [`PassiveConnectionTap`]; tests substitute a recorder.
+trait TunnelObserver: Send + Sync {
+    fn observe(&self, dir: Direction, bytes: &[u8]);
+}
+
+impl TunnelObserver for PassiveConnectionTap {
+    fn observe(&self, dir: Direction, bytes: &[u8]) {
+        Self::observe(self, dir, bytes);
+    }
+}
 
 /// RAII guard decrementing the active tunnel counter on drop.
 struct TunnelGuard {
@@ -150,6 +191,33 @@ struct ForwarderConfig {
     upstream: Option<UpstreamProxy>,
     blocker: HostBlocker,
     tap: Option<PassiveTapConfig>,
+    /// Test seam: when set, replaces the passive tap for every `CONNECT` tunnel.
+    #[cfg(test)]
+    test_observer: Option<Arc<dyn TunnelObserver>>,
+    /// Test seam: when set, replaces the platform's peer verifier.
+    #[cfg(test)]
+    test_peer_verifier: Option<Arc<dyn PeerVerifier>>,
+}
+
+impl ForwarderConfig {
+    /// Creates the observer attached to an established `CONNECT` tunnel to `host`, if any.
+    fn tunnel_observer(&self, host: &str) -> Option<Arc<dyn TunnelObserver>> {
+        #[cfg(test)]
+        {
+            if let Some(observer) = &self.test_observer {
+                return Some(Arc::clone(observer));
+            }
+        }
+        self.tap.as_ref().map(|t| {
+            let tap: Arc<dyn TunnelObserver> = Arc::new(PassiveConnectionTap::new(
+                host.to_owned(),
+                t.keylog.clone(),
+                t.inflight.clone(),
+                Arc::clone(&t.on_response),
+            ));
+            tap
+        })
+    }
 }
 
 /// RAII handle for the local loopback proxy forwarder thread.
@@ -167,7 +235,37 @@ impl ProxyForwarder {
     /// the listener thread cannot be spawned.
     #[cfg(test)]
     pub fn start(upstream: UpstreamProxy) -> Result<Self> {
-        Self::start_with_options(Some(upstream), HostBlocker::default(), None)
+        Self::start_with_verifier(upstream, Arc::new(crate::peer::AllowAll))
+    }
+
+    /// Starts a forwarder that admits clients according to `verifier`.
+    #[cfg(test)]
+    fn start_with_verifier(
+        upstream: UpstreamProxy,
+        verifier: Arc<dyn PeerVerifier>,
+    ) -> Result<Self> {
+        Self::spawn(ForwarderConfig {
+            upstream: Some(upstream),
+            blocker: HostBlocker::default(),
+            tap: None,
+            test_observer: None,
+            test_peer_verifier: Some(verifier),
+        })
+    }
+
+    /// Starts a forwarder whose `CONNECT` tunnels report relayed bytes to `observer`.
+    #[cfg(test)]
+    fn start_with_observer(
+        upstream: UpstreamProxy,
+        observer: Arc<dyn TunnelObserver>,
+    ) -> Result<Self> {
+        Self::spawn(ForwarderConfig {
+            upstream: Some(upstream),
+            blocker: HostBlocker::default(),
+            tap: None,
+            test_observer: Some(observer),
+            test_peer_verifier: Some(Arc::new(crate::peer::AllowAll)),
+        })
     }
 
     /// Starts a loopback HTTP/CONNECT proxy with optional upstream proxy, L4 host blocker,
@@ -182,20 +280,40 @@ impl ProxyForwarder {
         blocker: HostBlocker,
         tap: Option<PassiveTapConfig>,
     ) -> Result<Self> {
+        Self::spawn(ForwarderConfig {
+            upstream,
+            blocker,
+            tap,
+            #[cfg(test)]
+            test_observer: None,
+            #[cfg(test)]
+            test_peer_verifier: None,
+        })
+    }
+
+    fn spawn(cfg: ForwarderConfig) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let local_addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
 
+        #[cfg(test)]
+        let verifier = cfg
+            .test_peer_verifier
+            .clone()
+            .unwrap_or_else(|| platform_verifier(local_addr));
+        #[cfg(not(test))]
+        let verifier = platform_verifier(local_addr);
+        let refusals = Arc::new(RefusalLog::default());
+
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_ref = Arc::clone(&shutdown);
-        let has_tap = tap.is_some();
-        let has_blocker = !blocker.is_empty();
-        let upstream_desc = upstream.as_ref().map(|u| (u.protocol, u.host_port.clone()));
-        let cfg = Arc::new(ForwarderConfig {
-            upstream,
-            blocker,
-            tap,
-        });
+        let has_tap = cfg.tap.is_some();
+        let has_blocker = !cfg.blocker.is_empty();
+        let upstream_desc = cfg
+            .upstream
+            .as_ref()
+            .map(|u| (u.protocol, u.host_port.clone()));
+        let cfg = Arc::new(cfg);
         let cfg_thread = Arc::clone(&cfg);
         let active_tunnels = Arc::new(AtomicUsize::new(0));
 
@@ -212,6 +330,8 @@ impl ProxyForwarder {
                                 continue;
                             }
                             let c = Arc::clone(&cfg_thread);
+                            let v = Arc::clone(&verifier);
+                            let r = Arc::clone(&refusals);
                             let guard = TunnelGuard {
                                 counter: Arc::clone(&active_tunnels),
                             };
@@ -219,7 +339,7 @@ impl ProxyForwarder {
                                 .name("waybound-proxy-conn".to_owned())
                                 .spawn(move || {
                                     let _guard = guard;
-                                    if let Err(err) = handle_client(client, &c) {
+                                    if let Err(err) = serve_client(client, &c, v.as_ref(), &r) {
                                         tracing::debug!(error = %err, "proxy client tunnel closed");
                                     }
                                 });
@@ -285,6 +405,103 @@ fn connect_upstream(host_port: &str) -> io::Result<TcpStream> {
     }))
 }
 
+/// Checks the local process behind `client` before anything is read from it, so a refused
+/// client never causes an upstream connection or sees credentials being used.
+/// Rate limiter for refusal warnings: the first refusal is logged at `warn`, later ones at
+/// most once per [`REFUSAL_LOG_INTERVAL`] with a count of those logged only at `debug`.
+#[derive(Default)]
+struct RefusalLog {
+    state: std::sync::Mutex<RefusalLogState>,
+}
+
+#[derive(Default)]
+struct RefusalLogState {
+    last_warn: Option<Instant>,
+    suppressed: u64,
+}
+
+impl RefusalLog {
+    /// Records a refusal at `now`. Returns `Some(suppressed since the last warning)` when
+    /// this one should be logged at `warn`.
+    fn record(&self, now: Instant) -> Option<u64> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        match state.last_warn {
+            Some(last) if now.saturating_duration_since(last) < REFUSAL_LOG_INTERVAL => {
+                state.suppressed += 1;
+                None
+            }
+            _ => {
+                state.last_warn = Some(now);
+                Some(std::mem::take(&mut state.suppressed))
+            }
+        }
+    }
+}
+
+fn admit_client(
+    client: &TcpStream,
+    verifier: &dyn PeerVerifier,
+    refusals: &RefusalLog,
+) -> PeerDecision {
+    match (client.peer_addr(), client.local_addr()) {
+        (Ok(peer), Ok(local)) => match verifier.verify(peer, local) {
+            PeerDecision::Allow => PeerDecision::Allow,
+            PeerDecision::Deny(reason) => {
+                if let Some(suppressed) = refusals.record(Instant::now()) {
+                    tracing::warn!(
+                        %peer,
+                        %reason,
+                        suppressed_since_last_warning = suppressed,
+                        "refused local proxy client"
+                    );
+                } else {
+                    tracing::debug!(%peer, %reason, "refused local proxy client");
+                }
+                PeerDecision::Deny(reason)
+            }
+        },
+        (Err(err), _) | (_, Err(err)) => {
+            tracing::debug!(error = %err, "proxy client vanished before verification");
+            PeerDecision::Deny(err.to_string())
+        }
+    }
+}
+
+/// Replies `403 Forbidden` and closes, draining briefly so the reply is not lost to a reset.
+fn reject_client(mut client: TcpStream) {
+    let _ = write_proxy_error(&mut client, 403, "Forbidden");
+    let _ = client.shutdown(std::net::Shutdown::Write);
+    let _ = client.set_read_timeout(Some(REJECT_DRAIN_TIMEOUT));
+    let deadline = Instant::now() + REJECT_DRAIN_TIMEOUT;
+    let mut sink = [0u8; 4096];
+    let mut drained = 0usize;
+    while drained <= MAX_HEADER_BYTES && Instant::now() < deadline {
+        match client.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => drained += n,
+        }
+    }
+}
+
+/// Verifies the client's process, then relays its request or refuses it.
+fn serve_client(
+    client: TcpStream,
+    cfg: &ForwarderConfig,
+    verifier: &dyn PeerVerifier,
+    refusals: &RefusalLog,
+) -> io::Result<()> {
+    // Accepted sockets inherit the listener's non-blocking mode on BSD-derived systems.
+    client.set_nonblocking(false)?;
+    client.set_write_timeout(Some(HEADER_IO_TIMEOUT))?;
+    if admit_client(&client, verifier, refusals) != PeerDecision::Allow {
+        reject_client(client);
+        return Ok(());
+    }
+    handle_client(client, cfg)
+}
+
 fn handle_client(mut client: TcpStream, cfg: &ForwarderConfig) -> io::Result<()> {
     client.set_nonblocking(false)?;
     client.set_read_timeout(Some(HEADER_IO_TIMEOUT))?;
@@ -332,7 +549,7 @@ fn handle_client(mut client: TcpStream, cfg: &ForwarderConfig) -> io::Result<()>
         return Ok(());
     }
 
-    let (mut upstream_stream, strip_http_connect_reply) = open_upstream_tunnel(
+    let Some((mut upstream_stream, upstream_leftover)) = open_upstream_tunnel(
         &mut client,
         cfg.upstream.as_ref(),
         &header_lines,
@@ -340,17 +557,16 @@ fn handle_client(mut client: TcpStream, cfg: &ForwarderConfig) -> io::Result<()>
         &target_host,
         target_port,
         is_connect,
-    )?;
+    )?
+    else {
+        // The upstream refused the tunnel and the failure was already relayed to the client.
+        return Ok(());
+    };
 
-    let tap = if is_connect && !strip_http_connect_reply {
-        cfg.tap.as_ref().map(|t| {
-            PassiveConnectionTap::new(
-                target_host.clone(),
-                t.keylog.clone(),
-                t.inflight.clone(),
-                Arc::clone(&t.on_response),
-            )
-        })
+    // Every path that reaches this point has consumed any proxy-level reply, so a `CONNECT`
+    // tunnel now carries only end-to-end TLS bytes and can be observed.
+    let tap = if is_connect {
+        cfg.tunnel_observer(&target_host)
     } else {
         None
     };
@@ -359,8 +575,18 @@ fn handle_client(mut client: TcpStream, cfg: &ForwarderConfig) -> io::Result<()>
     if !buffered.is_empty() {
         upstream_stream.write_all(buffered)?;
         upstream_stream.flush()?;
-        if let Some(ref t) = tap {
+        if let Some(t) = &tap {
             t.observe(Direction::ClientToServer, buffered);
+        }
+    }
+
+    // Bytes the upstream proxy sent right behind its `CONNECT` reply already belong to the
+    // tunnelled stream (the first server-side TLS bytes); they must not be dropped.
+    if !upstream_leftover.is_empty() {
+        client.write_all(&upstream_leftover)?;
+        client.flush()?;
+        if let Some(t) = &tap {
+            t.observe(Direction::ServerToClient, &upstream_leftover);
         }
     }
 
@@ -381,7 +607,7 @@ fn handle_client(mut client: TcpStream, cfg: &ForwarderConfig) -> io::Result<()>
             let _ = copy_stream(
                 &mut client_to_up_src,
                 &mut client_to_up_dst,
-                tap_c2s.as_ref(),
+                tap_c2s.as_deref(),
                 Direction::ClientToServer,
             );
             let _ = client_to_up_dst.shutdown(std::net::Shutdown::Write);
@@ -390,7 +616,7 @@ fn handle_client(mut client: TcpStream, cfg: &ForwarderConfig) -> io::Result<()>
     let _ = copy_stream(
         &mut up_to_client_src,
         &mut up_to_client_dst,
-        tap.as_ref(),
+        tap.as_deref(),
         Direction::ServerToClient,
     );
     let _ = up_to_client_dst.shutdown(std::net::Shutdown::Write);
@@ -398,6 +624,12 @@ fn handle_client(mut client: TcpStream, cfg: &ForwarderConfig) -> io::Result<()>
     Ok(())
 }
 
+/// Connects to the target (directly or through `upstream`) and, for `CONNECT`, tells the
+/// client the tunnel is established exactly once.
+///
+/// Returns the upstream stream plus any tunnelled server bytes that were read while
+/// consuming an upstream HTTP proxy's `CONNECT` reply. Returns `Ok(None)` when the upstream
+/// proxy rejected the tunnel; the rejection has then already been relayed to the client.
 fn open_upstream_tunnel(
     client: &mut TcpStream,
     upstream: Option<&UpstreamProxy>,
@@ -406,7 +638,7 @@ fn open_upstream_tunnel(
     target_host: &str,
     target_port: u16,
     is_connect: bool,
-) -> io::Result<(TcpStream, bool)> {
+) -> io::Result<Option<(TcpStream, Vec<u8>)>> {
     match upstream {
         None => {
             let dest = format!("{target_host}:{target_port}");
@@ -414,12 +646,12 @@ fn open_upstream_tunnel(
             s.set_read_timeout(Some(HEADER_IO_TIMEOUT))?;
             s.set_write_timeout(Some(HEADER_IO_TIMEOUT))?;
             if is_connect {
-                client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+                client.write_all(CONNECT_ESTABLISHED)?;
                 client.flush()?;
             } else {
                 forward_plain_http_over_socks(&mut s, header_lines, total_bytes)?;
             }
-            Ok((s, false))
+            Ok(Some((s, Vec::new())))
         }
         Some(up) => {
             let mut s = connect_upstream(&up.host_port)?;
@@ -428,21 +660,171 @@ fn open_upstream_tunnel(
             match up.protocol {
                 ProxyProtocol::Http => {
                     forward_http_upstream(&mut s, header_lines, total_bytes, up)?;
-                    Ok((s, is_connect))
+                    if !is_connect {
+                        // Plain HTTP: the upstream's response is relayed to the client as-is.
+                        return Ok(Some((s, Vec::new())));
+                    }
+                    finish_http_upstream_connect(client, s)
                 }
                 ProxyProtocol::Socks5 => {
                     socks5_handshake(&mut s, up, target_host, target_port)?;
                     if is_connect {
-                        client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+                        client.write_all(CONNECT_ESTABLISHED)?;
                         client.flush()?;
                     } else {
                         forward_plain_http_over_socks(&mut s, header_lines, total_bytes)?;
                     }
-                    Ok((s, false))
+                    Ok(Some((s, Vec::new())))
                 }
             }
         }
     }
+}
+
+/// Consumes an upstream HTTP proxy's reply to `CONNECT` and reports the outcome to the client.
+fn finish_http_upstream_connect(
+    client: &mut TcpStream,
+    mut upstream_stream: TcpStream,
+) -> io::Result<Option<(TcpStream, Vec<u8>)>> {
+    match read_http_connect_reply(&mut upstream_stream) {
+        Ok(ConnectReply::Established { leftover }) => {
+            client.write_all(CONNECT_ESTABLISHED)?;
+            client.flush()?;
+            Ok(Some((upstream_stream, leftover)))
+        }
+        Ok(ConnectReply::Rejected { status, reason }) => {
+            tracing::debug!(status, "upstream HTTP proxy rejected CONNECT");
+            // Only the status line is relayed: upstream headers such as `Proxy-Authenticate`
+            // would make Chrome prompt for credentials this forwarder strips anyway.
+            write_proxy_error(client, status, &reason)?;
+            Ok(None)
+        }
+        Err(err) => {
+            let _ = write_proxy_error(client, 502, "Bad Gateway");
+            Err(err)
+        }
+    }
+}
+
+/// Upstream HTTP proxy's answer to a `CONNECT` request.
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectReply {
+    /// `2xx`: the tunnel is open. `leftover` holds tunnelled bytes read past the header block.
+    Established { leftover: Vec<u8> },
+    /// Any other status; the tunnel was not opened.
+    Rejected { status: u16, reason: String },
+}
+
+/// Reads the upstream proxy's `CONNECT` reply header block, bounded in size and total time.
+fn read_http_connect_reply(stream: &mut TcpStream) -> io::Result<ConnectReply> {
+    let deadline = Instant::now() + HEADER_IO_TIMEOUT;
+    let mut head = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(end) = find_header_end(&head) {
+            break end;
+        }
+        let room = MAX_HEADER_BYTES.saturating_sub(head.len());
+        if room == 0 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "upstream proxy CONNECT reply header exceeded limit",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                "timed out reading upstream proxy CONNECT reply",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let want = room.min(chunk.len());
+        match stream.read(&mut chunk[..want]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "upstream proxy closed before completing CONNECT reply",
+                ));
+            }
+            Ok(n) => head.extend_from_slice(&chunk[..n]),
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    };
+    stream.set_read_timeout(Some(HEADER_IO_TIMEOUT))?;
+
+    let leftover = head.split_off(head_end);
+    let (status, reason) = parse_status_line(&head)?;
+    if (200..300).contains(&status) {
+        Ok(ConnectReply::Established { leftover })
+    } else {
+        Ok(ConnectReply::Rejected { status, reason })
+    }
+}
+
+/// Returns the offset just past the blank line ending an HTTP header block (`\r\n\r\n`,
+/// tolerating bare `\n\n`), if the block is complete.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.iter().enumerate().find_map(|(idx, &byte)| {
+        if byte != b'\n' {
+            return None;
+        }
+        let rest = &buf[idx + 1..];
+        if rest.starts_with(b"\n") {
+            Some(idx + 2)
+        } else if rest.starts_with(b"\r\n") {
+            Some(idx + 3)
+        } else {
+            None
+        }
+    })
+}
+
+/// Parses `HTTP/1.x <code> <reason>` into a status code and a sanitized reason phrase.
+fn parse_status_line(head: &[u8]) -> io::Result<(u16, String)> {
+    let malformed = || {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "malformed upstream proxy CONNECT reply status line",
+        )
+    };
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let line = std::str::from_utf8(&head[..line_end]).map_err(|_| malformed())?;
+    let line = line.trim_end_matches('\r');
+    let mut parts = line.splitn(3, ' ');
+    let version = parts.next().unwrap_or("");
+    let code = parts.next().unwrap_or("");
+    if !version.starts_with("HTTP/1.") || code.len() != 3 {
+        return Err(malformed());
+    }
+    let status = code.parse::<u16>().map_err(|_| malformed())?;
+    if !(100..600).contains(&status) {
+        return Err(malformed());
+    }
+    let reason = parts
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(MAX_REASON_PHRASE_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    Ok((status, reason))
+}
+
+/// Sends a body-less error status to the client. Statuses other than 4xx/5xx become `502`.
+fn write_proxy_error(client: &mut TcpStream, status: u16, reason: &str) -> io::Result<()> {
+    let (status, reason) = if (400..600).contains(&status) {
+        (status, reason)
+    } else {
+        (502, "Bad Gateway")
+    };
+    let reply =
+        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    client.write_all(reply.as_bytes())?;
+    client.flush()
 }
 
 fn forward_http_upstream(
@@ -724,7 +1106,7 @@ fn socks5_handshake(
 fn copy_stream(
     src: &mut TcpStream,
     dst: &mut TcpStream,
-    tap: Option<&PassiveConnectionTap>,
+    tap: Option<&dyn TunnelObserver>,
     dir: Direction,
 ) -> io::Result<()> {
     let mut buf = [0u8; 16 * 1024];
@@ -906,6 +1288,109 @@ mod tests {
     }
 
     #[test]
+    fn refusal_warnings_are_rate_limited() {
+        let log = RefusalLog::default();
+        let t0 = Instant::now();
+        assert_eq!(log.record(t0), Some(0));
+        assert_eq!(log.record(t0 + Duration::from_secs(1)), None);
+        assert_eq!(log.record(t0 + Duration::from_secs(59)), None);
+        assert_eq!(log.record(t0 + REFUSAL_LOG_INTERVAL), Some(2));
+        assert_eq!(log.record(t0 + REFUSAL_LOG_INTERVAL), None);
+        assert_eq!(log.record(t0 + 3 * REFUSAL_LOG_INTERVAL), Some(1));
+    }
+
+    /// Fake verifier that refuses everyone and records the addresses it was asked about.
+    #[derive(Default)]
+    struct DenyingVerifier {
+        seen: std::sync::Mutex<Vec<(SocketAddr, SocketAddr)>>,
+    }
+
+    impl PeerVerifier for DenyingVerifier {
+        fn verify(&self, peer: SocketAddr, local: SocketAddr) -> PeerDecision {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push((peer, local));
+            }
+            PeerDecision::Deny("test: client owned by another user".to_owned())
+        }
+    }
+
+    #[test]
+    fn refused_peer_gets_403_and_no_upstream_connection() {
+        let Ok(upstream_listener) = TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let Ok(upstream_addr) = upstream_listener.local_addr() else {
+            return;
+        };
+        let Ok(upstream) = UpstreamProxy::parse(&format!("http://user:pass@{upstream_addr}"))
+        else {
+            return;
+        };
+        let verifier = Arc::new(DenyingVerifier::default());
+        let Ok(forwarder) = ProxyForwarder::start_with_verifier(upstream, verifier.clone()) else {
+            return;
+        };
+        let Some(mut client) = connect_client(&forwarder) else {
+            return;
+        };
+        let _ =
+            client.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
+        let reply = String::from_utf8_lossy(&read_to_close(&mut client)).into_owned();
+        assert!(reply.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{reply:?}");
+
+        let seen = verifier.seen.lock().map(|g| g.clone()).unwrap_or_default();
+        assert_eq!(
+            seen,
+            vec![(
+                client.local_addr().unwrap_or(forwarder.local_addr),
+                forwarder.local_addr
+            )]
+        );
+
+        // No upstream connection was ever attempted, so no credentials left the daemon.
+        let _ = upstream_listener.set_nonblocking(true);
+        assert!(matches!(
+            upstream_listener.accept(),
+            Err(err) if err.kind() == ErrorKind::WouldBlock
+        ));
+    }
+
+    /// With the real platform policy, connections from this (same-user) process still work.
+    #[test]
+    fn platform_policy_admits_own_process() {
+        let Ok(upstream_listener) = TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let Ok(upstream_addr) = upstream_listener.local_addr() else {
+            return;
+        };
+        let server_thread = thread::spawn(move || {
+            if let Ok((mut stream, _)) = upstream_listener.accept() {
+                let _ = read_request_head(&mut stream);
+                let _ = stream.write_all(CONNECT_ESTABLISHED);
+            }
+        });
+        let Ok(upstream) = UpstreamProxy::parse(&format!("http://user:pass@{upstream_addr}"))
+        else {
+            return;
+        };
+        let Ok(forwarder) =
+            ProxyForwarder::start_with_options(Some(upstream), HostBlocker::default(), None)
+        else {
+            return;
+        };
+        let Some(mut client) = connect_client(&forwarder) else {
+            return;
+        };
+        let _ =
+            client.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
+        let reply = read_up_to(&mut client, CONNECT_ESTABLISHED.len());
+        assert_eq!(reply, CONNECT_ESTABLISHED);
+        drop(client);
+        let _ = server_thread.join();
+    }
+
+    #[test]
     fn forwarder_bridges_http_connect_to_authenticated_socks5() {
         let Ok(socks_listener) = TcpListener::bind("127.0.0.1:0") else {
             return;
@@ -961,5 +1446,294 @@ mod tests {
         drop(client);
 
         assert!(socks_thread.join().unwrap_or(false));
+    }
+
+    /// Records every byte a tunnel observer is shown, per direction.
+    #[derive(Default)]
+    struct RecordingObserver {
+        c2s: std::sync::Mutex<Vec<u8>>,
+        s2c: std::sync::Mutex<Vec<u8>>,
+    }
+
+    impl TunnelObserver for RecordingObserver {
+        fn observe(&self, dir: Direction, bytes: &[u8]) {
+            let slot = match dir {
+                Direction::ClientToServer => &self.c2s,
+                Direction::ServerToClient => &self.s2c,
+            };
+            if let Ok(mut buf) = slot.lock() {
+                buf.extend_from_slice(bytes);
+            }
+        }
+    }
+
+    impl RecordingObserver {
+        fn snapshot(&self) -> (Vec<u8>, Vec<u8>) {
+            let c2s = self.c2s.lock().map(|b| b.clone()).unwrap_or_default();
+            let s2c = self.s2c.lock().map(|b| b.clone()).unwrap_or_default();
+            (c2s, s2c)
+        }
+    }
+
+    const TEST_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Reads from `stream` until the bytes seen so far contain `\r\n\r\n`; returns them all.
+    fn read_request_head(stream: &mut TcpStream) -> Vec<u8> {
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while find_header_end(&head).is_none() {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => head.extend_from_slice(&buf[..n]),
+            }
+        }
+        head
+    }
+
+    /// Reads exactly `len` bytes, or whatever arrived before EOF/error/timeout.
+    fn read_up_to(stream: &mut TcpStream, len: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1024];
+        while out.len() < len {
+            let want = (len - out.len()).min(buf.len());
+            match stream.read(&mut buf[..want]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+            }
+        }
+        out
+    }
+
+    fn read_to_close(stream: &mut TcpStream) -> Vec<u8> {
+        read_up_to(stream, usize::MAX)
+    }
+
+    /// Starts a forwarder chained to a one-shot fake upstream HTTP proxy run by `upstream`.
+    fn forwarder_with_fake_http_upstream<F>(
+        upstream: F,
+    ) -> Option<(
+        ProxyForwarder,
+        Arc<RecordingObserver>,
+        thread::JoinHandle<Vec<u8>>,
+    )>
+    where
+        F: FnOnce(TcpStream) -> Vec<u8> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+        let addr = listener.local_addr().ok()?;
+        let server = thread::spawn(move || match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_read_timeout(Some(TEST_IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(TEST_IO_TIMEOUT));
+                upstream(stream)
+            }
+            Err(_) => Vec::new(),
+        });
+        let proxy = UpstreamProxy::parse(&format!("http://user:pass@{addr}")).ok()?;
+        let recorder = Arc::new(RecordingObserver::default());
+        let observer: Arc<dyn TunnelObserver> = recorder.clone();
+        let forwarder = ProxyForwarder::start_with_observer(proxy, observer).ok()?;
+        Some((forwarder, recorder, server))
+    }
+
+    fn connect_client(forwarder: &ProxyForwarder) -> Option<TcpStream> {
+        let client = TcpStream::connect(forwarder.local_addr).ok()?;
+        client.set_read_timeout(Some(TEST_IO_TIMEOUT)).ok()?;
+        client.set_write_timeout(Some(TEST_IO_TIMEOUT)).ok()?;
+        Some(client)
+    }
+
+    /// Waits until the recorder holds the expected bytes (observation trails the relay write).
+    fn wait_for_tap(recorder: &RecordingObserver, c2s: &[u8], s2c: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let deadline = Instant::now() + TEST_IO_TIMEOUT;
+        loop {
+            let seen = recorder.snapshot();
+            if (seen.0 == c2s && seen.1 == s2c) || Instant::now() >= deadline {
+                return seen;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    const SERVER_FIRST: &[u8] = b"\x16\x03\x03server-first-flight";
+    const CLIENT_HELLO: &[u8] = b"\x16\x03\x01client-hello-bytes";
+    const SERVER_REPLY: &[u8] = b"\x17\x03\x03server-app-data";
+    const UPSTREAM_200: &[u8] = b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: fake\r\n\r\n";
+
+    #[test]
+    fn http_upstream_connect_is_tapped_without_proxy_reply_bytes() {
+        // The 200 header and the first tunnelled bytes arrive in a single write.
+        let mut first = UPSTREAM_200.to_vec();
+        first.extend_from_slice(SERVER_FIRST);
+        assert_http_upstream_connect_is_tapped(vec![first]);
+    }
+
+    #[test]
+    fn http_upstream_connect_reply_split_across_writes_is_tapped() {
+        // The reply header is cut mid status line; its tail shares a write with the payload.
+        let (head, tail) = UPSTREAM_200.split_at(16);
+        let mut second = tail.to_vec();
+        second.extend_from_slice(SERVER_FIRST);
+        assert_http_upstream_connect_is_tapped(vec![head.to_vec(), second]);
+    }
+
+    /// Runs a tapped `CONNECT` through a fake upstream that sends `reply_writes` (the 200
+    /// header followed by [`SERVER_FIRST`]) as separate writes with a short pause in between.
+    fn assert_http_upstream_connect_is_tapped(reply_writes: Vec<Vec<u8>>) {
+        let Some((forwarder, recorder, server)) =
+            forwarder_with_fake_http_upstream(move |mut s| {
+                let request = read_request_head(&mut s);
+                for (idx, chunk) in reply_writes.iter().enumerate() {
+                    if idx > 0 {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    if s.write_all(chunk).and_then(|()| s.flush()).is_err() {
+                        return request;
+                    }
+                }
+                let hello = read_up_to(&mut s, CLIENT_HELLO.len());
+                if hello == CLIENT_HELLO {
+                    let _ = s.write_all(SERVER_REPLY);
+                }
+                request
+            })
+        else {
+            return;
+        };
+        let Some(mut client) = connect_client(&forwarder) else {
+            return;
+        };
+        assert!(
+            client
+                .write_all(b"CONNECT api.test:443 HTTP/1.1\r\nHost: api.test:443\r\n\r\n")
+                .is_ok()
+        );
+
+        let mut expected_head = CONNECT_ESTABLISHED.to_vec();
+        expected_head.extend_from_slice(SERVER_FIRST);
+        let head = read_up_to(&mut client, expected_head.len());
+        assert_eq!(head, expected_head, "{}", String::from_utf8_lossy(&head));
+
+        assert!(client.write_all(CLIENT_HELLO).is_ok());
+        let rest = read_to_close(&mut client);
+        assert_eq!(
+            rest, SERVER_REPLY,
+            "exactly one 200 and an unmodified tunnel"
+        );
+
+        let request = server.join().unwrap_or_default();
+        let request = String::from_utf8_lossy(&request);
+        assert!(
+            request.starts_with("CONNECT api.test:443 HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(request.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+
+        let mut s2c_expected = SERVER_FIRST.to_vec();
+        s2c_expected.extend_from_slice(SERVER_REPLY);
+        let (c2s, s2c) = wait_for_tap(&recorder, CLIENT_HELLO, &s2c_expected);
+        assert_eq!(c2s, CLIENT_HELLO);
+        assert_eq!(
+            s2c, s2c_expected,
+            "tap must see leftover bytes but no proxy header"
+        );
+    }
+
+    fn assert_upstream_rejection_is_relayed(reply: &'static [u8], expected_status: &str) {
+        let Some((forwarder, recorder, server)) =
+            forwarder_with_fake_http_upstream(move |mut s| {
+                let request = read_request_head(&mut s);
+                // Bytes behind the rejection must never reach the client or the tap.
+                let mut out = reply.to_vec();
+                out.extend_from_slice(b"\x16\x03\x03not-a-tunnel");
+                let _ = s.write_all(&out);
+                let _ = read_to_close(&mut s);
+                request
+            })
+        else {
+            return;
+        };
+        let Some(mut client) = connect_client(&forwarder) else {
+            return;
+        };
+        assert!(
+            client
+                .write_all(b"CONNECT api.test:443 HTTP/1.1\r\nHost: api.test:443\r\n\r\n")
+                .is_ok()
+        );
+        let response = read_to_close(&mut client);
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {expected_status}")),
+            "{response}"
+        );
+        assert!(response.ends_with("\r\n\r\n"), "{response}");
+        assert!(!response.contains("200"), "{response}");
+        assert!(!response.contains("Proxy-Authenticate"), "{response}");
+        assert!(!response.contains("not-a-tunnel"), "{response}");
+        drop(client);
+        let _ = server.join();
+        assert_eq!(recorder.snapshot(), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn http_upstream_407_is_relayed_and_not_tapped() {
+        assert_upstream_rejection_is_relayed(
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+              Proxy-Authenticate: Basic realm=\"upstream\"\r\nContent-Length: 0\r\n\r\n",
+            "407 Proxy Authentication Required\r\n",
+        );
+    }
+
+    #[test]
+    fn http_upstream_502_is_relayed_and_not_tapped() {
+        assert_upstream_rejection_is_relayed(
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+            "502 Bad Gateway\r\n",
+        );
+    }
+
+    #[test]
+    fn http_upstream_malformed_or_oversized_reply_becomes_502() {
+        assert_upstream_rejection_is_relayed(b"SSH-2.0-not-http\r\n\r\n", "502 Bad Gateway\r\n");
+
+        let oversized: &'static [u8] = Vec::leak(vec![b'a'; MAX_HEADER_BYTES + 16]);
+        assert_upstream_rejection_is_relayed(oversized, "502 Bad Gateway\r\n");
+    }
+
+    #[test]
+    fn header_end_and_status_line_parsing() {
+        assert_eq!(find_header_end(b"HTTP/1.1 200 OK\r\n"), None);
+        assert_eq!(find_header_end(b"HTTP/1.1 200 OK\r\n\r\nTLS"), Some(19));
+        assert_eq!(find_header_end(b"HTTP/1.0 200 OK\n\nTLS"), Some(17));
+        assert_eq!(
+            parse_status_line(b"HTTP/1.1 200 Connection established\r\n").ok(),
+            Some((200, "Connection established".to_owned()))
+        );
+        assert_eq!(
+            parse_status_line(b"HTTP/1.0 407\r\n").ok(),
+            Some((407, String::new()))
+        );
+        assert!(parse_status_line(b"HTTP/1.1 2000 nope\r\n").is_err());
+        assert!(parse_status_line(b"ICY 200 OK\r\n").is_err());
+    }
+
+    #[test]
+    fn header_end_found_only_once_complete_when_fed_bytewise() {
+        let mut wire = UPSTREAM_200.to_vec();
+        wire.extend_from_slice(SERVER_FIRST);
+        let mut fed = Vec::new();
+        for (idx, &byte) in wire.iter().enumerate() {
+            fed.push(byte);
+            let expected = (idx + 1 >= UPSTREAM_200.len()).then_some(UPSTREAM_200.len());
+            assert_eq!(find_header_end(&fed), expected, "after {} bytes", idx + 1);
+        }
+
+        let mut fed = Vec::new();
+        for &byte in b"HTTP/1.0 200 OK\n\nX" {
+            fed.push(byte);
+            let expected = (fed.len() >= 17).then_some(17);
+            assert_eq!(find_header_end(&fed), expected, "after {} bytes", fed.len());
+        }
     }
 }

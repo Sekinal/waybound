@@ -89,6 +89,26 @@ class AsyncLocator:
         """Drag this element onto `target` with a native press, pointer path, and release."""
         await asyncio.to_thread(self._inner.drag_to, target._inner, timeout_ms=timeout_ms)
 
+    async def check(self) -> None:
+        """Ensure the checkbox/radio/switch is checked, clicking only if it is not."""
+        await asyncio.to_thread(self._inner.check)
+
+    async def uncheck(self) -> None:
+        """Ensure the checkbox/switch is unchecked, clicking only if it is checked.
+
+        A mixed (indeterminate) checkbox counts as unchecked and is left as is; radio buttons
+        cannot be unchecked.
+        """
+        await asyncio.to_thread(self._inner.uncheck)
+
+    async def is_checked(self, *, timeout_ms: int = 5_000) -> bool:
+        """Return whether the element is checked (a mixed checkbox is not checked)."""
+        return await asyncio.to_thread(self._inner.is_checked, timeout_ms=timeout_ms)
+
+    async def is_enabled(self, *, timeout_ms: int = 5_000) -> bool:
+        """Return `True` unless the element is disabled."""
+        return await asyncio.to_thread(self._inner.is_enabled, timeout_ms=timeout_ms)
+
 
 class AsyncPage:
     """Async Playwright-style interface to a controlled browser session."""
@@ -179,7 +199,10 @@ class AsyncPage:
         )
 
     async def screenshot(self, path: Path | str | None = None) -> bytes:
-        """Capture a native OS PNG screenshot of the browser window and return PNG bytes."""
+        """Capture a native OS PNG screenshot and return PNG bytes.
+
+        macOS captures the browser window; the other backends capture the whole screen.
+        """
         return await asyncio.to_thread(self._inner.screenshot, path)
 
     def get_by_role(

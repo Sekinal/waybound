@@ -464,11 +464,11 @@ fn ydotool_stateless_commands(event: &InputEvent) -> Vec<Vec<String>> {
 /// Returns `Ok(true)` if `xclip` succeeded, or `Ok(false)` if `xclip` is unavailable.
 pub(crate) fn try_paste_unicode_x11(ch: char, display: Option<&str>) -> Result<bool> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::thread;
     use std::time::Duration;
 
-    let mut cmd = Command::new("xclip");
+    let mut cmd = waybound_core::process::command("xclip");
     let _ = cmd
         .args(["-selection", "clipboard"])
         .stdin(Stdio::piped())
