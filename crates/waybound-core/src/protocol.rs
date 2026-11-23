@@ -187,6 +187,10 @@ pub enum Response {
     Pong {
         /// Daemon crate version string.
         version: String,
+        /// Whether the browser this daemon launched (`--launch-chrome`) is still running.
+        /// Absent when the daemon did not launch a browser, and from older daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        browser_alive: Option<bool>,
     },
     /// Response to [`Request::SnapshotTree`] and [`Request::LocateAll`].
     Tree {
@@ -263,6 +267,28 @@ impl From<&WayboundError> for Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pong_browser_alive_is_optional_on_the_wire() {
+        let without = Response::Pong {
+            version: "1".to_owned(),
+            browser_alive: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&without).ok().as_deref(),
+            Some(r#"{"status":"pong","version":"1"}"#)
+        );
+        let with = Response::Pong {
+            version: "1".to_owned(),
+            browser_alive: Some(false),
+        };
+        assert_eq!(
+            serde_json::to_string(&with).ok().as_deref(),
+            Some(r#"{"status":"pong","version":"1","browser_alive":false}"#)
+        );
+        let old: Result<Response, _> = serde_json::from_str(r#"{"status":"pong","version":"1"}"#);
+        assert_eq!(old.ok(), Some(without));
+    }
     use crate::locator::Role;
 
     #[test]

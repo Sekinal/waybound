@@ -251,13 +251,35 @@ fn setup_proxy(
 struct BackendBundle {
     // Drop Chrome before the driver/compositor and runtime dir so Chrome never sees the
     // Wayland socket disappear while it is still running.
-    _launched: Option<launcher::LaunchedChrome>,
+    launched_browser: Option<launcher::LaunchedChrome>,
     driver: Arc<dyn Driver>,
     use_motion: bool,
     proxy_forwarder: Option<ProxyForwarder>,
     _waydroid: Option<WaydroidSession>,
     _xvfb: Option<HeadlessDisplaySession>,
     _wayland_runtime_dir: Option<TempDirGuard>,
+}
+
+impl BackendBundle {
+    fn server_options(
+        &self,
+        inflight: InflightCounter,
+        fingerprint: FingerprintRecorder,
+    ) -> ServerOptions {
+        ServerOptions {
+            use_motion: self.use_motion,
+            inflight,
+            fingerprint,
+            proxy_stats: self
+                .proxy_forwarder
+                .as_ref()
+                .map(ProxyForwarder::stats_handle),
+            browser: self
+                .launched_browser
+                .as_ref()
+                .map(launcher::LaunchedChrome::probe),
+        }
+    }
 }
 
 fn launch_desktop_chrome(
@@ -301,11 +323,18 @@ fn launch_desktop_chrome(
 fn headless_display_config(display: Option<&str>) -> Result<HeadlessDisplayConfig, String> {
     let mut config = HeadlessDisplayConfig::default();
     if let Some(raw) = display {
+        let invalid =
+            || format!("--display {raw:?} must look like :N when combined with --headless-xvfb");
         let without_colon = raw.strip_prefix(':').unwrap_or(raw);
-        let number = without_colon.split('.').next().unwrap_or(without_colon);
-        config.display_num = number.parse::<u16>().map_err(|_| {
-            format!("--display {raw:?} must look like :N when combined with --headless-xvfb")
-        })?;
+        let (number, screen) = match without_colon.split_once('.') {
+            Some((number, screen)) => (number, Some(screen)),
+            None => (without_colon, None),
+        };
+        let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if !all_digits(number) || screen.is_some_and(|s| !all_digits(s)) {
+            return Err(invalid());
+        }
+        config.display_num = number.parse::<u16>().map_err(|_| invalid())?;
     }
     Ok(config)
 }
@@ -321,7 +350,7 @@ fn build_backend(
         "mock" => Ok(BackendBundle {
             driver: Arc::new(MockDriver::sample_page()),
             use_motion: false,
-            _launched: None,
+            launched_browser: None,
             proxy_forwarder: None,
             _waydroid: None,
             _xvfb: None,
@@ -370,7 +399,7 @@ fn build_backend(
             Ok(BackendBundle {
                 driver: Arc::new(android),
                 use_motion: !cli.no_motion,
-                _launched: None,
+                launched_browser: None,
                 proxy_forwarder: proxy_fwd,
                 _waydroid: waydroid_session,
                 _xvfb: None,
@@ -393,7 +422,7 @@ fn build_backend(
             Ok(BackendBundle {
                 driver: Arc::new(MacOsDriver::new(target_pid)),
                 use_motion: !cli.no_motion,
-                _launched: launched,
+                launched_browser: launched,
                 proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: None,
@@ -459,7 +488,7 @@ fn build_backend(
             Ok(BackendBundle {
                 driver,
                 use_motion: !cli.no_motion,
-                _launched: launched,
+                launched_browser: launched,
                 proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: xvfb_session,
@@ -479,7 +508,7 @@ fn build_backend(
             Ok(BackendBundle {
                 driver: Arc::new(WindowsDriver::new(target_pid)),
                 use_motion: !cli.no_motion,
-                _launched: launched,
+                launched_browser: launched,
                 proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: None,
@@ -585,16 +614,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let proxy_stats = bundle
-        .proxy_forwarder
-        .as_ref()
-        .map(ProxyForwarder::stats_handle);
-    let options = ServerOptions {
-        use_motion: bundle.use_motion,
-        inflight,
-        fingerprint,
-        proxy_stats,
-    };
+    let options = bundle.server_options(inflight, fingerprint);
 
     if let Some(addr) = tcp_addr {
         if let Err(err) = server::serve_tcp(&addr, &bundle.driver, responses, options, shutdown) {
@@ -712,5 +732,9 @@ mod tests {
         );
         assert!(headless_display_config(Some("localhost:1")).is_err());
         assert!(headless_display_config(Some(":")).is_err());
+        assert!(headless_display_config(Some(":+5")).is_err());
+        assert!(headless_display_config(Some(":1.junk")).is_err());
+        assert!(headless_display_config(Some(":1.")).is_err());
+        assert!(headless_display_config(Some(":70000")).is_err());
     }
 }

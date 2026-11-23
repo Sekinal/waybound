@@ -24,6 +24,7 @@ use waybound_core::{
 };
 use waybound_net::{FingerprintRecorder, InflightCounter, wait_for_network_idle};
 
+use crate::launcher::BrowserProbe;
 use crate::net_tap::ResponseStore;
 use crate::proxy::ProxyStats;
 
@@ -73,6 +74,8 @@ pub struct ServerOptions {
     pub fingerprint: FingerprintRecorder,
     /// Shared per-session proxy bandwidth & connection counters (`None` when proxy is inactive).
     pub proxy_stats: Option<Arc<ProxyStats>>,
+    /// Liveness probe for the browser this daemon launched, reported by `ping`.
+    pub browser: Option<BrowserProbe>,
 }
 
 struct SessionState {
@@ -106,6 +109,7 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
     match request {
         Request::Ping => Response::Pong {
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            browser_alive: state.options.browser.as_ref().map(BrowserProbe::is_alive),
         },
         Request::SnapshotTree { max_nodes } => {
             let limit = waybound_core::clamp_max_nodes(max_nodes);
@@ -1572,6 +1576,7 @@ mod tests {
                 inflight: InflightCounter::default(),
                 fingerprint: FingerprintRecorder::new(),
                 proxy_stats: None,
+                browser: None,
             },
             Arc::new(ResponseStore::default()),
             Arc::new(AtomicBool::new(false)),
@@ -1585,6 +1590,7 @@ mod tests {
                 inflight: InflightCounter::default(),
                 fingerprint: FingerprintRecorder::new(),
                 proxy_stats: None,
+                browser: None,
             },
             Arc::new(ResponseStore::default()),
             shutdown,
@@ -2761,6 +2767,7 @@ mod tests {
                 inflight: InflightCounter::default(),
                 fingerprint: FingerprintRecorder::new(),
                 proxy_stats: Some(forwarder.stats_handle()),
+                browser: None,
             },
             Arc::new(ResponseStore::default()),
             Arc::new(AtomicBool::new(false)),

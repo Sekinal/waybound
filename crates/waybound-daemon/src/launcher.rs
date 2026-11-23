@@ -6,12 +6,14 @@
 //! `SSLKEYLOGFILE` for passive wire-level TLS inspection.
 
 use std::env;
+use std::fmt;
 use std::fs::DirBuilder;
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use waybound_core::{Result, WayboundError};
@@ -44,7 +46,7 @@ pub struct ChromeLaunchOptions {
 
 /// RAII handle owning a spawned Google Chrome process.
 pub struct LaunchedChrome {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     pid: i32,
     /// Temporary profile owned by this launch (removed on drop), if one was created.
     temp_profile: Option<PathBuf>,
@@ -56,12 +58,46 @@ impl LaunchedChrome {
     pub const fn pid(&self) -> i32 {
         self.pid
     }
+
+    /// Returns a cheap, shareable probe reporting whether this browser process still runs.
+    #[must_use]
+    pub fn probe(&self) -> BrowserProbe {
+        BrowserProbe {
+            child: Arc::clone(&self.child),
+        }
+    }
+}
+
+/// Liveness probe for a launched browser, shared with the request server so `ping` can
+/// report a browser that exited (crashed, or handed off to another instance holding the
+/// profile's `SingletonLock`) while the daemon itself is still up.
+#[derive(Clone)]
+pub struct BrowserProbe {
+    child: Arc<Mutex<Child>>,
+}
+
+impl BrowserProbe {
+    /// Returns `true` while the launched browser process has not exited.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.child
+            .lock()
+            .is_ok_and(|mut child| matches!(child.try_wait(), Ok(None)))
+    }
+}
+
+impl fmt::Debug for BrowserProbe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BrowserProbe").finish_non_exhaustive()
+    }
 }
 
 impl Drop for LaunchedChrome {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         if let Some(dir) = self.temp_profile.take() {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -222,7 +258,7 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
         focus_macos_pid(pid);
     }
     Ok(LaunchedChrome {
-        child,
+        child: Arc::new(Mutex::new(child)),
         pid,
         temp_profile,
     })
@@ -316,6 +352,33 @@ mod tests {
         drop(launched);
         if let Some(dir) = &profile {
             assert!(!dir.exists(), "temporary profile was not removed on drop");
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn probe_reports_a_browser_that_exits() {
+        let scratch = create_temp_profile_dir().unwrap_or_default();
+        assert!(scratch.is_dir(), "could not create scratch dir");
+        let script = scratch.join("short-lived.sh");
+        assert!(std::fs::write(&script, "#!/bin/sh\nexit 0\n").is_ok());
+        assert!(std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).is_ok());
+        let long_lived = fake_browser(&scratch);
+
+        let running = launch_chrome(&options(&long_lived, Some(scratch.join("p1"))));
+        let exiting = launch_chrome(&options(&script, Some(scratch.join("p2"))));
+        assert!(running.is_ok() && exiting.is_ok());
+        if let (Ok(running), Ok(exiting)) = (running, exiting) {
+            let probe = running.probe();
+            assert!(probe.is_alive());
+            let gone = exiting.probe();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while gone.is_alive() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!gone.is_alive(), "exited browser still reported alive");
+            drop(running);
+            assert!(!probe.is_alive(), "killed browser still reported alive");
         }
         let _ = std::fs::remove_dir_all(&scratch);
     }

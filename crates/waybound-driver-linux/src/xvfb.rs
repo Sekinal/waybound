@@ -1,8 +1,9 @@
 //! Headless Xvfb virtual framebuffer configuration and RAII session guard.
 
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 use waybound_core::{Result, WayboundError};
@@ -10,7 +11,52 @@ use waybound_core::{Result, WayboundError};
 use crate::process::BACKEND_NAME;
 
 const MAX_DIMENSION: u32 = 16_384;
-const STARTUP_SETTLE_DELAY: Duration = Duration::from_millis(100);
+const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for the socket once our `Xvfb` holds the lock (some builds only listen on
+/// an abstract socket, so its absence is not fatal).
+const SOCKET_GRACE: Duration = Duration::from_secs(1);
+/// Directory holding X11 server lock files (`.X<n>-lock`) and sockets (`.X11-unix/X<n>`).
+const X11_TMP_DIR: &str = "/tmp";
+
+/// Returns the lock file path an X server for `display_num` writes.
+fn x11_lock_path(display_num: u16) -> PathBuf {
+    Path::new(X11_TMP_DIR).join(format!(".X{display_num}-lock"))
+}
+
+/// Returns the Unix socket path an X server for `display_num` listens on.
+fn x11_socket_path(display_num: u16) -> PathBuf {
+    Path::new(X11_TMP_DIR)
+        .join(".X11-unix")
+        .join(format!("X{display_num}"))
+}
+
+/// Parses the owning pid from X11 lock file contents (a space-padded decimal pid).
+fn parse_lock_owner(contents: &str) -> Option<u32> {
+    contents.trim().parse::<u32>().ok()
+}
+
+/// Outcome of one readiness probe of a freshly spawned `Xvfb`.
+#[derive(Debug, PartialEq, Eq)]
+enum Readiness {
+    /// Our `Xvfb` owns the display lock and its socket exists.
+    Ready,
+    /// Our `Xvfb` owns the display lock but its filesystem socket is not there (yet).
+    LockedWithoutSocket,
+    /// Not ready yet (no readable lock file).
+    Pending,
+    /// The display lock belongs to another process.
+    OwnedBy(u32),
+}
+
+fn probe_readiness(lock_contents: Option<&str>, socket_exists: bool, our_pid: u32) -> Readiness {
+    match lock_contents.and_then(parse_lock_owner) {
+        Some(owner) if owner != our_pid => Readiness::OwnedBy(owner),
+        Some(_) if socket_exists => Readiness::Ready,
+        Some(_) => Readiness::LockedWithoutSocket,
+        None => Readiness::Pending,
+    }
+}
 
 /// Configuration for a headless `Xvfb` virtual framebuffer display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +158,8 @@ impl HeadlessDisplaySession {
     /// # Errors
     ///
     /// Returns [`WayboundError::BackendUnavailable`] if `config` is invalid, `Xvfb`
-    /// cannot be spawned, or `Xvfb` exits immediately on startup.
+    /// cannot be spawned, exits on startup (for example because another server already owns
+    /// the display), or does not take the display's lock file within 5 seconds.
     pub fn start(config: HeadlessDisplayConfig) -> Result<Self> {
         let args = build_xvfb_args(&config)?;
         debug!(?args, "starting headless Xvfb display");
@@ -131,17 +178,66 @@ impl HeadlessDisplaySession {
                 reason: format!("failed to spawn `Xvfb`: {err}"),
             })?;
 
-        thread::sleep(STARTUP_SETTLE_DELAY);
-        if let Some(status) = child.try_wait()? {
-            return Err(WayboundError::BackendUnavailable {
-                backend: BACKEND_NAME.to_owned(),
-                reason: format!("`Xvfb` exited prematurely on startup with {status}"),
-            });
-        }
-
-        Ok(Self {
-            config,
-            child: Some(child),
+        // Wait until *this* Xvfb owns the display: another process may have started a server
+        // on the same number a moment earlier, in which case ours exits (or never gets the
+        // lock) and connecting to the display would silently drive someone else's server.
+        let display_name = config.display_name();
+        let deadline = Instant::now() + STARTUP_READY_TIMEOUT;
+        let mut locked_since: Option<Instant> = None;
+        let failure = loop {
+            if let Some(status) = child.try_wait()? {
+                let owner = std::fs::read_to_string(x11_lock_path(config.display_num))
+                    .ok()
+                    .and_then(|c| parse_lock_owner(&c));
+                break owner.map_or_else(
+                    || format!("`Xvfb` exited prematurely on startup with {status}"),
+                    |pid| {
+                        format!(
+                            "`Xvfb` exited on startup with {status}; display {display_name} is \
+                             already owned by pid {pid}"
+                        )
+                    },
+                );
+            }
+            let lock = std::fs::read_to_string(x11_lock_path(config.display_num)).ok();
+            let socket = x11_socket_path(config.display_num).exists();
+            let readiness = probe_readiness(lock.as_deref(), socket, child.id());
+            if readiness == Readiness::LockedWithoutSocket {
+                let since = *locked_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= SOCKET_GRACE {
+                    debug!(display = %display_name, "Xvfb holds the display lock; no filesystem socket found");
+                    return Ok(Self {
+                        config,
+                        child: Some(child),
+                    });
+                }
+            }
+            match readiness {
+                Readiness::Ready => {
+                    return Ok(Self {
+                        config,
+                        child: Some(child),
+                    });
+                }
+                Readiness::OwnedBy(pid) if Instant::now() >= deadline => {
+                    break format!(
+                        "Xvfb display {display_name} is owned by another process (pid {pid})"
+                    );
+                }
+                _ if Instant::now() >= deadline => {
+                    break format!(
+                        "`Xvfb` did not become ready on display {display_name} within {}s",
+                        STARTUP_READY_TIMEOUT.as_secs()
+                    );
+                }
+                _ => thread::sleep(STARTUP_POLL_INTERVAL),
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        Err(WayboundError::BackendUnavailable {
+            backend: BACKEND_NAME.to_owned(),
+            reason: failure,
         })
     }
 
@@ -201,6 +297,25 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn readiness_requires_our_lock_and_socket() {
+        assert_eq!(parse_lock_owner("      4242\n"), Some(4242));
+        assert_eq!(parse_lock_owner("garbage"), None);
+        assert_eq!(probe_readiness(None, false, 7), Readiness::Pending);
+        assert_eq!(
+            probe_readiness(Some("    7\n"), false, 7),
+            Readiness::LockedWithoutSocket
+        );
+        assert_eq!(probe_readiness(Some("    7\n"), true, 7), Readiness::Ready);
+        assert_eq!(
+            probe_readiness(Some("    9\n"), true, 7),
+            Readiness::OwnedBy(9)
+        );
+        assert_eq!(probe_readiness(Some(""), true, 7), Readiness::Pending);
+        assert_eq!(x11_lock_path(101), PathBuf::from("/tmp/.X101-lock"));
+        assert_eq!(x11_socket_path(101), PathBuf::from("/tmp/.X11-unix/X101"));
     }
 
     #[test]
