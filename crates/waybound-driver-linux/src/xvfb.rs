@@ -12,7 +12,11 @@ use crate::process::BACKEND_NAME;
 
 const MAX_DIMENSION: u32 = 16_384;
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Kept below the Python SDK's default 5 s daemon startup timeout, so a display that never
+/// becomes ready surfaces as this descriptive error rather than a generic SDK timeout.
+const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long `stop` waits after `SIGTERM` before falling back to `SIGKILL`.
+const STOP_GRACE: Duration = Duration::from_secs(2);
 /// How long to wait for the socket once our `Xvfb` holds the lock (some builds only listen on
 /// an abstract socket, so its absence is not fatal).
 const SOCKET_GRACE: Duration = Duration::from_secs(1);
@@ -29,6 +33,36 @@ fn x11_socket_path(display_num: u16) -> PathBuf {
     Path::new(X11_TMP_DIR)
         .join(".X11-unix")
         .join(format!("X{display_num}"))
+}
+
+/// Sends `SIGTERM` to `child` and waits up to `grace` for it to exit; `false` if it did not.
+///
+/// This crate forbids `unsafe`, so the signal is sent by the `kill` utility (through
+/// [`waybound_core::process::command`]). `child` has not been reaped, so its pid cannot have
+/// been reused. Returns `false` (caller falls back to `SIGKILL`) if `kill` is unavailable.
+fn terminate_gracefully(child: &mut Child, grace: Duration) -> bool {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return true;
+    }
+    let sent = waybound_core::process::command("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !sent {
+        return false;
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => thread::sleep(STARTUP_POLL_INTERVAL),
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Parses the owning pid from X11 lock file contents (a space-padded decimal pid).
@@ -254,9 +288,15 @@ impl HeadlessDisplaySession {
     }
 
     /// Terminates the underlying `Xvfb` process if it is still running.
+    ///
+    /// Sends `SIGTERM` first so Xvfb removes its `/tmp/.X<n>-lock` file and socket (a killed
+    /// Xvfb leaves them behind and they look like a live display to the next allocator), and
+    /// only falls back to `SIGKILL` if it has not exited within 2 seconds.
     pub fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            if let Err(err) = child.kill() {
+            if !terminate_gracefully(&mut child, STOP_GRACE)
+                && let Err(err) = child.kill()
+            {
                 warn!(display = %self.config.display_name(), %err, "failed to kill Xvfb");
             }
             let _ = child.wait();
@@ -316,6 +356,32 @@ mod tests {
         assert_eq!(probe_readiness(Some(""), true, 7), Readiness::Pending);
         assert_eq!(x11_lock_path(101), PathBuf::from("/tmp/.X101-lock"));
         assert_eq!(x11_socket_path(101), PathBuf::from("/tmp/.X11-unix/X101"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_gracefully_uses_sigterm_and_reports_a_child_that_ignores_it() {
+        let polite = waybound_core::process::command("sleep").arg("30").spawn();
+        assert!(polite.is_ok());
+        if let Ok(mut child) = polite {
+            let started = Instant::now();
+            assert!(terminate_gracefully(&mut child, Duration::from_secs(5)));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+
+        let stubborn = waybound_core::process::command("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 0.05; done"])
+            .spawn();
+        assert!(stubborn.is_ok());
+        if let Ok(mut child) = stubborn {
+            thread::sleep(Duration::from_millis(200)); // let the shell install its trap
+            assert!(!terminate_gracefully(
+                &mut child,
+                Duration::from_millis(300)
+            ));
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     #[test]

@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use tracing_subscriber::EnvFilter;
 use waybound_compositor::{CompositorConfig, HeadlessCompositor};
@@ -65,6 +67,7 @@ struct CliArgs {
     focus: bool,
     no_motion: bool,
     replay: bool,
+    exit_with_parent: bool,
 }
 
 fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -102,6 +105,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, St
         focus: false,
         no_motion: false,
         replay: false,
+        exit_with_parent: env::var_os("WAYBOUND_EXIT_WITH_PARENT").is_some_and(|v| v == "1"),
     };
 
     let mut args = args.into_iter();
@@ -159,6 +163,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, St
             "--locale" => cli.locale = Some(next_arg(&mut args, "--locale")?),
             "--focus" => cli.focus = true,
             "--no-motion" => cli.no_motion = true,
+            "--exit-with-parent" => cli.exit_with_parent = true,
             "--replay" => cli.replay = true,
             unknown => return Err(format!("unknown argument: {unknown}")),
         }
@@ -521,6 +526,40 @@ fn build_backend(
     }
 }
 
+/// How often `--exit-with-parent` checks whether the process that started the daemon is gone.
+const PARENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// With `--exit-with-parent` (or `WAYBOUND_EXIT_WITH_PARENT=1`), request the normal graceful
+/// shutdown (the same path as `SIGTERM`: held buttons released, Chrome and Xvfb stopped) as
+/// soon as the parent process changes, i.e. the SDK process that launched the daemon died,
+/// however it died (`SIGKILL` included). The SDK starts the daemon in its own process group, so
+/// signals sent to the caller's group no longer reach the daemon directly.
+#[cfg(unix)]
+fn watch_parent(shutdown: Arc<AtomicBool>) {
+    let original = std::os::unix::process::parent_id();
+    let spawned = thread::Builder::new()
+        .name("waybound-parent-watch".to_owned())
+        .spawn(move || {
+            while !shutdown.load(Ordering::Acquire) {
+                if std::os::unix::process::parent_id() != original {
+                    tracing::info!(original, "parent process exited; shutting down");
+                    shutdown.store(true, Ordering::Release);
+                    break;
+                }
+                thread::sleep(PARENT_POLL_INTERVAL);
+            }
+        });
+    if let Err(err) = spawned {
+        tracing::warn!(error = %err, "failed to start the parent watchdog");
+    }
+}
+
+/// Windows has no reparenting to observe; `--exit-with-parent` is accepted and ignored.
+#[cfg(not(unix))]
+fn watch_parent(_shutdown: Arc<AtomicBool>) {
+    tracing::warn!("--exit-with-parent is not supported on this platform; ignoring it");
+}
+
 #[cfg(unix)]
 const TERMINATION_SIGNALS: &[i32] = &[
     signal_hook::consts::SIGTERM,
@@ -584,6 +623,10 @@ fn main() -> ExitCode {
         if let Err(err) = signal_hook::flag::register(*signal, Arc::clone(&shutdown)) {
             tracing::warn!(signal, error = %err, "failed to install signal handler");
         }
+    }
+
+    if cli.exit_with_parent {
+        watch_parent(Arc::clone(&shutdown));
     }
 
     let responses = Arc::new(ResponseStore::default());

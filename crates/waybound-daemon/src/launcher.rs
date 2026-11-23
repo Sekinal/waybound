@@ -45,6 +45,11 @@ pub struct ChromeLaunchOptions {
 }
 
 /// RAII handle owning a spawned Google Chrome process.
+///
+/// The `Child` is shared with [`BrowserProbe`], whose `try_wait` may *reap* the process. After
+/// a reap the kernel can reuse the pid, so the raw [`LaunchedChrome::pid`] must never be
+/// signalled: any future signal must go through the `Child` under the mutex, after checking
+/// `try_wait` (as `Drop` does via `Child::kill`, which is a no-op on a reaped child).
 pub struct LaunchedChrome {
     child: Arc<Mutex<Child>>,
     pid: i32,
@@ -71,6 +76,9 @@ impl LaunchedChrome {
 /// Liveness probe for a launched browser, shared with the request server so `ping` can
 /// report a browser that exited (crashed, or handed off to another instance holding the
 /// profile's `SingletonLock`) while the daemon itself is still up.
+///
+/// [`BrowserProbe::is_alive`] uses `Child::try_wait`, which reaps an exited browser; see
+/// [`LaunchedChrome`] for why its raw pid must not be signalled afterwards.
 #[derive(Clone)]
 pub struct BrowserProbe {
     child: Arc<Mutex<Child>>,
