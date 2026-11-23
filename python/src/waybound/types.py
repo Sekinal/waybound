@@ -192,6 +192,173 @@ class CapturedWebSocketFrame:
 
 
 @dataclass(frozen=True, slots=True)
+class TlsFingerprint:
+    """Exact TLS `ClientHello` fingerprint observed on the wire from the live browser."""
+
+    tls_version: int
+    cipher_suites: tuple[int, ...]
+    extensions: tuple[int, ...]
+    supported_groups: tuple[int, ...]
+    ec_point_formats: tuple[int, ...]
+    signature_algorithms: tuple[int, ...]
+    alpn_protocols: tuple[str, ...]
+    supported_versions: tuple[int, ...]
+    cert_compression_algorithms: tuple[int, ...]
+    alps_protocols: tuple[str, ...]
+    alps_use_new_codepoint: bool
+    psk_key_exchange_modes: tuple[int, ...]
+    grease_present: bool
+    has_status_request: bool
+    has_signed_cert_timestamp: bool
+    has_session_ticket: bool
+    has_extended_master_secret: bool
+    has_renegotiation_info: bool
+    has_ech: bool
+    ja3_string: str
+    ja3_hash: str
+    ja4: str
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize to a JSON-compatible dictionary matching `waybound_core::TlsFingerprint`."""
+        return {
+            "tls_version": self.tls_version,
+            "cipher_suites": list(self.cipher_suites),
+            "extensions": list(self.extensions),
+            "supported_groups": list(self.supported_groups),
+            "ec_point_formats": list(self.ec_point_formats),
+            "signature_algorithms": list(self.signature_algorithms),
+            "alpn_protocols": list(self.alpn_protocols),
+            "supported_versions": list(self.supported_versions),
+            "cert_compression_algorithms": list(self.cert_compression_algorithms),
+            "alps_protocols": list(self.alps_protocols),
+            "alps_use_new_codepoint": self.alps_use_new_codepoint,
+            "psk_key_exchange_modes": list(self.psk_key_exchange_modes),
+            "grease_present": self.grease_present,
+            "has_status_request": self.has_status_request,
+            "has_signed_cert_timestamp": self.has_signed_cert_timestamp,
+            "has_session_ticket": self.has_session_ticket,
+            "has_extended_master_secret": self.has_extended_master_secret,
+            "has_renegotiation_info": self.has_renegotiation_info,
+            "has_ech": self.has_ech,
+            "ja3_string": self.ja3_string,
+            "ja3_hash": self.ja3_hash,
+            "ja4": self.ja4,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Http2Setting:
+    """Single HTTP/2 `SETTINGS` frame parameter in wire order."""
+
+    id: int
+    value: int
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize to a JSON-compatible dictionary."""
+        return {"id": self.id, "value": self.value}
+
+
+@dataclass(frozen=True, slots=True)
+class Http2StreamDependency:
+    """HTTP/2 `HEADERS` frame stream dependency / priority fields (RFC 9113)."""
+
+    dependency_id: int
+    weight: int
+    exclusive: bool
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize to a JSON-compatible dictionary."""
+        return {
+            "dependency_id": self.dependency_id,
+            "weight": self.weight,
+            "exclusive": self.exclusive,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Http2Fingerprint:
+    """Exact HTTP/2 connection & header framing fingerprint observed from the live browser."""
+
+    settings: tuple[Http2Setting, ...]
+    initial_window_update: int | None
+    pseudo_header_order: tuple[str, ...]
+    akamai_fingerprint: str
+    headers_priority: Http2StreamDependency | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize to a JSON-compatible dictionary."""
+        return {
+            "settings": [s.to_dict() for s in self.settings],
+            "initial_window_update": self.initial_window_update,
+            "pseudo_header_order": list(self.pseudo_header_order),
+            "headers_priority": (
+                self.headers_priority.to_dict() if self.headers_priority is not None else None
+            ),
+            "akamai_fingerprint": self.akamai_fingerprint,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HeaderEntry:
+    """Ordered HTTP header `(name, value)` pair preserving exact wire order."""
+
+    name: str
+    value: str
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize to a JSON-compatible dictionary."""
+        return {"name": self.name, "value": self.value}
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedCookie:
+    """Cookie captured passively from live browser `Cookie` / `Set-Cookie` headers."""
+
+    name: str
+    value: str
+    domain: str
+    path: str
+    secure: bool = False
+    http_only: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize to a JSON-compatible dictionary."""
+        return {
+            "name": self.name,
+            "value": self.value,
+            "domain": self.domain,
+            "path": self.path,
+            "secure": self.secure,
+            "http_only": self.http_only,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SessionFingerprint:
+    """Complete live wire fingerprint + cookie jar snapshot of a running browser session."""
+
+    tls: TlsFingerprint | None
+    http2: Http2Fingerprint | None
+    default_headers: tuple[HeaderEntry, ...]
+    cookies: tuple[CapturedCookie, ...]
+    api_headers: tuple[HeaderEntry, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize to a JSON-compatible dictionary."""
+        return {
+            "tls": self.tls.to_dict() if self.tls is not None else None,
+            "http2": self.http2.to_dict() if self.http2 is not None else None,
+            "default_headers": [h.to_dict() for h in self.default_headers],
+            "api_headers": [h.to_dict() for h in self.api_headers],
+            "cookies": [c.to_dict() for c in self.cookies],
+        }
+
+    def to_json(self) -> str:
+        """Serialize this fingerprint snapshot to JSON."""
+        return json.dumps(self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
 class LocatorQuery:
     """Semantic query resolved by the Rust control daemon."""
 
@@ -301,6 +468,10 @@ class Transport(Protocol):
 
     def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
         """Wait until zero HTTP/1.1 or HTTP/2 requests remain inflight for `idle_ms`."""
+        ...
+
+    def export_fingerprint(self) -> SessionFingerprint:
+        """Export the live TLS, HTTP/2, header, and cookie fingerprint captured from the session."""
         ...
 
     def screenshot(self, path: str) -> None:

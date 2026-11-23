@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::WayboundError;
+use crate::fingerprint::SessionFingerprint;
 use crate::input::{KeyCode, KeyModifier};
 use crate::locator::{AccessibilityNode, LocatorQuery};
 use crate::network::{CapturedResponse, CapturedWebSocketFrame};
@@ -132,6 +133,8 @@ pub enum Request {
         /// Maximum wait time in milliseconds.
         timeout_ms: u64,
     },
+    /// Export the live TLS, HTTP/2, header, and cookie fingerprint captured from the browser session.
+    ExportSessionFingerprint,
     /// Capture a native OS PNG screenshot to `path` (the browser window on macOS, the whole
     /// display on Linux, the primary screen on Windows, the device screen on Android).
     Screenshot {
@@ -203,6 +206,11 @@ pub enum Response {
     HttpResponses {
         /// Captured HTTP responses matching the filter.
         responses: Vec<CapturedResponse>,
+    },
+    /// Response to [`Request::ExportSessionFingerprint`].
+    SessionFingerprint {
+        /// Captured live TLS, HTTP/2, header, and cookie snapshot.
+        fingerprint: Box<SessionFingerprint>,
     },
     /// Response to [`Request::CapturedWebsocketFrames`].
     WebsocketFrames {

@@ -6,6 +6,7 @@
 
 pub mod driver;
 pub mod error;
+pub mod fingerprint;
 pub mod input;
 pub mod locator;
 pub mod motion;
@@ -15,6 +16,10 @@ pub mod protocol;
 
 pub use driver::{BackendKind, Driver, SessionConfig};
 pub use error::{Result, WayboundError};
+pub use fingerprint::{
+    CapturedCookie, HeaderEntry, Http2Fingerprint, Http2Setting, Http2StreamDependency,
+    SessionFingerprint, TlsFingerprint,
+};
 pub use input::{InputEvent, KeyCode, KeyModifier, MouseButton, Point};
 pub use locator::{AccessibilityNode, Bounds, LocatorQuery, Role};
 pub use motion::{

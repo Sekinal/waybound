@@ -8,6 +8,8 @@ mod mock_driver;
 mod net_tap;
 mod peer;
 mod proxy;
+#[cfg(feature = "replay")]
+mod replay;
 mod server;
 
 use std::env;
@@ -32,7 +34,7 @@ use crate::mock_driver::MockDriver;
 use crate::net_tap::{ResponseStore, start_passive_tap};
 use crate::proxy::{PassiveTapConfig, ProxyForwarder, UpstreamProxy};
 use crate::server::ServerOptions;
-use waybound_net::{HostBlocker, InflightCounter, KeyLogStore};
+use waybound_net::{FingerprintRecorder, HostBlocker, InflightCounter, KeyLogStore};
 
 #[allow(clippy::struct_excessive_bools)]
 struct CliArgs {
@@ -58,6 +60,7 @@ struct CliArgs {
     locale: Option<String>,
     focus: bool,
     no_motion: bool,
+    replay: bool,
 }
 
 fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -88,6 +91,7 @@ fn parse_args() -> Result<CliArgs, String> {
         locale: None,
         focus: false,
         no_motion: false,
+        replay: false,
     };
 
     let mut args = env::args().skip(1);
@@ -141,6 +145,7 @@ fn parse_args() -> Result<CliArgs, String> {
             "--locale" => cli.locale = Some(next_arg(&mut args, "--locale")?),
             "--focus" => cli.focus = true,
             "--no-motion" => cli.no_motion = true,
+            "--replay" => cli.replay = true,
             unknown => return Err(format!("unknown argument: {unknown}")),
         }
     }
@@ -162,6 +167,7 @@ fn setup_proxy(
     ssl_keylog: Option<&PathBuf>,
     responses: &Arc<ResponseStore>,
     inflight: &InflightCounter,
+    fingerprint: &FingerprintRecorder,
 ) -> Result<(Option<String>, Option<ProxyForwarder>), String> {
     let blocker = HostBlocker::new(block_hosts);
     let tap = ssl_keylog.map(|path| {
@@ -170,6 +176,7 @@ fn setup_proxy(
         PassiveTapConfig {
             keylog: KeyLogStore::new(path),
             inflight: inflight.clone(),
+            fingerprint: fingerprint.clone(),
             on_response: Arc::new(move |seq, resp| {
                 store.upsert(seq, resp);
             }),
@@ -209,6 +216,7 @@ fn launch_desktop_chrome(
     display: Option<String>,
     responses: &Arc<ResponseStore>,
     inflight: &InflightCounter,
+    fingerprint: &FingerprintRecorder,
 ) -> Result<(i32, launcher::LaunchedChrome, Option<ProxyForwarder>), String> {
     let (chrome_proxy_server, proxy_fwd) = setup_proxy(
         cli.proxy.clone(),
@@ -216,6 +224,7 @@ fn launch_desktop_chrome(
         cli.ssl_keylog_file.as_ref(),
         responses,
         inflight,
+        fingerprint,
     )?;
     let opts = ChromeLaunchOptions {
         binary_path: None,
@@ -238,6 +247,7 @@ fn build_backend(
     cli: CliArgs,
     responses: &Arc<ResponseStore>,
     inflight: &InflightCounter,
+    fingerprint: &FingerprintRecorder,
 ) -> Result<BackendBundle, String> {
     match cli.backend.as_str() {
         "mock" => Ok(BackendBundle {
@@ -256,6 +266,7 @@ fn build_backend(
                     cli.ssl_keylog_file.as_ref(),
                     responses,
                     inflight,
+                    fingerprint,
                 )?;
                 let android_proxy = local_proxy.map(|p| {
                     p.strip_prefix("http://")
@@ -299,7 +310,7 @@ fn build_backend(
         "macos" => {
             let (target_pid, launched, fwd) = if cli.launch_chrome {
                 let (pid, chrome, proxy_fwd) =
-                    launch_desktop_chrome(&cli, None, responses, inflight)?;
+                    launch_desktop_chrome(&cli, None, responses, inflight, fingerprint)?;
                 (pid, Some(chrome), proxy_fwd)
             } else if let Some(pid) = cli.pid {
                 (pid, None, None)
@@ -329,8 +340,13 @@ fn build_backend(
             };
 
             let (target_pid, launched, fwd) = if cli.launch_chrome {
-                let (pid, chrome, proxy_fwd) =
-                    launch_desktop_chrome(&cli, display_env.clone(), responses, inflight)?;
+                let (pid, chrome, proxy_fwd) = launch_desktop_chrome(
+                    &cli,
+                    display_env.clone(),
+                    responses,
+                    inflight,
+                    fingerprint,
+                )?;
                 (Some(pid), Some(chrome), proxy_fwd)
             } else {
                 (cli.pid, None, None)
@@ -349,7 +365,7 @@ fn build_backend(
         "windows" => {
             let (target_pid, launched, fwd) = if cli.launch_chrome {
                 let (pid, chrome, proxy_fwd) =
-                    launch_desktop_chrome(&cli, None, responses, inflight)?;
+                    launch_desktop_chrome(&cli, None, responses, inflight, fingerprint)?;
                 (Some(pid), Some(chrome), proxy_fwd)
             } else {
                 (cli.pid, None, None)
@@ -380,6 +396,20 @@ const TERMINATION_SIGNALS: &[i32] = &[
 #[cfg(not(unix))]
 const TERMINATION_SIGNALS: &[i32] = &[signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT];
 
+fn run_replay_mode() -> ExitCode {
+    #[cfg(feature = "replay")]
+    {
+        replay::run_replay_stdio()
+    }
+    #[cfg(not(feature = "replay"))]
+    {
+        tracing::error!(
+            "waybound-daemon was built without `--features replay`; rebuild with `cargo build -p waybound-daemon --features replay`"
+        );
+        ExitCode::FAILURE
+    }
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -395,6 +425,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if cli.replay {
+        return run_replay_mode();
+    }
 
     if cli.proxy_from_argv && cli.proxy.as_deref().is_some_and(|p| p.contains('@')) {
         // Never log the value itself.
@@ -419,6 +453,7 @@ fn main() -> ExitCode {
 
     let responses = Arc::new(ResponseStore::default());
     let inflight = InflightCounter::default();
+    let fingerprint = FingerprintRecorder::new();
     // When `--launch-chrome` is set, the built-in zero-MITM local pass-through proxy handles
     // passive TLS 1.3 + HTTP/1.1–2 decryption in-process (zero tshark, zero CAP_NET_RAW).
     // Only fall back to external `tshark` when attaching to an already-running browser PID.
@@ -436,7 +471,7 @@ fn main() -> ExitCode {
         })
     };
 
-    let bundle = match build_backend(cli, &responses, &inflight) {
+    let bundle = match build_backend(cli, &responses, &inflight, &fingerprint) {
         Ok(bundle) => bundle,
         Err(msg) => {
             tracing::error!(error = %msg, "failed to initialize backend");
@@ -447,6 +482,7 @@ fn main() -> ExitCode {
     let options = ServerOptions {
         use_motion: bundle.use_motion,
         inflight,
+        fingerprint,
     };
 
     if let Some(addr) = tcp_addr {

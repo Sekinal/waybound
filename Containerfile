@@ -4,10 +4,16 @@
 #   docker build -f Containerfile -t waybound:latest .
 
 FROM rust:1-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    clang \
+    libclang-dev \
+    perl \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release --bin waybound-daemon
+RUN cargo build --release --bin waybound-daemon --features replay
 
 FROM debian:trixie-slim AS runtime
 ARG TARGETARCH

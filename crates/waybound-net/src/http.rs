@@ -14,9 +14,13 @@ use flate2::read::{GzDecoder, ZlibDecoder};
 use fluke_hpack::Decoder as HpackDecoder;
 use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
 use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
-use waybound_core::{CapturedResponse, CapturedWebSocketFrame, HttpHeader, WebSocketDirection};
+use waybound_core::{
+    CapturedResponse, CapturedWebSocketFrame, Http2Setting, Http2StreamDependency, HttpHeader,
+    WebSocketDirection,
+};
 
 use crate::chunked::{ChunkStatus, ChunkedDecoder};
+use crate::fingerprint::FingerprintRecorder;
 use crate::websocket::{PerMessageDeflate, WebSocketStream};
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -24,8 +28,12 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const H2_FRAME_DATA: u8 = 0x0;
 const H2_FRAME_HEADERS: u8 = 0x1;
 const H2_FRAME_RST_STREAM: u8 = 0x3;
+const H2_FRAME_SETTINGS: u8 = 0x4;
 const H2_FRAME_GOAWAY: u8 = 0x7;
+const H2_FRAME_WINDOW_UPDATE: u8 = 0x8;
 const H2_FRAME_CONTINUATION: u8 = 0x9;
+
+const H2_FLAG_ACK: u8 = 0x1;
 
 const H2_FLAG_END_STREAM: u8 = 0x1;
 const H2_FLAG_END_HEADERS: u8 = 0x4;
@@ -238,6 +246,7 @@ pub struct HttpConnectionCorrelator {
     inflight: InflightCounter,
     on_response: ResponseCallback,
     on_websocket: Option<WebSocketCallback>,
+    fingerprint: Option<FingerprintRecorder>,
     /// Number of request-body decodes performed (work bound checked by tests).
     #[cfg(test)]
     request_body_decodes: usize,
@@ -276,6 +285,18 @@ impl HttpConnectionCorrelator {
         inflight: InflightCounter,
         on_response: ResponseCallback,
     ) -> Self {
+        Self::with_fingerprint(host_fallback, seq_base, inflight, on_response, None)
+    }
+
+    /// Creates a new correlator that also records HTTP/2, header, and cookie fingerprints.
+    #[must_use]
+    pub fn with_fingerprint(
+        host_fallback: String,
+        seq_base: u64,
+        inflight: InflightCounter,
+        on_response: ResponseCallback,
+        fingerprint: Option<FingerprintRecorder>,
+    ) -> Self {
         Self {
             host_fallback,
             mode: ProtoMode::Detecting,
@@ -300,6 +321,7 @@ impl HttpConnectionCorrelator {
             inflight,
             on_response,
             on_websocket: None,
+            fingerprint,
             #[cfg(test)]
             request_body_decodes: 0,
         }
@@ -505,10 +527,35 @@ impl HttpConnectionCorrelator {
     fn drain_h2_client(&mut self) {
         while let Some((ftype, flags, stream_id, payload)) = pop_h2_frame(&mut self.c2s_buf) {
             if stream_id == 0 {
+                if let Some(ref rec) = self.fingerprint {
+                    if ftype == H2_FRAME_SETTINGS && (flags & H2_FLAG_ACK) == 0 {
+                        let settings: Vec<Http2Setting> = payload
+                            .as_chunks::<6>()
+                            .0
+                            .iter()
+                            .map(|c| Http2Setting {
+                                id: u16::from_be_bytes([c[0], c[1]]),
+                                value: u32::from_be_bytes([c[2], c[3], c[4], c[5]]),
+                            })
+                            .collect();
+                        rec.record_h2_settings(settings);
+                    } else if ftype == H2_FRAME_WINDOW_UPDATE && payload.len() >= 4 {
+                        let inc =
+                            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                                & 0x7fff_ffff;
+                        rec.record_h2_window_update(inc);
+                    }
+                }
                 continue;
             }
             match ftype {
                 H2_FRAME_HEADERS => {
+                    if let Some(ref rec) = self.fingerprint
+                        && (flags & H2_FLAG_PRIORITY) != 0
+                        && let Some(prio) = parse_h2_headers_priority(flags, &payload)
+                    {
+                        rec.record_h2_headers_priority(prio);
+                    }
                     let Some(frag) = strip_h2_headers_payload(flags, &payload) else {
                         continue;
                     };
@@ -593,17 +640,22 @@ impl HttpConnectionCorrelator {
         let mut method = None;
         let mut content_encoding = None;
         let mut headers = Vec::new();
+        let mut pseudo_order = Vec::new();
+        let mut ordered_headers = Vec::new();
         for (name, value) in decoded {
+            let n_str = String::from_utf8_lossy(&name).into_owned();
+            let v_str = String::from_utf8_lossy(&value).into_owned();
+            if n_str.starts_with(':') {
+                pseudo_order.push(n_str.clone());
+            }
+            ordered_headers.push((n_str.clone(), v_str.clone()));
             match name.as_slice() {
-                b":authority" => authority = String::from_utf8_lossy(&value).into_owned(),
-                b":path" => path = String::from_utf8_lossy(&value).into_owned(),
-                b":method" => method = Some(String::from_utf8_lossy(&value).into_owned()),
+                b":authority" => authority = v_str,
+                b":path" => path = v_str,
+                b":method" => method = Some(v_str),
                 n if n.starts_with(b":") => {}
-                n => {
-                    let header = HttpHeader::new(
-                        String::from_utf8_lossy(n).into_owned(),
-                        String::from_utf8_lossy(&value).into_owned(),
-                    );
+                _ => {
+                    let header = HttpHeader::new(n_str, v_str);
                     if header.name.eq_ignore_ascii_case("host") {
                         authority.clone_from(&header.value);
                     } else if header.name.eq_ignore_ascii_case("content-encoding") {
@@ -627,6 +679,10 @@ impl HttpConnectionCorrelator {
         }
         if authority.is_empty() {
             authority.clone_from(&self.host_fallback);
+        }
+        if let Some(ref rec) = self.fingerprint {
+            rec.record_h2_pseudo_order(pseudo_order);
+            rec.record_request_headers(&authority, &ordered_headers);
         }
         let url = build_https_url(&authority, &path);
         self.ensure_h2_stream(stream_id);
@@ -748,6 +804,18 @@ impl HttpConnectionCorrelator {
         let Some(st) = self.h2_streams.get_mut(&stream_id) else {
             return;
         };
+        if let Some(ref rec) = self.fingerprint {
+            let host = st
+                .url
+                .as_deref()
+                .and_then(extract_url_host)
+                .unwrap_or(&self.host_fallback);
+            for h in &headers {
+                if h.name.eq_ignore_ascii_case("set-cookie") {
+                    rec.record_set_cookie(host, &h.value);
+                }
+            }
+        }
         if let Some(code) = status {
             st.status = Some(code);
             st.headers = headers.into();
@@ -890,6 +958,14 @@ impl HttpConnectionCorrelator {
             let id = self.h1_next_request_id;
             self.h1_next_request_id = self.h1_next_request_id.wrapping_add(1);
             self.make_room_for_h1_request();
+            if let Some(ref rec) = self.fingerprint {
+                let ordered: Vec<(String, String)> = head
+                    .headers
+                    .iter()
+                    .map(|h| (h.name.clone(), h.value.clone()))
+                    .collect();
+                rec.record_request_headers(&host, &ordered);
+            }
             self.h1_pending.push_back(H1PendingRequest {
                 id,
                 url: build_https_url(&host, path),
@@ -1041,6 +1117,14 @@ impl HttpConnectionCorrelator {
             {
                 req.attach_to(&mut resp);
             }
+            if let Some(ref rec) = self.fingerprint {
+                let host = extract_url_host(&resp.url).unwrap_or(&self.host_fallback);
+                for h in resp.headers.iter() {
+                    if h.name.eq_ignore_ascii_case("set-cookie") {
+                        rec.record_set_cookie(host, &h.value);
+                    }
+                }
+            }
             let websocket = upgrade.then(|| {
                 let deflate = PerMessageDeflate::from_extension_headers(
                     resp.headers
@@ -1182,6 +1266,34 @@ fn strip_h2_padding(flags: u8, payload: &[u8]) -> &[u8] {
         return &[];
     }
     &payload[1..end]
+}
+
+fn parse_h2_headers_priority(flags: u8, payload: &[u8]) -> Option<Http2StreamDependency> {
+    if (flags & H2_FLAG_PRIORITY) == 0 {
+        return None;
+    }
+    let unpadded = strip_h2_padding(flags, payload);
+    if unpadded.len() < 5 {
+        return None;
+    }
+    let exclusive = (unpadded[0] & 0x80) != 0;
+    let dependency_id =
+        u32::from_be_bytes([unpadded[0] & 0x7F, unpadded[1], unpadded[2], unpadded[3]]);
+    let weight = unpadded[4];
+    Some(Http2StreamDependency {
+        dependency_id,
+        weight,
+        exclusive,
+    })
+}
+
+fn extract_url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split('/').next()?;
+    let host = authority.split(':').next()?;
+    if host.is_empty() { None } else { Some(host) }
 }
 
 fn strip_h2_headers_payload(flags: u8, payload: &[u8]) -> Option<&[u8]> {

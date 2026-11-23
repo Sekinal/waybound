@@ -37,8 +37,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install BoringSSL build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev perl
       - name: Build release daemon
-        run: cargo build --release --bin waybound-daemon --target ${{ matrix.target }}
+        run: cargo build --release --bin waybound-daemon --features replay --target ${{ matrix.target }}
       - name: Package tarball + SHA-256
         shell: bash
         run: |

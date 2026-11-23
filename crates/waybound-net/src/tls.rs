@@ -6,6 +6,7 @@
 //! `ServerHello` carries a `supported_versions` extension selecting `0x0304` (and always
 //! negotiates a `0x13xx` cipher suite); a TLS 1.2 `ServerHello` does neither.
 
+use crate::fingerprint::{FingerprintRecorder, parse_client_hello};
 use crate::keylog::KeyLogStore;
 use crate::tls12::PassiveTls12Decoder;
 use crate::tls13::{Direction, PassiveTls13Decoder};
@@ -158,6 +159,7 @@ impl Plaintext {
 #[derive(Debug)]
 pub struct PassiveTlsDecoder {
     keylog: KeyLogStore,
+    fingerprint: Option<FingerprintRecorder>,
     state: DecoderState,
 }
 
@@ -165,8 +167,18 @@ impl PassiveTlsDecoder {
     /// Creates a new version-dispatching passive decoder using `keylog` for secret lookups.
     #[must_use]
     pub const fn new(keylog: KeyLogStore) -> Self {
+        Self::with_fingerprint(keylog, None)
+    }
+
+    /// Creates a new version-dispatching passive decoder that also records `ClientHello` fingerprints.
+    #[must_use]
+    pub const fn with_fingerprint(
+        keylog: KeyLogStore,
+        fingerprint: Option<FingerprintRecorder>,
+    ) -> Self {
         Self {
             keylog,
+            fingerprint,
             state: DecoderState::Detecting {
                 c2s: Vec::new(),
                 s2c: Vec::new(),
@@ -232,6 +244,17 @@ impl PassiveTlsDecoder {
         // Replay the client side first so `client_random` is known before the ServerHello.
         match version {
             TlsVersion::Tls12 => {
+                if let Some(ref rec) = self.fingerprint
+                    && let Some(hdr) = c2s.get(..5)
+                    && hdr[0] == CONTENT_TYPE_HANDSHAKE
+                {
+                    let len = usize::from(u16::from_be_bytes([hdr[3], hdr[4]]));
+                    if let Some(payload) = c2s.get(5..5usize.saturating_add(len))
+                        && let Some(fp) = parse_client_hello(payload)
+                    {
+                        rec.record_tls(fp);
+                    }
+                }
                 let mut dec = Box::new(PassiveTls12Decoder::new(keylog));
                 out.push(
                     Direction::ClientToServer,
@@ -249,7 +272,10 @@ impl PassiveTlsDecoder {
                 self.state = DecoderState::Tls12(dec);
             }
             TlsVersion::Tls13 => {
-                let mut dec = Box::new(PassiveTls13Decoder::new(keylog));
+                let mut dec = Box::new(PassiveTls13Decoder::with_fingerprint(
+                    keylog,
+                    self.fingerprint.clone(),
+                ));
                 out.push(
                     Direction::ClientToServer,
                     &dec.feed(Direction::ClientToServer, &c2s),

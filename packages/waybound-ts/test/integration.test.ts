@@ -94,7 +94,7 @@ describe("integration: waybound-daemon --backend mock", { skip }, () => {
       assert.equal(await page.transport.ping(), PKG_VERSION, "daemon version matches package");
 
       const nodes = await page.snapshotTree();
-      assert.equal(nodes.length, 2);
+      assert.equal(nodes.length, 5);
       assert.equal(nodes[0]?.role, Role.TEXTBOX);
       assert.equal(nodes[0]?.name, "Origin");
       assert.equal(await page.url(), "https://mock.waybound.local/");

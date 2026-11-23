@@ -2,19 +2,27 @@
 
 from waybound.async_client import AsyncLocator, AsyncPage, AsyncSession, launch_async
 from waybound.client import Locator, Page
+from waybound.handoff import AsyncHandoffHttpClient, HandoffHttpClient, HandoffResponse
 from waybound.session import LaunchOptions, Session, launch
 from waybound.transport import UnixSocketTransport, WayboundDaemonError
 from waybound.types import (
     AccessibilityNode,
     BackendKind,
     Bounds,
+    CapturedCookie,
     CapturedResponse,
     CapturedWebSocketFrame,
+    HeaderEntry,
+    Http2Fingerprint,
+    Http2Setting,
+    Http2StreamDependency,
     HttpHeader,
     KeyModifier,
     LocatorQuery,
     Role,
+    SessionFingerprint,
     SupportsWebSocketFrames,
+    TlsFingerprint,
     Transport,
     WebSocketDirection,
     WebSocketOpcode,
@@ -22,13 +30,21 @@ from waybound.types import (
 
 __all__ = [
     "AccessibilityNode",
+    "AsyncHandoffHttpClient",
     "AsyncLocator",
     "AsyncPage",
     "AsyncSession",
     "BackendKind",
     "Bounds",
+    "CapturedCookie",
     "CapturedResponse",
     "CapturedWebSocketFrame",
+    "HandoffHttpClient",
+    "HandoffResponse",
+    "HeaderEntry",
+    "Http2Fingerprint",
+    "Http2Setting",
+    "Http2StreamDependency",
     "HttpHeader",
     "KeyModifier",
     "LaunchOptions",
@@ -37,7 +53,9 @@ __all__ = [
     "Page",
     "Role",
     "Session",
+    "SessionFingerprint",
     "SupportsWebSocketFrames",
+    "TlsFingerprint",
     "Transport",
     "UnixSocketTransport",
     "WayboundDaemonError",

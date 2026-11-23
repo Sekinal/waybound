@@ -11,6 +11,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
 use sha2::{Sha256, Sha384};
 
+use crate::fingerprint::{FingerprintRecorder, parse_client_hello};
 use crate::keylog::KeyLogStore;
 
 const CONTENT_TYPE_HANDSHAKE: u8 = 22;
@@ -218,6 +219,7 @@ struct DirBuffer {
 #[derive(Debug)]
 pub struct PassiveTls13Decoder {
     keylog: KeyLogStore,
+    fingerprint: Option<FingerprintRecorder>,
     client_random: Option<[u8; 32]>,
     cipher_suite: Option<Tls13CipherSuite>,
     c2s: DirBuffer,
@@ -228,8 +230,15 @@ impl PassiveTls13Decoder {
     /// Creates a new passive TLS 1.3 decoder using `keylog` for secret lookups.
     #[must_use]
     pub fn new(keylog: KeyLogStore) -> Self {
+        Self::with_fingerprint(keylog, None)
+    }
+
+    /// Creates a new passive TLS 1.3 decoder that also records `ClientHello` fingerprints.
+    #[must_use]
+    pub fn with_fingerprint(keylog: KeyLogStore, fingerprint: Option<FingerprintRecorder>) -> Self {
         Self {
             keylog,
+            fingerprint,
             client_random: None,
             cipher_suite: None,
             c2s: DirBuffer::default(),
@@ -306,6 +315,11 @@ impl PassiveTls13Decoder {
             && let Ok(rand) = <[u8; 32]>::try_from(&payload[6..38])
         {
             self.client_random = Some(rand);
+            if let Some(ref rec) = self.fingerprint
+                && let Some(fp) = parse_client_hello(payload)
+            {
+                rec.record_tls(fp);
+            }
         } else if dir == Direction::ServerToClient
             && hs_type == HANDSHAKE_SERVER_HELLO
             && self.cipher_suite.is_none()

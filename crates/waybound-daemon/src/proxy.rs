@@ -37,8 +37,8 @@ use waybound_core::Result;
 
 use crate::peer::{PeerDecision, PeerVerifier, platform_verifier};
 use waybound_net::{
-    Direction, HostBlocker, InflightCounter, KeyLogStore, PassiveConnectionTap, ResponseCallback,
-    WebSocketCallback,
+    Direction, FingerprintRecorder, HostBlocker, InflightCounter, KeyLogStore,
+    PassiveConnectionTap, ResponseCallback, WebSocketCallback,
 };
 
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
@@ -183,6 +183,8 @@ pub struct PassiveTapConfig {
     pub keylog: KeyLogStore,
     /// Shared inflight request counter powering `wait_for_network_idle`.
     pub inflight: InflightCounter,
+    /// Shared session-wide TLS/HTTP2/header/cookie fingerprint recorder.
+    pub fingerprint: FingerprintRecorder,
     /// Callback invoked with each decrypted HTTP response.
     pub on_response: ResponseCallback,
     /// Callback invoked with each decrypted WebSocket message (`None` disables WebSocket capture).
@@ -192,11 +194,12 @@ pub struct PassiveTapConfig {
 impl PassiveTapConfig {
     /// Creates the per-connection passive tap for a tunnel to `host`.
     fn connection_tap(&self, host: String) -> PassiveConnectionTap {
-        let tap = PassiveConnectionTap::new(
+        let tap = PassiveConnectionTap::new_with_fingerprint(
             host,
             self.keylog.clone(),
             self.inflight.clone(),
             Arc::clone(&self.on_response),
+            Some(self.fingerprint.clone()),
         );
         match &self.on_websocket {
             Some(cb) => tap.with_websocket_callback(Arc::clone(cb)),
