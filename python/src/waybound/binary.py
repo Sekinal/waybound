@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 
 DEFAULT_REPO = "Sekinal/waybound"
-_FALLBACK_VERSION = "v0.4.0"
+_FALLBACK_VERSION = "v0.5.0"
 
 
 def _default_version() -> str:
