@@ -126,21 +126,20 @@ def main() -> int:
 
                 link = page.get_by_role(waybound.Role.LINK, name="Go to Page Two", strict=True)
                 link.click()
-                try:
-                    page2 = page.get_by_role(waybound.Role.HEADING, name="Page Two").wait_for(
-                        timeout_ms=5_000
-                    )
-                except Exception:
-                    sys.stderr.write(
-                        f"DEBUG link click: hits={_FixtureHandler.hits!r} "
-                        f"url={page.url()!r} nodes={page.snapshot_tree()!r}\n"
-                    )
-                    raise
+                page2 = page.get_by_role(waybound.Role.HEADING, name="Page Two").wait_for(
+                    timeout_ms=10_000
+                )
                 sys.stdout.write(f"7. After link click (/page2) -> HEADING: {page2.name!r}\n")
+
+                page.goto(f"{base_url}/")
+                back_home = page.get_by_role(
+                    waybound.Role.HEADING, name="Hello Linux Waybound"
+                ).wait_for(timeout_ms=10_000)
+                sys.stdout.write(f"8. After goto(/) -> HEADING: {back_home.name!r}\n")
 
                 png = page.screenshot()
                 assert png[:8] == b"\x89PNG\r\n\x1a\n", "screenshot must be valid PNG"
-                sys.stdout.write(f"8. Native Linux PNG: {len(png)} bytes, valid=True\n")
+                sys.stdout.write(f"9. Native Linux PNG: {len(png)} bytes, valid=True\n")
     finally:
         server.shutdown()
         server.server_close()

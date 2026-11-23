@@ -34,15 +34,11 @@ type AccessibleRef = (String, OwnedObjectPath);
 /// Persistent pure-Rust D-Bus client connected to the AT-SPI2 accessibility bus.
 pub struct AtspiClient {
     conn: Connection,
-    /// Cached `(target_pid, web_root)` so subsequent snapshots skip walking browser chrome.
-    cached_web_root: Option<(Option<i32>, AccessibleRef)>,
 }
 
 impl std::fmt::Debug for AtspiClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AtspiClient")
-            .field("has_cached_web_root", &self.cached_web_root.is_some())
-            .finish_non_exhaustive()
+        f.debug_struct("AtspiClient").finish_non_exhaustive()
     }
 }
 
@@ -67,37 +63,19 @@ impl AtspiClient {
                 reason: format!("failed to connect to AT-SPI2 bus: {err}"),
             })?;
         debug!(addr = %addr, "connected native pure-Rust AtspiClient");
-        Ok(Self {
-            conn,
-            cached_web_root: None,
-        })
+        Ok(Self { conn })
     }
 
-    /// Resolves the active `document web` node, reusing the cached reference when still alive.
+    /// Resolves the currently attached `document web` node from the live application tree.
+    ///
+    /// We intentionally avoid caching the document object path across calls: Chrome keeps
+    /// navigated-away documents alive in its `BFcache` answering D-Bus queries (`GetRoleName`,
+    /// `GetState`, `GetExtents`, `GetChildren`) with frozen state even after detaching them
+    /// from the active window hierarchy.
     fn resolve_web_root(
-        &mut self,
+        &self,
         target_pid: Option<i32>,
     ) -> Result<(Option<AccessibleRef>, Option<String>, Option<Bounds>)> {
-        if let Some((cached_pid, ref root)) = self.cached_web_root
-            && cached_pid == target_pid
-            && matches!(
-                self.get_role_name(&root.0, root.1.as_str())
-                    .as_deref()
-                    .map(str::trim),
-                Some("document web" | "document frame")
-            )
-            && self
-                .get_state(&root.0, root.1.as_str())
-                .is_some_and(|words| is_atspi_showing(&words))
-            && let Some(bounds) = self.get_extents(&root.0, root.1.as_str())
-            && bounds.width > 0.0
-            && bounds.height > 0.0
-        {
-            let url = self.get_document_url(&root.0, root.1.as_str());
-            return Ok((Some(root.clone()), url, Some(bounds)));
-        }
-
-        self.cached_web_root = None;
         let apps = self
             .get_children(REGISTRY_BUS, REGISTRY_ROOT)
             .map_err(|err| WayboundError::BackendUnavailable {
@@ -109,11 +87,7 @@ impl AtspiClient {
             return Ok((None, None, None));
         };
 
-        let (web_root, current_url, viewport_bounds) = self.locate_web_document(&target_app);
-        if let Some(ref root) = web_root {
-            self.cached_web_root = Some((target_pid, root.clone()));
-        }
-        Ok((web_root, current_url, viewport_bounds))
+        Ok(self.locate_web_document(&target_app))
     }
 
     /// Fast-path URL lookup on the active web document without walking DOM children.
