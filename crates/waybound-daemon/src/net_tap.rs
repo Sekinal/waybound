@@ -1444,11 +1444,14 @@ mod tests {
 
     #[test]
     fn path_lookup_skips_empty_and_relative_entries() {
-        let joined = env::join_paths(["", ".", "bin", "/usr/bin"]).ok();
-        assert_eq!(
-            absolute_path_dirs(joined.as_deref()),
-            [PathBuf::from("/usr/bin")]
-        );
+        // `temp_dir()` is absolute on every platform (`/usr/bin` is not absolute on Windows,
+        // which needs a drive or UNC prefix).
+        let absolute = env::temp_dir();
+        assert!(absolute.is_absolute());
+        let relative = [Path::new(""), Path::new("."), Path::new("bin")];
+        let joined = env::join_paths(relative.iter().copied().chain([absolute.as_path()])).ok();
+        assert!(joined.is_some());
+        assert_eq!(absolute_path_dirs(joined.as_deref()), [absolute]);
     }
 
     #[test]

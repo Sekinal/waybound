@@ -84,15 +84,8 @@ def _parse_route_interface(output: str) -> str | None:
     return None
 
 
-def _capture_interface() -> str | None:
-    """Interface the daemon's tshark fallback would capture on (mirrors `capture_interface`)."""
-    explicit = os.environ.get("WAYBOUND_NET_IFACE", "").strip()
-    if explicit:
-        return explicit
-    if sys.platform == "win32":
-        return None
-    if sys.platform != "darwin":
-        return "any"
+def _default_route_interface() -> str | None:
+    """Interface of the default route on macOS (`route -n get default`)."""
     try:
         result = subprocess.run(
             ["/sbin/route", "-n", "get", "default"],
@@ -104,6 +97,24 @@ def _capture_interface() -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return _parse_route_interface(result.stdout)
+
+
+def _capture_interface() -> str | None:
+    """Interface the daemon's tshark fallback would capture on (mirrors `capture_interface`).
+
+    Linux captures on `any`; macOS has no `any` device and uses the default-route interface;
+    Windows (Npcap) has no `any` device either and needs `WAYBOUND_NET_IFACE`.
+    """
+    explicit = os.environ.get("WAYBOUND_NET_IFACE", "").strip()
+    if explicit:
+        iface: str | None = explicit
+    elif sys.platform == "darwin":
+        iface = _default_route_interface()
+    elif sys.platform == "win32":
+        iface = None
+    else:
+        iface = "any"
+    return iface
 
 
 def _run_probe(cmd: list[str]) -> subprocess.CompletedProcess[str]:
