@@ -28,6 +28,19 @@ def main() -> int:
         time.sleep(3.0)
         tree = page.snapshot_tree()
         sys.stdout.write(f"0. UIA tree nodes: {len(tree)}\n")
+        # Round-trip latency of a full snapshot through the daemon (IPC included). The
+        # in-process COM backend should be far below the old PowerShell walker's ~300-400 ms;
+        # WAYBOUND_WINDOWS_UIA=powershell restores the old backend for comparison.
+        timings_ms = []
+        for _ in range(5):
+            started = time.perf_counter()
+            page.snapshot_tree()
+            timings_ms.append((time.perf_counter() - started) * 1000.0)
+        timings_ms.sort()
+        sys.stdout.write(
+            f"   snapshot latency ms: median={timings_ms[2]:.1f} min={timings_ms[0]:.1f} "
+            f"max={timings_ms[-1]:.1f}\n"
+        )
         for node in tree[:20]:
             if node.name or node.value:
                 sys.stdout.write(f"   {node.role.value}: name={node.name!r} val={node.value!r}\n")

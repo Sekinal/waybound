@@ -233,7 +233,7 @@ Understanding how `waybound` captures network traffic without MITM or CDP is imp
 |---|---|---|---|---|
 | `linux` (Wayland) | AT-SPI2 over D-Bus (`zbus`) | Pure-Rust `waybound-compositor` (`wl_seat` pointer + xkb keyboard) | Direct per-surface `wl_buffer` PNG | **Live stock Chrome CI (`--ozone-platform=wayland`, zero Xvfb)** |
 | `linux` (X11/Xvfb) | AT-SPI2 over D-Bus (`zbus`, `pyatspi` fallback) | X11 `XTEST` (`x11rb`, `xdotool` fallback) | X11 `GetImage` (`import`/`scrot` fallback) | **Live stock Chrome CI (`Xvfb` + `openbox`)** |
-| `windows` | UI Automation | Win32 `SendInput` | Primary screen (`System.Drawing`) | **Live stock Chrome CI** |
+| `windows` | UI Automation, in-process over COM (`WAYBOUND_WINDOWS_UIA=powershell` selects the PowerShell fallback) | Win32 `SendInput` | Primary screen (`System.Drawing`) | **Live stock Chrome CI** |
 | `macos` | `AXUIElement` (`AXWebArea`-scoped) | `CGEvent` HID tap | Browser window (`screencapture`) | Unit + workspace tests in CI (main dev platform) |
 | `android` | `uiautomator dump` over ADB | `adb shell input` | `screencap` | Unit tests in CI; Waydroid launch experimental ([docs/waydroid-linux.md](docs/waydroid-linux.md)) |
 
@@ -254,7 +254,7 @@ Understanding how `waybound` captures network traffic without MITM or CDP is imp
 - **`crates/waybound-compositor`** (`#![forbid(unsafe_code)]`) — Pure-Rust headless Wayland compositor (`wayland-server` + `xdg_shell` + `wl_shm` + `wl_seat`) for zero-Xvfb Linux Chrome concurrency.
 - **`crates/waybound-driver-linux`** (`#![forbid(unsafe_code)]`) — AT-SPI2 (`zbus`), `HeadlessCompositor` Wayland integration, X11 `XTEST`/`GetImage` (`x11rb`), and RAII `Xvfb`.
 - **`crates/waybound-driver-macos`** — `AXUIElement` (`AXWebArea`-scoped), `CGEvent` HID input, and `screencapture`.
-- **`crates/waybound-driver-windows`** — UI Automation, audited Win32 `SendInput`, and PNG screenshots.
+- **`crates/waybound-driver-windows`** — UI Automation over in-process COM (PowerShell fallback), audited Win32 `SendInput`, and PNG screenshots.
 - **`crates/waybound-driver-android`** (`#![forbid(unsafe_code)]`) — Pure-Rust ADB + `uiautomator` XML parser + experimental Waydroid launcher.
 - **`crates/waybound-net`** (`#![forbid(unsafe_code)]`) — Passive TLS 1.3 decryptor, `SSLKEYLOGFILE` reader, HTTP/1.1 & HTTP/2 (HPACK) + WebSocket correlator, `SessionFingerprint` recorder, host blocker presets, and bandwidth accounting.
 - **`crates/waybound-http`** (`#![forbid(unsafe_code)]`) — Tier 2 replay client (`BoringSSL` via `wreq` with TLS session resumption & warm H2 pooling, lossless binary/multipart bodies, and opt-in pure-Rust HTTP/3 via `quinn` + `h3`).
