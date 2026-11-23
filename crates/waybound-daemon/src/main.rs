@@ -437,27 +437,27 @@ fn build_backend(
             })
         }
         "linux" => {
-            let (xvfb_session, display_env, compositor, wayland_runtime_guard) =
-                if cli.headless_wayland {
-                    let runtime_dir = create_wayland_runtime_dir().map_err(|e| e.to_string())?;
-                    let guard = TempDirGuard(runtime_dir.clone());
-                    let comp = Arc::new(
-                        HeadlessCompositor::start(CompositorConfig {
-                            runtime_dir: Some(runtime_dir),
-                            ..CompositorConfig::default()
-                        })
-                        .map_err(|e| e.to_string())?,
-                    );
-                    (None, None, Some(comp), Some(guard))
-                } else if cli.headless_xvfb {
-                    let config = headless_display_config(cli.display.as_deref())?;
-                    let session =
-                        HeadlessDisplaySession::start(config).map_err(|e| e.to_string())?;
-                    let disp = session.display();
-                    (Some(session), Some(disp), None, None)
-                } else {
-                    (None, cli.display.clone(), None, None)
-                };
+            let (xvfb_session, display_env, compositor, wayland_runtime_guard) = if cli
+                .headless_wayland
+            {
+                let runtime_dir = create_wayland_runtime_dir().map_err(|e| e.to_string())?;
+                let guard = TempDirGuard(runtime_dir.clone());
+                let comp = Arc::new(
+                    HeadlessCompositor::start(CompositorConfig {
+                        runtime_dir: Some(runtime_dir),
+                        ..CompositorConfig::default()
+                    })
+                    .map_err(|e| e.to_string())?,
+                );
+                (None, None, Some(comp), Some(guard))
+            } else if cli.headless_xvfb {
+                let config = headless_display_config(cli.display.as_deref())?;
+                let session = HeadlessDisplaySession::start(config).map_err(|e| e.to_string())?;
+                let disp = session.display();
+                (Some(session), Some(disp), None, None)
+            } else {
+                (None, cli.display.clone(), None, None)
+            };
 
             let wayland_display = compositor
                 .as_ref()
