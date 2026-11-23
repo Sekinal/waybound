@@ -15,7 +15,7 @@ import { WayboundLaunchError } from "./errors.js";
 
 export const DEFAULT_REPO = "Sekinal/waybound";
 /** Release tag downloaded by default: the release matching this package's version. */
-export const DEFAULT_VERSION = "v0.5.0";
+export const DEFAULT_VERSION = "v0.6.0";
 
 const SAFE_VERSION_RE = /^[A-Za-z0-9._-]+$/;
 const SAFE_REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;

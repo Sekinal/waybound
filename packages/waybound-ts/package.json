@@ -1,6 +1,6 @@
 {
   "name": "waybound",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Typed async Node.js client for waybound-daemon: out-of-band Chrome automation through OS accessibility APIs and native input.",
   "license": "MIT OR Apache-2.0",
   "repository": {

@@ -2412,7 +2412,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-compositor"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "png",
  "rustix",
@@ -2426,7 +2426,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-daemon"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "brotli 8.0.4",
  "flate2",
@@ -2457,7 +2457,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-driver-android"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "tracing",
  "waybound-core",
@@ -2465,7 +2465,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-driver-linux"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "png",
  "serde",
@@ -2479,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-driver-macos"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "tracing",
  "waybound-core",
@@ -2487,7 +2487,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-driver-windows"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2497,7 +2497,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-http"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "brotli 8.0.4",
  "bytes",
@@ -2520,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "waybound-net"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "brotli 8.0.4",
