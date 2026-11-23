@@ -215,6 +215,7 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-gpu")
+        .arg("--disable-gpu-compositing")
         .arg("--disable-dev-shm-usage")
         .arg("--no-sandbox")
         .arg(format!("--user-data-dir={}", profile_dir.display()))
@@ -287,7 +288,10 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
     }
 
     let png_bytes = captured_png.ok_or_else(|| {
-        "timed out waiting for non-blank committed wl_buffer from Chrome".to_owned()
+        format!(
+            "timed out waiting for non-blank committed wl_buffer from Chrome (windows={:?})",
+            compositor.windows()
+        )
     })?;
     let (w, h, non_black) = verify_png_non_blank(&png_bytes)?;
     log_line(&format!(
