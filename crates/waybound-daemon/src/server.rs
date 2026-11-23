@@ -725,8 +725,9 @@ fn navigate_url(driver: &dyn Driver, url: &str) -> Result<()> {
         modifiers: vec![focus_mod],
         hold_ms: 0,
     })?;
-    thread::sleep(Duration::from_millis(60));
+    thread::sleep(Duration::from_millis(150));
     type_text(driver, url, false)?;
+    thread::sleep(Duration::from_millis(50));
     driver.dispatch_input(&InputEvent::KeyPress {
         key: KeyCode::Enter,
         modifiers: Vec::new(),
