@@ -217,18 +217,9 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
                 Err(err) => Response::from(&err),
             }
         }
-        // A dead tshark tap is reported rather than a list that silently stops growing.
-        Request::CapturedResponses { url_contains } => state.responses.capture_error().map_or_else(
-            || Response::HttpResponses {
-                responses: state.responses.list(url_contains.as_deref()),
-            },
-            |reason| {
-                Response::from(&WayboundError::BackendUnavailable {
-                    backend: "net_tap".to_owned(),
-                    reason,
-                })
-            },
-        ),
+        Request::CapturedResponses { url_contains } => Response::HttpResponses {
+            responses: state.responses.list(url_contains.as_deref()),
+        },
         Request::CapturedWebsocketFrames {
             url_contains,
             limit,
@@ -1625,32 +1616,43 @@ mod tests {
     }
 
     #[test]
-    fn capture_calls_report_a_dead_tshark_tap() {
+    fn wait_for_response_reports_a_dead_tshark_tap() {
         let driver = MockDriver::sample_page();
         let state = state();
+        state.responses.upsert(
+            1,
+            waybound_core::CapturedResponse {
+                url: "https://a.test/before".to_owned(),
+                status: 200,
+                ..waybound_core::CapturedResponse::default()
+            },
+        );
+        state
+            .responses
+            .mark_capture_failed("tshark capture on interface en0 stopped".to_owned());
+
+        // What was captured before the tap died stays listable.
         let listed = handle_request(
             &driver,
             &state,
             Request::CapturedResponses { url_contains: None },
         );
-        assert!(matches!(listed, Response::HttpResponses { .. }));
+        assert!(
+            matches!(listed, Response::HttpResponses { ref responses } if responses.len() == 1)
+        );
 
-        state
-            .responses
-            .mark_capture_failed("tshark capture on interface en0 stopped".to_owned());
-        for request in [
-            Request::CapturedResponses { url_contains: None },
+        let waited = handle_request(
+            &driver,
+            &state,
             Request::WaitForResponse {
                 url_contains: "/api".to_owned(),
                 timeout_ms: 5_000,
             },
-        ] {
-            let response = handle_request(&driver, &state, request);
-            assert!(
-                matches!(response, Response::Error { ref code, .. } if code == "backend_unavailable"),
-                "{response:?}"
-            );
-        }
+        );
+        assert!(
+            matches!(waited, Response::Error { ref code, .. } if code == "backend_unavailable"),
+            "{waited:?}"
+        );
     }
 
     #[test]

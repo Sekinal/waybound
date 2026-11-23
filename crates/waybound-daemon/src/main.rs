@@ -319,7 +319,8 @@ fn start_keylog_capture(
     cli: &CliArgs,
     responses: &Arc<ResponseStore>,
 ) -> Result<Option<net_tap::PassiveTap>, ()> {
-    if cli.proxy.is_some() && !launches_browser(cli) {
+    let attaches_desktop = matches!(cli.backend.as_str(), "macos" | "linux" | "windows");
+    if cli.proxy.is_some() && attaches_desktop && !launches_browser(cli) {
         tracing::warn!("the proxy setting is not applied when attaching to a running browser");
     }
     match keylog_capture(cli) {

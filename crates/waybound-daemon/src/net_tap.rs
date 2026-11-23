@@ -50,7 +50,8 @@ struct StoreInner {
     websocket_frames: VecDeque<CapturedWebSocketFrame>,
     /// Highest stream sequence ID ever stored; the baseline for [`ResponseStore::wait_for`].
     last_seq: u64,
-    /// Set when the `tshark` capture died; capture calls report it instead of timing out.
+    /// Set when the `tshark` capture died; [`ResponseStore::wait_for`] reports it instead of
+    /// timing out (responses captured before stay listable).
     capture_error: Option<String>,
 }
 
@@ -264,14 +265,17 @@ struct PendingStream {
     emitted: bool,
     /// Source port of the side that sent the response status; only its frames are body bytes.
     response_src: Option<String>,
-    /// HTTP/1.x request URIs on this connection still waiting for their response.
-    h1_requests: VecDeque<String>,
+    /// HTTP/1.x requests on this connection still waiting for their response, as
+    /// (`frame.number` of the packet that completed the request, URI).
+    h1_requests: VecDeque<(Option<u64>, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum H1Message {
-    Request,
-    Response,
+    /// A request completed in the packet with this `frame.number`.
+    Request { frame: Option<u64> },
+    /// A response; `request_in` is tshark's `http.request_in` (the request's `frame.number`).
+    Response { request_in: Option<u64> },
 }
 
 /// The HTTP-level fields of one protocol instance in a `tshark -T ek` packet: one HTTP/2 or
@@ -340,24 +344,20 @@ impl StreamCorrelator {
     /// request).
     fn route_message(&mut self, key: &str, h1: Option<H1Message>, url: Option<String>) -> bool {
         match h1 {
-            Some(H1Message::Request) => {
+            Some(H1Message::Request { frame }) => {
                 if let (Some(entry), Some(uri)) = (self.streams.get_mut(key), url) {
                     if entry.h1_requests.len() >= MAX_H1_QUEUED_REQUESTS {
                         let _ = entry.h1_requests.pop_front();
                     }
-                    entry.h1_requests.push_back(uri);
+                    entry.h1_requests.push_back((frame, uri));
                 }
                 false
             }
-            Some(H1Message::Response) => {
-                // Each HTTP/1.x response is a new exchange on the keep-alive connection, paired
-                // with the oldest unanswered request (tshark itself mislabels pipelined
-                // responses that share a segment), else with the URI tshark attached.
+            Some(H1Message::Response { request_in }) => {
+                // Each HTTP/1.x response is a new exchange on the keep-alive connection.
                 let fresh_seq = self.alloc_seq();
                 if let Some(entry) = self.streams.get_mut(key) {
-                    let uri = entry
-                        .h1_requests
-                        .pop_front()
+                    let uri = pair_h1_response(&mut entry.h1_requests, request_in)
                         .or(url)
                         .or_else(|| entry.url.take());
                     *entry = PendingStream {
@@ -476,11 +476,44 @@ impl StreamCorrelator {
     }
 }
 
+/// Pairs an HTTP/1.x response with its request.
+///
+/// tshark links a response to the packet that completed its request (`http.request_in`), so
+/// requests queued from earlier packets are answers that were never captured and are dropped;
+/// pairing purely by order would shift every later URL after one lost response. Pipelined
+/// requests completed in the same packet share that frame number and are taken in order
+/// (tshark gives only the first of such responses a `request_in`, and mislabels its URI).
+/// Returns `None` when the request itself was not captured, so tshark's URI is used.
+fn pair_h1_response(
+    queue: &mut VecDeque<(Option<u64>, String)>,
+    request_in: Option<u64>,
+) -> Option<String> {
+    if let Some(request_frame) = request_in {
+        while queue
+            .front()
+            .is_some_and(|(frame, _)| frame.is_some_and(|f| f < request_frame))
+        {
+            let _ = queue.pop_front();
+        }
+    }
+    let matches = queue
+        .front()
+        .is_some_and(|(frame, _)| match (request_in, frame) {
+            (Some(wanted), Some(queued)) => *queued == wanted,
+            _ => true,
+        });
+    if matches {
+        queue.pop_front().map(|(_, uri)| uri)
+    } else {
+        None
+    }
+}
+
 /// Protocol layers kept by `tshark -T ek -J`: only these top-level layers are written, each
 /// with all of its child fields (packet selection is `-Y`'s job). Each HTTP/2 frame, HTTP/3
 /// frame and HTTP/1.x message becomes its own object under `layers.<proto>` (an array when a
 /// packet carries several), with keys named `<proto>_<field with '.' replaced by '_'>`.
-const EK_PROTOCOLS: &str = "tcp udp quic http http2 http3";
+const EK_PROTOCOLS: &str = "frame tcp udp quic http http2 http3";
 
 /// The objects of one protocol layer, which `-T ek` emits as a single object or as an array
 /// of objects when the protocol occurs several times in the packet.
@@ -515,6 +548,10 @@ fn ek_str(obj: &Value, key: &str) -> Option<String> {
     })
 }
 
+fn ek_u64(obj: &Value, key: &str) -> Option<u64> {
+    ek_str(obj, key).and_then(|s| s.parse::<u64>().ok())
+}
+
 /// A response status, ignoring interim `1xx` responses other than `101 Switching Protocols`.
 fn ek_final_status(obj: &Value, key: &str) -> Option<u16> {
     ek_str(obj, key)
@@ -532,6 +569,9 @@ fn frames_from_ek_layers(layers: &Value) -> Vec<FrameFields> {
         && let Some(tcp_stream) = ek_str(tcp, "tcp_tcp_stream")
     {
         let src_port = ek_str(tcp, "tcp_tcp_srcport");
+        let frame_number = ek_layer(layers, "frame")
+            .first()
+            .and_then(|f| ek_u64(f, "frame_frame_number"));
 
         for msg in ek_layer(layers, "http") {
             let uri = ek_str(msg, "http_http_request_full_uri");
@@ -540,9 +580,13 @@ fn frames_from_ek_layers(layers: &Value) -> Vec<FrameFields> {
                 if ek_final_status(msg, "http_http_response_code").is_none() {
                     continue;
                 }
-                H1Message::Response
+                H1Message::Response {
+                    request_in: ek_u64(msg, "http_http_request_in"),
+                }
             } else if uri.is_some() {
-                H1Message::Request
+                H1Message::Request {
+                    frame: frame_number,
+                }
             } else {
                 continue;
             };
@@ -740,14 +784,17 @@ const TSHARK_FALLBACK_PATHS: &[&str] = &[
     r"C:\Program Files\Wireshark\tshark.exe",
 ];
 
-/// Longest `tshark` output line accepted (a packet with a body near [`MAX_BODY_BYTES`] is
-/// about three times that as colon-separated hex, twice with the reassembled copy).
+/// Longest `tshark` output line accepted. Bodies are colon-separated hex (3 bytes per body
+/// byte), and the `END_STREAM` frame carries both `http2.data.data` and the reassembled body,
+/// so a body near [`MAX_BODY_BYTES`] makes a line of about six times that.
 const MAX_EK_LINE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
 /// Lines of `tshark` stderr kept for error messages.
 const STDERR_TAIL_LINES: usize = 20;
-/// How long to wait for `tshark` to report `Capturing on ...` (or to exit) at startup.
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for `tshark` to report `Capturing on ...` (or to exit) at startup. It runs
+/// before the daemon binds its socket, so together with [`STARTUP_GRACE`] it must stay well
+/// under the SDK's default `startup_timeout_s` (5 s).
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long `tshark` must stay alive after `Capturing on ...`: it prints that line before
 /// dumpcap has opened the device, so a missing interface or permission fails just after it.
 const STARTUP_GRACE: Duration = Duration::from_secs(1);
@@ -942,8 +989,8 @@ fn spawn_stdout_reader(
 /// [`capture_interface`]), so traffic through a proxy is invisible to it.
 ///
 /// Waits (up to [`STARTUP_TIMEOUT`]) until tshark reports that it is capturing and then stays
-/// alive for [`STARTUP_GRACE`]. If tshark dies later, the store is marked failed and capture
-/// calls report that instead of timing out.
+/// alive for [`STARTUP_GRACE`]. If tshark dies later, the store is marked failed and
+/// `wait_for_response` reports that instead of timing out.
 ///
 /// # Errors
 ///
@@ -1022,7 +1069,7 @@ pub fn start_passive_tap(
     loop {
         if !reported_capturing && capturing.load(Ordering::SeqCst) {
             reported_capturing = true;
-            deadline = deadline.min(Instant::now() + STARTUP_GRACE);
+            deadline = Instant::now() + STARTUP_GRACE;
         }
         if let Some(status) = tap.child.try_wait().map_err(WayboundError::Io)? {
             let drain_deadline = Instant::now() + STDERR_DRAIN_TIMEOUT;
@@ -1072,14 +1119,16 @@ mod tests {
 
     use serde_json::json;
 
-    // `tshark -T ek -J "tcp udp quic http http2 http3"` output (Wireshark 4.6.7) for synthetic
-    // cleartext captures dissected with `-d tcp.port==...,http2|http`; see each test.
+    // Output of the daemon's tshark arguments (Wireshark 4.6.7, `-T ek -J "frame tcp udp quic
+    // http http2 http3"`) with `-r <pcap> -d tcp.port==...,http2|http` in place of `-i`/`-f`,
+    // for synthetic cleartext captures; see each test.
     const EK_H2_MUX: &str = include_str!("../testdata/tshark_ek_h2_mux.jsonl");
     const EK_H2_SPLIT: &str = include_str!("../testdata/tshark_ek_h2_split.jsonl");
     const EK_H2_REQBODY: &str = include_str!("../testdata/tshark_ek_h2_reqbody.jsonl");
     const EK_H2_HINTS: &str = include_str!("../testdata/tshark_ek_h2_hints.jsonl");
     const EK_H1_KEEPALIVE: &str = include_str!("../testdata/tshark_ek_h1_keepalive.jsonl");
     const EK_H1_PIPELINED: &str = include_str!("../testdata/tshark_ek_h1_pipelined.jsonl");
+    const EK_H1_LOST_RESPONSE: &str = include_str!("../testdata/tshark_ek_h1_lost_response.jsonl");
 
     fn replay(ek: &str) -> Vec<CapturedResponse> {
         let store = ResponseStore::default();
@@ -1215,6 +1264,49 @@ mod tests {
         assert_eq!(captured[0].body.as_deref(), Some("bbb"));
         assert_eq!(captured[1].url, "http://h.test/c");
         assert_eq!(captured[1].body.as_deref(), Some("ccc"));
+    }
+
+    /// `GET /a1` whose response was never captured, then `/a2`, `/a3`, `/a4` each answered.
+    /// tshark's `http.request_in` keeps the later responses on their own requests.
+    #[test]
+    fn correlator_survives_a_lost_http1_response() {
+        let captured = replay(EK_H1_LOST_RESPONSE);
+        let got: Vec<(&str, Option<&str>)> = captured
+            .iter()
+            .map(|r| (r.url.as_str(), r.body.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("http://h.test/a2", Some("body2")),
+                ("http://h.test/a3", Some("body3")),
+                ("http://h.test/a4", Some("body4")),
+            ]
+        );
+    }
+
+    #[test]
+    fn h1_pairing_drops_requests_whose_response_was_lost() {
+        let mut queue: VecDeque<(Option<u64>, String)> = [
+            (Some(4), "/a1"),
+            (Some(5), "/a2"),
+            (Some(7), "/b"),
+            (Some(7), "/c"),
+        ]
+        .into_iter()
+        .map(|(f, u)| (f, u.to_owned()))
+        .collect();
+        assert_eq!(
+            pair_h1_response(&mut queue, Some(5)).as_deref(),
+            Some("/a2")
+        );
+        assert_eq!(pair_h1_response(&mut queue, Some(7)).as_deref(), Some("/b"));
+        // tshark gives the second pipelined response no `request_in`: take the next in order.
+        assert_eq!(pair_h1_response(&mut queue, None).as_deref(), Some("/c"));
+        // The request itself was never captured: fall back to tshark's URI.
+        queue.push_back((Some(20), "/later".to_owned()));
+        assert_eq!(pair_h1_response(&mut queue, Some(9)), None);
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]
