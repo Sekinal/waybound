@@ -533,9 +533,13 @@ impl FingerprintRecorder {
     }
 
     /// Records the stream priority/dependency carried on the client's HTTP/2 `HEADERS` frame.
+    /// Prefers higher stream weights so top-level navigation priority (`255`) wins over
+    /// lower-priority background probes.
     pub fn record_h2_headers_priority(&self, priority: Http2StreamDependency) {
         if let Ok(mut st) = self.inner.lock()
-            && st.h2_headers_priority.is_none()
+            && st
+                .h2_headers_priority
+                .is_none_or(|cur| priority.weight > cur.weight)
         {
             st.h2_headers_priority = Some(priority);
         }
