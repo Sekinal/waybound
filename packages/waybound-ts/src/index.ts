@@ -32,6 +32,7 @@ export {
   DEFAULT_TIMEOUT_MS,
   type Endpoint,
   type ResponseWaiter,
+  type SnapshotTreeOptions,
   Transport,
   type TransportOptions,
 } from "./transport.js";
@@ -45,4 +46,5 @@ export {
   NAMED_KEYS,
   type NamedKey,
   Role,
+  type TreeSnapshot,
 } from "./types.js";

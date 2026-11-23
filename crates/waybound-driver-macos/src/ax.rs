@@ -5,7 +5,10 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use waybound_core::{AccessibilityNode, Bounds, Result, Role, WayboundError};
+use waybound_core::{
+    AccessibilityNode, Bounds, MAX_MAX_NODES, MIN_MAX_NODES, Result, Role, TreeSnapshot,
+    WayboundError,
+};
 
 use crate::ffi::{
     AXIsProcessTrusted, AXUIElementCopyAttributeNames, AXUIElementCopyAttributeValue,
@@ -136,12 +139,17 @@ pub fn snapshot_application_tree(pid: i32) -> Result<Vec<AccessibilityNode>> {
 
     let mut nodes = Vec::new();
     let mut visited = 0;
+    let mut truncated = false;
+    let max_nodes = MAX_NODES;
     // Created once per walk and shared by every probed node.
     let expanded_key = cf_string("AXExpanded");
     walk_node(
         &web_area,
         0,
+        max_nodes,
+        MAX_VISITED,
         &mut visited,
+        &mut truncated,
         &mut nodes,
         expanded_key.as_ref(),
     );
@@ -149,9 +157,51 @@ pub fn snapshot_application_tree(pid: i32) -> Result<Vec<AccessibilityNode>> {
         pid,
         visited,
         captured = nodes.len(),
+        truncated,
         "macos AXWebArea snapshot complete"
     );
     Ok(nodes)
+}
+
+/// Captures up to `max_nodes` accessibility nodes for `pid`, reporting whether traversal
+/// stopped early due to hitting `max_nodes` or the visit budget.
+///
+/// # Errors
+///
+/// Returns [`WayboundError::BackendUnavailable`] if Accessibility permissions are missing.
+pub fn snapshot_application_tree_limited(pid: i32, max_nodes: usize) -> Result<TreeSnapshot> {
+    let limit = max_nodes.clamp(MIN_MAX_NODES, MAX_MAX_NODES);
+    let max_visited = MAX_VISITED.max(limit.saturating_mul(5));
+    let window_root = open_window_root(pid)?;
+    let Some(web_area) = find_web_area(&window_root) else {
+        return Ok(TreeSnapshot {
+            nodes: Vec::new(),
+            truncated: false,
+        });
+    };
+
+    let mut nodes = Vec::new();
+    let mut visited = 0;
+    let mut truncated = false;
+    let expanded_key = cf_string("AXExpanded");
+    walk_node(
+        &web_area,
+        0,
+        limit,
+        max_visited,
+        &mut visited,
+        &mut truncated,
+        &mut nodes,
+        expanded_key.as_ref(),
+    );
+    tracing::debug!(
+        pid,
+        visited,
+        captured = nodes.len(),
+        truncated,
+        "macos AXWebArea limited snapshot complete"
+    );
+    Ok(TreeSnapshot { nodes, truncated })
 }
 
 /// Reads the active tab's URL from `AXWebArea`'s `AXURL` attribute.
@@ -484,14 +534,22 @@ fn read_expanded(element: &OwnedCf, role: Role, expanded_key: Option<&OwnedCf>) 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_node(
     element: &OwnedCf,
     depth: usize,
+    max_nodes: usize,
+    max_visited: usize,
     visited: &mut usize,
+    truncated: &mut bool,
     out: &mut Vec<AccessibilityNode>,
     expanded_key: Option<&OwnedCf>,
 ) {
-    if depth > MAX_DEPTH || out.len() >= MAX_NODES || *visited >= MAX_VISITED {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    if out.len() >= max_nodes || *visited >= max_visited {
+        *truncated = true;
         return;
     }
     *visited += 1;
@@ -555,10 +613,11 @@ fn walk_node(
         }
         let ax_type_id = AXUIElementGetTypeID();
         let count = CFArrayGetCount(children.as_ptr());
-        let budget = MAX_VISITED.saturating_sub(*visited);
+        let budget = max_visited.saturating_sub(*visited);
         let mut collected = Vec::new();
         for idx in 0..count {
             if collected.len() >= budget {
+                *truncated = true;
                 break;
             }
             let child_raw = CFArrayGetValueAtIndex(children.as_ptr(), idx);
@@ -573,10 +632,20 @@ fn walk_node(
     };
 
     for child in &child_refs {
-        if out.len() >= MAX_NODES || *visited >= MAX_VISITED {
+        if out.len() >= max_nodes || *visited >= max_visited {
+            *truncated = true;
             break;
         }
-        walk_node(child, depth + 1, visited, out, expanded_key);
+        walk_node(
+            child,
+            depth + 1,
+            max_nodes,
+            max_visited,
+            visited,
+            truncated,
+            out,
+            expanded_key,
+        );
     }
 }
 

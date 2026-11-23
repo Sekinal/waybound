@@ -14,7 +14,10 @@ pub mod network;
 pub mod process;
 pub mod protocol;
 
-pub use driver::{BackendKind, Driver, SessionConfig};
+pub use driver::{
+    BackendKind, DEFAULT_MAX_NODES, Driver, MAX_MAX_NODES, MIN_MAX_NODES, SessionConfig,
+    TreeSnapshot, clamp_max_nodes,
+};
 pub use error::{Result, WayboundError};
 pub use fingerprint::{
     CapturedCookie, HeaderEntry, Http2Fingerprint, Http2Setting, Http2StreamDependency,

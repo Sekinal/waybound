@@ -25,6 +25,7 @@ from waybound.types import (
     Role,
     SessionFingerprint,
     TlsFingerprint,
+    TreeSnapshot,
     WebSocketDirection,
     WebSocketOpcode,
 )
@@ -150,15 +151,27 @@ class UnixSocketTransport:
             raise WayboundDaemonError("protocol_error", msg)
         return version
 
-    def snapshot_tree(self) -> list[AccessibilityNode]:
+    def snapshot_tree(self, *, max_nodes: int | None = None) -> list[AccessibilityNode]:
         """Fetch the current accessibility tree from the daemon."""
-        response = self._request({"method": "snapshot_tree"})
+        return self.snapshot_tree_with_meta(max_nodes=max_nodes).nodes
+
+    def snapshot_tree_with_meta(self, *, max_nodes: int | None = None) -> TreeSnapshot:
+        """Fetch the current accessibility tree along with truncation metadata."""
+        payload: dict[str, object] = {"method": "snapshot_tree"}
+        if max_nodes is not None:
+            if max_nodes < 1:
+                msg = f"max_nodes must be a positive integer, got {max_nodes}"
+                raise ValueError(msg)
+            payload["max_nodes"] = max_nodes
+        response = self._request(payload)
         raw_nodes = response.get("nodes")
         if not isinstance(raw_nodes, list):
             msg = f"unexpected tree response: {response!r}"
             raise WayboundDaemonError("protocol_error", msg)
 
-        return [_parse_node(item) for item in raw_nodes if isinstance(item, dict)]
+        nodes = [_parse_node(item) for item in raw_nodes if isinstance(item, dict)]
+        truncated = response.get("truncated") is True
+        return TreeSnapshot(nodes=nodes, truncated=truncated)
 
     def locate_all(self, query: LocatorQuery) -> list[AccessibilityNode]:
         """Return all accessibility nodes matching `query`."""
@@ -725,4 +738,6 @@ def _encode_query(query: LocatorQuery) -> dict[str, object]:
     }
     if query.within is not None:
         payload["within"] = _encode_query(query.within)
+    if query.strict:
+        payload["strict"] = True
     return payload

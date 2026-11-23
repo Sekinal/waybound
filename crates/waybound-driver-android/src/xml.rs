@@ -1,6 +1,6 @@
 //! Pure-Rust, zero-panic parser for Android `uiautomator dump` XML hierarchies.
 
-use waybound_core::{AccessibilityNode, Bounds, Role};
+use waybound_core::{AccessibilityNode, Bounds, MAX_MAX_NODES, MIN_MAX_NODES, Role, TreeSnapshot};
 
 /// Upper bound on accessibility nodes extracted from a single `uiautomator` dump.
 pub const MAX_NODES: usize = 2_000;
@@ -12,11 +12,20 @@ pub const MAX_NODES: usize = 2_000;
 /// `UI hierchary dumped to: /dev/tty`) and truncates output at [`MAX_NODES`].
 #[must_use]
 pub fn parse_uiautomator_xml(xml: &str) -> Vec<AccessibilityNode> {
+    parse_uiautomator_xml_limited(xml, MAX_NODES).nodes
+}
+
+/// Parses an Android `uiautomator dump` XML payload up to `max_nodes` entries,
+/// reporting `truncated: true` if additional valid `<node>` entries remained.
+#[must_use]
+pub fn parse_uiautomator_xml_limited(xml: &str, max_nodes: usize) -> TreeSnapshot {
+    let limit = max_nodes.clamp(MIN_MAX_NODES, MAX_MAX_NODES);
     let mut nodes = Vec::new();
+    let mut truncated = false;
     let bytes = xml.as_bytes();
     let mut pos = 0;
 
-    while pos < bytes.len() && nodes.len() < MAX_NODES {
+    while pos < bytes.len() {
         let Some(rel_lt) = xml.get(pos..).and_then(|s| s.find('<')) else {
             break;
         };
@@ -39,13 +48,17 @@ pub fn parse_uiautomator_xml(xml: &str) -> Vec<AccessibilityNode> {
             && let Some(attr_region) = strip_node_tag_prefix(inner)
             && let Some(node) = parse_node_attributes(attr_region, nodes.len())
         {
+            if nodes.len() >= limit {
+                truncated = true;
+                break;
+            }
             nodes.push(node);
         }
 
         pos = tag_end + 1;
     }
 
-    nodes
+    TreeSnapshot { nodes, truncated }
 }
 
 /// Finds the byte index of the closing `>` for an XML tag starting after `<`,

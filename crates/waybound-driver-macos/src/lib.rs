@@ -15,7 +15,9 @@ mod screenshot;
 use std::path::Path;
 use std::sync::Mutex;
 
-use waybound_core::{AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Point, Result};
+use waybound_core::{
+    AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Point, Result, TreeSnapshot,
+};
 
 /// Native macOS browser driver targeting a running browser process by PID.
 pub struct MacOsDriver {
@@ -52,6 +54,24 @@ impl Driver for MacOsDriver {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            Err(waybound_core::WayboundError::BackendUnavailable {
+                backend: "macos_native".to_owned(),
+                reason: format!(
+                    "MacOsDriver (pid {}) is only supported on macOS hosts",
+                    self.pid
+                ),
+            })
+        }
+    }
+
+    fn snapshot_tree_limited(&self, max_nodes: usize) -> Result<TreeSnapshot> {
+        #[cfg(target_os = "macos")]
+        {
+            ax::snapshot_application_tree_limited(self.pid, max_nodes)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = max_nodes;
             Err(waybound_core::WayboundError::BackendUnavailable {
                 backend: "macos_native".to_owned(),
                 reason: format!(

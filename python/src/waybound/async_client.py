@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         KeyModifier,
         Role,
         SessionFingerprint,
+        TreeSnapshot,
     )
 
 
@@ -41,14 +42,19 @@ class AsyncLocator:
         return AsyncLocator(self._inner.nth(index))
 
     def get_by_role(
-        self, role: Role, *, name: str | None = None, exact: bool = False
+        self,
+        role: Role,
+        *,
+        name: str | None = None,
+        exact: bool = False,
+        strict: bool = False,
     ) -> AsyncLocator:
         """Return a child async locator scoped spatially inside this container element."""
-        return AsyncLocator(self._inner.get_by_role(role, name=name, exact=exact))
+        return AsyncLocator(self._inner.get_by_role(role, name=name, exact=exact, strict=strict))
 
-    def get_by_text(self, text: str, *, exact: bool = False) -> AsyncLocator:
+    def get_by_text(self, text: str, *, exact: bool = False, strict: bool = False) -> AsyncLocator:
         """Return a child async locator matching accessible text inside this container element."""
-        return AsyncLocator(self._inner.get_by_text(text, exact=exact))
+        return AsyncLocator(self._inner.get_by_text(text, exact=exact, strict=strict))
 
     async def all(self) -> list[AccessibilityNode]:
         """Return all accessibility nodes matching this locator."""
@@ -183,9 +189,18 @@ class AsyncPage:
         """Emit a native key press."""
         await asyncio.to_thread(self._inner.press, key, modifiers=modifiers)
 
-    async def snapshot_tree(self) -> list[AccessibilityNode]:
+    @property
+    def last_tree_truncated(self) -> bool:
+        """Whether the most recent `snapshot_tree()` call was truncated at the node cap."""
+        return self._inner.last_tree_truncated
+
+    async def snapshot_tree(self, *, max_nodes: int | None = None) -> list[AccessibilityNode]:
         """Return a snapshot of the live web-content accessibility tree."""
-        return await asyncio.to_thread(self._inner.snapshot_tree)
+        return await asyncio.to_thread(self._inner.snapshot_tree, max_nodes=max_nodes)
+
+    async def snapshot_tree_with_meta(self, *, max_nodes: int | None = None) -> TreeSnapshot:
+        """Return a `TreeSnapshot` with `nodes` and `truncated` metadata."""
+        return await asyncio.to_thread(self._inner.snapshot_tree_with_meta, max_nodes=max_nodes)
 
     async def captured_responses(
         self, *, url_contains: str | None = None
@@ -255,14 +270,19 @@ class AsyncPage:
         return await asyncio.to_thread(self._inner.screenshot, path)
 
     def get_by_role(
-        self, role: Role, *, name: str | None = None, exact: bool = False
+        self,
+        role: Role,
+        *,
+        name: str | None = None,
+        exact: bool = False,
+        strict: bool = False,
     ) -> AsyncLocator:
         """Return an async locator targeting an element by its semantic role."""
-        return AsyncLocator(self._inner.get_by_role(role, name=name, exact=exact))
+        return AsyncLocator(self._inner.get_by_role(role, name=name, exact=exact, strict=strict))
 
-    def get_by_text(self, text: str, *, exact: bool = False) -> AsyncLocator:
+    def get_by_text(self, text: str, *, exact: bool = False, strict: bool = False) -> AsyncLocator:
         """Return an async locator matching an element by its accessible text."""
-        return AsyncLocator(self._inner.get_by_text(text, exact=exact))
+        return AsyncLocator(self._inner.get_by_text(text, exact=exact, strict=strict))
 
 
 class AsyncSession:

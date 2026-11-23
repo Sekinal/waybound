@@ -104,12 +104,21 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
         Request::Ping => Response::Pong {
             version: env!("CARGO_PKG_VERSION").to_owned(),
         },
-        Request::SnapshotTree => match driver.snapshot_tree() {
-            Ok(nodes) => Response::Tree { nodes },
-            Err(err) => Response::from(&err),
-        },
+        Request::SnapshotTree { max_nodes } => {
+            let limit = waybound_core::clamp_max_nodes(max_nodes);
+            match driver.snapshot_tree_limited(limit) {
+                Ok(snapshot) => Response::Tree {
+                    nodes: snapshot.nodes,
+                    truncated: snapshot.truncated,
+                },
+                Err(err) => Response::from(&err),
+            }
+        }
         Request::LocateAll { query } => match driver.locate_all(&query) {
-            Ok(nodes) => Response::Tree { nodes },
+            Ok(nodes) => Response::Tree {
+                nodes,
+                truncated: false,
+            },
             Err(err) => Response::from(&err),
         },
         Request::CurrentUrl => match driver.current_url() {
@@ -2572,6 +2581,101 @@ mod tests {
         assert!(matches!(
             response,
             Response::Node { ref node } if node.id == "chk-nonstop" && node.checked == Some(true)
+        ));
+    }
+
+    #[test]
+    fn snapshot_tree_honors_max_nodes_and_reports_truncation() {
+        let driver = MockDriver::sample_page();
+        let total = driver.snapshot_tree().map_or(0, |nodes| nodes.len());
+        assert!(total > 2);
+
+        let capped = handle_request(
+            &driver,
+            &state(),
+            Request::SnapshotTree { max_nodes: Some(2) },
+        );
+        assert!(matches!(
+            capped,
+            Response::Tree { ref nodes, truncated: true } if nodes.len() == 2
+        ));
+
+        let uncapped = handle_request(
+            &driver,
+            &state(),
+            Request::SnapshotTree {
+                max_nodes: Some(total + 10),
+            },
+        );
+        assert!(matches!(
+            uncapped,
+            Response::Tree { ref nodes, truncated: false } if nodes.len() == total
+        ));
+    }
+
+    #[test]
+    fn strict_locator_returns_strict_mode_violation_on_ambiguous_match() {
+        let driver = MockDriver::with_nodes(vec![
+            AccessibilityNode::new(
+                "btn-1".to_owned(),
+                Role::Button,
+                Some("Save".to_owned()),
+                None,
+                Bounds {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 60.0,
+                    height: 30.0,
+                },
+            ),
+            AccessibilityNode::new(
+                "btn-2".to_owned(),
+                Role::Button,
+                Some("Save".to_owned()),
+                None,
+                Bounds {
+                    x: 100.0,
+                    y: 10.0,
+                    width: 60.0,
+                    height: 30.0,
+                },
+            ),
+            AccessibilityNode::new(
+                "btn-unique".to_owned(),
+                Role::Button,
+                Some("Cancel".to_owned()),
+                None,
+                Bounds {
+                    x: 200.0,
+                    y: 10.0,
+                    width: 60.0,
+                    height: 30.0,
+                },
+            ),
+        ]);
+
+        let mut ambiguous = LocatorQuery::by_role(Role::Button, Some("Save".to_owned()));
+        ambiguous.strict = true;
+        let resp = handle_request(&driver, &state(), Request::Click { query: ambiguous });
+        assert!(matches!(
+            resp,
+            Response::Error { ref code, ref message }
+                if code == "strict_mode_violation" && message.contains("2 elements")
+        ));
+
+        let mut unique = LocatorQuery::by_role(Role::Button, Some("Cancel".to_owned()));
+        unique.strict = true;
+        let ok_resp = handle_request(
+            &driver,
+            &state(),
+            Request::WaitFor {
+                query: unique,
+                timeout_ms: 500,
+            },
+        );
+        assert!(matches!(
+            ok_resp,
+            Response::Node { ref node } if node.id == "btn-unique"
         ));
     }
 }

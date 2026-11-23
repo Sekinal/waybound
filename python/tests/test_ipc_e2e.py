@@ -216,3 +216,55 @@ def test_partial_frame_is_reassembled_across_idle_wakeups() -> None:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+
+def test_snapshot_tree_truncation_and_strict_locator_mode() -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    with launch(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
+        full = page.snapshot_tree_with_meta(max_nodes=20)
+        assert len(full.nodes) == 5
+        assert full.truncated is False
+        full_truncated = page.last_tree_truncated
+        assert full_truncated is False
+
+        capped = page.snapshot_tree_with_meta(max_nodes=2)
+        assert len(capped.nodes) == 2
+        assert capped.truncated is True
+        capped_truncated = page.last_tree_truncated
+        assert capped_truncated is True
+
+        # `snapshot_tree(max_nodes=...)` stays backwards-compatible and sets `last_tree_truncated`.
+        nodes = page.snapshot_tree(max_nodes=3)
+        assert len(nodes) == 3
+        after_truncated = page.last_tree_truncated
+        assert after_truncated is True
+
+        # Single match succeeds in strict mode.
+        btn = page.get_by_role(Role.BUTTON, strict=True).wait_for(timeout_ms=1_000)
+        assert btn.id == "btn-search"
+
+        # Multiple matches (2 checkboxes in mock page) fail immediately with strict_mode_violation.
+        with pytest.raises(WayboundDaemonError) as strict_err:
+            page.get_by_role(Role.CHECKBOX, strict=True).click()
+        assert strict_err.value.code == "strict_mode_violation"
+        assert "2 elements" in strict_err.value.message
+
+        # Non-strict mode still resolves the first match cleanly.
+        assert page.get_by_role(Role.CHECKBOX).wait_for(timeout_ms=1_000).id == "chk-nonstop"
+
+
+async def test_async_snapshot_tree_truncation_and_strict_mode() -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    async with launch_async(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
+        capped = await page.snapshot_tree_with_meta(max_nodes=2)
+        assert len(capped.nodes) == 2
+        assert capped.truncated is True
+        assert page.last_tree_truncated is True
+
+        with pytest.raises(WayboundDaemonError) as strict_err:
+            await page.get_by_role(Role.CHECKBOX, strict=True).wait_for(timeout_ms=1_000)
+        assert strict_err.value.code == "strict_mode_violation"

@@ -152,6 +152,23 @@ impl Driver for LinuxDriver {
         Ok(snapshot.nodes)
     }
 
+    fn snapshot_tree_limited(&self, max_nodes: usize) -> Result<waybound_core::TreeSnapshot> {
+        if let Some(Ok(snap)) =
+            self.with_atspi(|client| client.snapshot_limited(self.pid, max_nodes))
+        {
+            return Ok(waybound_core::TreeSnapshot {
+                nodes: snap.nodes,
+                truncated: snap.truncated,
+            });
+        }
+        let snapshot =
+            atspi::query_atspi_tree_limited(self.pid, self.display.as_deref(), max_nodes)?;
+        Ok(waybound_core::TreeSnapshot {
+            nodes: snapshot.nodes,
+            truncated: snapshot.truncated,
+        })
+    }
+
     fn current_url(&self) -> Result<Option<String>> {
         if let Some(Ok(url)) = self.with_atspi(|client| client.current_url(self.pid)) {
             return Ok(url);

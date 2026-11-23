@@ -113,6 +113,11 @@ impl Driver for AndroidDriver {
         Ok(xml::parse_uiautomator_xml(&raw_xml))
     }
 
+    fn snapshot_tree_limited(&self, max_nodes: usize) -> Result<waybound_core::TreeSnapshot> {
+        let raw_xml = self.dump_xml(None)?;
+        Ok(xml::parse_uiautomator_xml_limited(&raw_xml, max_nodes))
+    }
+
     fn locate_within(
         &self,
         query: &LocatorQuery,
@@ -120,12 +125,7 @@ impl Driver for AndroidDriver {
     ) -> Result<AccessibilityNode> {
         let raw_xml = self.dump_xml(Some(remaining))?;
         let nodes = xml::parse_uiautomator_xml(&raw_xml);
-        query
-            .resolve_one(&nodes)
-            .cloned()
-            .ok_or_else(|| WayboundError::ElementNotFound {
-                query: format!("{query:?}"),
-            })
+        query.resolve_checked(&nodes).cloned()
     }
 
     fn current_url(&self) -> Result<Option<String>> {

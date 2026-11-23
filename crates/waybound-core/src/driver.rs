@@ -49,6 +49,30 @@ impl Default for SessionConfig {
     }
 }
 
+/// Default maximum number of accessibility nodes returned by [`Driver::snapshot_tree_limited`].
+pub const DEFAULT_MAX_NODES: usize = 2_000;
+/// Minimum allowed value for `max_nodes` in [`Driver::snapshot_tree_limited`].
+pub const MIN_MAX_NODES: usize = 1;
+/// Maximum allowed value for `max_nodes` in [`Driver::snapshot_tree_limited`].
+pub const MAX_MAX_NODES: usize = 20_000;
+
+/// Resolves an optional `max_nodes` parameter to a safe limit within `1..=20_000`
+/// (defaulting to [`DEFAULT_MAX_NODES`]).
+#[must_use]
+pub fn clamp_max_nodes(max_nodes: Option<usize>) -> usize {
+    max_nodes.map_or(DEFAULT_MAX_NODES, |n| n.clamp(MIN_MAX_NODES, MAX_MAX_NODES))
+}
+
+/// Result of capturing an accessibility tree snapshot, including truncation metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TreeSnapshot {
+    /// Captured accessibility nodes.
+    pub nodes: Vec<AccessibilityNode>,
+    /// `true` when traversal stopped early because the node cap was reached.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 /// Core platform abstraction for out-of-band browser control.
 ///
 /// Implementations live in dedicated backend crates so any platform-specific
@@ -64,6 +88,25 @@ pub trait Driver: Send + Sync {
     /// Returns an error if the OS accessibility bus cannot be queried.
     fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>>;
 
+    /// Captures a snapshot of the current accessibility tree capped at `max_nodes`
+    /// (clamped to `1..=20_000`), reporting whether traversal was truncated.
+    ///
+    /// Backends that enforce a traversal cap should override this method to apply
+    /// `max_nodes` directly during traversal and report `truncated` accurately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OS accessibility bus cannot be queried.
+    fn snapshot_tree_limited(&self, max_nodes: usize) -> Result<TreeSnapshot> {
+        let limit = max_nodes.clamp(MIN_MAX_NODES, MAX_MAX_NODES);
+        let mut nodes = self.snapshot_tree()?;
+        let truncated = nodes.len() > limit;
+        if truncated {
+            nodes.truncate(limit);
+        }
+        Ok(TreeSnapshot { nodes, truncated })
+    }
+
     /// Resolves all accessibility nodes matching `query` (ignoring `query.nth`).
     ///
     /// # Errors
@@ -74,19 +117,17 @@ pub trait Driver: Send + Sync {
         Ok(query.resolve_all(&nodes).into_iter().cloned().collect())
     }
 
-    /// Resolves the `query.nth`-th accessibility node matching `query`.
+    /// Resolves the `query.nth`-th accessibility node matching `query`, enforcing
+    /// `query.strict` when set.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::WayboundError::ElementNotFound`] when fewer than `query.nth + 1` nodes match.
+    /// Returns [`crate::WayboundError::StrictModeViolation`] when `query.strict` is `true`
+    /// and more than one node matches, or [`crate::WayboundError::ElementNotFound`] when
+    /// fewer than `query.nth + 1` nodes match.
     fn locate(&self, query: &LocatorQuery) -> Result<AccessibilityNode> {
         let nodes = self.snapshot_tree()?;
-        query
-            .resolve_one(&nodes)
-            .cloned()
-            .ok_or_else(|| crate::WayboundError::ElementNotFound {
-                query: format!("{query:?}"),
-            })
+        query.resolve_checked(&nodes).cloned()
     }
 
     /// Like [`Driver::locate`], called from a wait loop that has `remaining` time left.

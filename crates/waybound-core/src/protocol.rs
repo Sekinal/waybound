@@ -15,7 +15,11 @@ pub enum Request {
     /// Health check returning the daemon version.
     Ping,
     /// Return a snapshot of the active accessibility tree.
-    SnapshotTree,
+    SnapshotTree {
+        /// Optional maximum number of nodes to return (defaults to 2,000, clamped to `1..=20_000`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_nodes: Option<usize>,
+    },
     /// Return all accessibility nodes matching `query`.
     LocateAll {
         /// Semantic locator query (`nth` is ignored).
@@ -182,10 +186,13 @@ pub enum Response {
         /// Daemon crate version string.
         version: String,
     },
-    /// Response to [`Request::SnapshotTree`].
+    /// Response to [`Request::SnapshotTree`] and [`Request::LocateAll`].
     Tree {
         /// Captured accessibility nodes.
         nodes: Vec<AccessibilityNode>,
+        /// `true` when traversal stopped early because the node cap was reached.
+        #[serde(default)]
+        truncated: bool,
     },
     /// Response to [`Request::WaitFor`].
     Node {
@@ -237,6 +244,7 @@ impl From<&WayboundError> for Response {
             WayboundError::UnsupportedInput { .. } => "unsupported_input",
             WayboundError::ElementDisabled { .. } => "element_disabled",
             WayboundError::InvalidElementState { .. } => "invalid_element_state",
+            WayboundError::StrictModeViolation { .. } => "strict_mode_violation",
         };
         Self::Error {
             code: code.to_owned(),
@@ -391,6 +399,55 @@ mod tests {
         });
         assert!(
             matches!(invalid, Response::Error { ref code, .. } if code == "invalid_element_state")
+        );
+        let strict = Response::from(&WayboundError::StrictModeViolation {
+            query: "q".to_owned(),
+            count: 3,
+        });
+        assert!(
+            matches!(strict, Response::Error { ref code, ref message } if code == "strict_mode_violation" && message.contains('3'))
+        );
+    }
+
+    #[test]
+    fn snapshot_tree_request_and_tree_response_are_backwards_compatible() {
+        let legacy_req: Result<Request, _> = serde_json::from_str(r#"{"method":"snapshot_tree"}"#);
+        assert_eq!(
+            legacy_req.ok(),
+            Some(Request::SnapshotTree { max_nodes: None })
+        );
+
+        let capped_req: Result<Request, _> =
+            serde_json::from_str(r#"{"method":"snapshot_tree","max_nodes":25}"#);
+        assert_eq!(
+            capped_req.ok(),
+            Some(Request::SnapshotTree {
+                max_nodes: Some(25)
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_string(&Request::SnapshotTree { max_nodes: None }).unwrap_or_default(),
+            r#"{"method":"snapshot_tree"}"#
+        );
+
+        let legacy_resp: Result<Response, _> =
+            serde_json::from_str(r#"{"status":"tree","nodes":[]}"#);
+        assert_eq!(
+            legacy_resp.ok(),
+            Some(Response::Tree {
+                nodes: Vec::new(),
+                truncated: false,
+            })
+        );
+
+        let truncated_resp = Response::Tree {
+            nodes: Vec::new(),
+            truncated: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&truncated_resp).unwrap_or_default(),
+            r#"{"status":"tree","nodes":[],"truncated":true}"#
         );
     }
 }

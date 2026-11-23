@@ -139,22 +139,39 @@ impl AtspiClient {
     ///
     /// Returns [`WayboundError::BackendUnavailable`] if the AT-SPI2 registry cannot be queried.
     pub fn snapshot(&mut self, target_pid: Option<i32>) -> Result<AtspiSnapshot> {
+        self.snapshot_limited(target_pid, MAX_NODES)
+    }
+
+    /// Captures an accessibility snapshot of the active browser web document capped at
+    /// `max_nodes`, reporting whether traversal was truncated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WayboundError::BackendUnavailable`] if the AT-SPI2 registry cannot be queried.
+    pub fn snapshot_limited(
+        &mut self,
+        target_pid: Option<i32>,
+        max_nodes: usize,
+    ) -> Result<AtspiSnapshot> {
+        let limit = max_nodes.clamp(waybound_core::MIN_MAX_NODES, waybound_core::MAX_MAX_NODES);
         let (web_root, mut current_url, viewport_bounds) = self.resolve_web_root(target_pid)?;
         let Some(root) = web_root else {
             return Ok(AtspiSnapshot {
                 nodes: Vec::new(),
+                truncated: false,
                 current_url,
                 viewport_bounds,
             });
         };
 
-        let nodes = self.walk_web_document(&root);
+        let (nodes, truncated) = self.walk_web_document(&root, limit);
         if current_url.as_deref().is_some_and(|u| u.trim().is_empty()) {
             current_url = None;
         }
 
         Ok(AtspiSnapshot {
             nodes,
+            truncated,
             current_url,
             viewport_bounds,
         })
@@ -253,13 +270,19 @@ impl AtspiClient {
         (web_root, current_url, viewport_bounds)
     }
 
-    fn walk_web_document(&self, root: &AccessibleRef) -> Vec<AccessibilityNode> {
+    fn walk_web_document(
+        &self,
+        root: &AccessibleRef,
+        max_nodes: usize,
+    ) -> (Vec<AccessibilityNode>, bool) {
         let mut nodes = Vec::new();
+        let mut truncated = false;
         let mut queue: VecDeque<AccessibleRef> = VecDeque::new();
         queue.push_back(root.clone());
 
         while let Some((bus, path)) = queue.pop_front() {
-            if nodes.len() >= MAX_NODES {
+            if nodes.len() >= max_nodes {
+                truncated = true;
                 break;
             }
 
@@ -314,7 +337,7 @@ impl AtspiClient {
             }
         }
 
-        nodes
+        (nodes, truncated)
     }
 
     fn bus_pid(&self, bus: &str) -> Option<u32> {

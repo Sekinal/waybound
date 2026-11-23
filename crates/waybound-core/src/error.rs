@@ -75,6 +75,15 @@ pub enum WayboundError {
         /// Explanation of the mismatch, including the locator query.
         detail: String,
     },
+
+    /// More than one accessibility node matched a strict locator query.
+    #[error("strict mode violation: locator {query} matched {count} elements")]
+    StrictModeViolation {
+        /// Human-readable representation of the locator query.
+        query: String,
+        /// Number of matching elements found.
+        count: usize,
+    },
 }
 
 impl WayboundError {
