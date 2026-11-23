@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
+import secrets
 import subprocess
 import threading
+import urllib.parse
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
 
@@ -18,6 +21,8 @@ if TYPE_CHECKING:
     from pathlib import Path
     from types import TracebackType
 
+type MultipartFile = tuple[str, bytes] | tuple[str, bytes, str] | bytes
+
 
 @dataclass(frozen=True, slots=True)
 class HandoffResponse:
@@ -27,6 +32,16 @@ class HandoffResponse:
     status: int
     headers: tuple[tuple[str, str], ...]
     body: str
+    content: bytes = b""
+
+    def __post_init__(self) -> None:
+        if not self.content and self.body:
+            object.__setattr__(self, "content", self.body.encode("utf-8"))
+
+    @property
+    def text(self) -> str:
+        """Return the response body decoded as UTF-8 text."""
+        return self.body
 
     def json(self) -> object:
         """Parse and return the response body as JSON."""
@@ -51,6 +66,102 @@ def _normalize_headers(
     return [[str(k), str(v)] for k, v in headers.items()]
 
 
+def _escape_disposition_param(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
+
+
+def _sanitize_header_value(value: str) -> str:
+    return value.replace("\r", "").replace("\n", "")
+
+
+def _encode_multipart(
+    *,
+    data: Mapping[str, str] | None,
+    files: Mapping[str, MultipartFile],
+) -> tuple[bytes, str]:
+    """Encode `data` and `files` as an RFC 7578 `multipart/form-data` payload."""
+    boundary = f"----WayboundBoundary{secrets.token_hex(16)}"
+    boundary_bytes = boundary.encode("ascii")
+    chunks: list[bytes] = []
+
+    if data is not None:
+        for field_name, field_value in data.items():
+            escaped_name = _escape_disposition_param(field_name)
+            chunks.append(b"--" + boundary_bytes + b"\r\n")
+            chunks.append(f'Content-Disposition: form-data; name="{escaped_name}"\r\n\r\n'.encode())
+            chunks.append(field_value.encode("utf-8"))
+            chunks.append(b"\r\n")
+
+    for field_name, file_spec in files.items():
+        match file_spec:
+            case bytes() as payload:
+                filename = field_name
+                content_type = "application/octet-stream"
+            case (filename, payload):
+                content_type = "application/octet-stream"
+            case (filename, payload, content_type):
+                pass
+
+        escaped_name = _escape_disposition_param(field_name)
+        escaped_filename = _escape_disposition_param(filename)
+        clean_ct = _sanitize_header_value(content_type)
+        chunks.append(b"--" + boundary_bytes + b"\r\n")
+        chunks.append(
+            (
+                f'Content-Disposition: form-data; name="{escaped_name}"; '
+                f'filename="{escaped_filename}"\r\n'
+            ).encode()
+        )
+        chunks.append(f"Content-Type: {clean_ct}\r\n\r\n".encode())
+        chunks.append(payload)
+        chunks.append(b"\r\n")
+
+    chunks.append(b"--" + boundary_bytes + b"--\r\n")
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def _prepare_request_payload(
+    headers: Mapping[str, str] | list[tuple[str, str]] | None,
+    *,
+    body: str | bytes | None,
+    json_body: object | None,
+    data: Mapping[str, str] | None,
+    files: Mapping[str, MultipartFile] | None,
+) -> tuple[list[list[str]], str | bytes | None]:
+    encoded_headers = _normalize_headers(headers)
+    specified = sum(
+        (
+            body is not None,
+            json_body is not None,
+            data is not None or files is not None,
+        )
+    )
+    if specified > 1:
+        msg = "specify at most one of 'body', 'json_body', or 'data'/'files'"
+        raise ValueError(msg)
+
+    has_content_type = any(k.lower() == "content-type" for k, _ in encoded_headers)
+
+    if files is not None:
+        multipart_body, content_type = _encode_multipart(data=data, files=files)
+        if not has_content_type:
+            encoded_headers.append(["content-type", content_type])
+        return encoded_headers, multipart_body
+
+    if data is not None:
+        form_body = urllib.parse.urlencode(list(data.items()))
+        if not has_content_type:
+            encoded_headers.append(["content-type", "application/x-www-form-urlencoded"])
+        return encoded_headers, form_body
+
+    if json_body is not None:
+        if not has_content_type:
+            encoded_headers.append(["content-type", "application/json"])
+        return encoded_headers, json.dumps(json_body)
+
+    return encoded_headers, body
+
+
 _PAIR_LEN = 2
 
 
@@ -64,8 +175,21 @@ def _parse_handoff_response(raw: dict[object, object]) -> HandoffResponse:
         for pair in raw_headers:
             if isinstance(pair, list) and len(pair) == _PAIR_LEN:
                 parsed_headers.append((str(pair[0]), str(pair[1])))
-    body = str(raw.get("body", ""))
-    return HandoffResponse(url=url, status=status, headers=tuple(parsed_headers), body=body)
+    raw_body_b64 = raw.get("body_base64")
+    raw_body = raw.get("body")
+    if isinstance(raw_body_b64, str):
+        content = base64.b64decode(raw_body_b64)
+        body = str(raw_body) if raw_body is not None else content.decode("utf-8", errors="replace")
+    else:
+        body = str(raw_body) if raw_body is not None else ""
+        content = body.encode("utf-8")
+    return HandoffResponse(
+        url=url,
+        status=status,
+        headers=tuple(parsed_headers),
+        body=body,
+        content=content,
+    )
 
 
 class HandoffHttpClient:
@@ -177,22 +301,25 @@ class HandoffHttpClient:
         self._fingerprint = fingerprint
         self._init_worker(fingerprint)
 
-    def request(
+    def request(  # noqa: PLR0913
         self,
         method: str,
         url: str,
         *,
         headers: Mapping[str, str] | list[tuple[str, str]] | None = None,
-        body: str | None = None,
+        body: str | bytes | None = None,
         json_body: object | None = None,
+        data: Mapping[str, str] | None = None,
+        files: Mapping[str, MultipartFile] | None = None,
     ) -> HandoffResponse:
         """Send an HTTP request replaying the captured browser fingerprint and cookies."""
-        encoded_headers = _normalize_headers(headers)
-        payload_body = body
-        if json_body is not None:
-            payload_body = json.dumps(json_body)
-            if not any(k.lower() == "content-type" for k, _ in encoded_headers):
-                encoded_headers.append(["content-type", "application/json"])
+        encoded_headers, payload_body = _prepare_request_payload(
+            headers,
+            body=body,
+            json_body=json_body,
+            data=data,
+            files=files,
+        )
 
         result = self._execute_once(method, url, encoded_headers, payload_body)
         if self._on_refresh is not None and result.status in self._refresh_statuses:
@@ -206,17 +333,20 @@ class HandoffHttpClient:
         method: str,
         url: str,
         headers: list[list[str]],
-        body: str | None,
+        body: str | bytes | None,
     ) -> HandoffResponse:
-        resp = self._rpc(
-            {
-                "method": "request",
-                "http_method": method,
-                "url": url,
-                "headers": headers,
-                "body": body,
-            }
-        )
+        rpc_payload: dict[str, object] = {
+            "method": "request",
+            "http_method": method,
+            "url": url,
+            "headers": headers,
+        }
+        if isinstance(body, bytes):
+            rpc_payload["body_base64"] = base64.b64encode(body).decode("ascii")
+        elif body is not None:
+            rpc_payload["body"] = body
+
+        resp = self._rpc(rpc_payload)
         raw_resp = resp.get("response")
         if resp.get("status") != "response" or not isinstance(raw_resp, dict):
             msg = f"unexpected replay request response: {resp!r}"
@@ -232,27 +362,68 @@ class HandoffHttpClient:
         """Send an HTTP `GET` request."""
         return self.request("GET", url, headers=headers)
 
-    def post(
+    def post(  # noqa: PLR0913
         self,
         url: str,
         *,
         headers: Mapping[str, str] | list[tuple[str, str]] | None = None,
-        body: str | None = None,
+        body: str | bytes | None = None,
         json_body: object | None = None,
+        data: Mapping[str, str] | None = None,
+        files: Mapping[str, MultipartFile] | None = None,
     ) -> HandoffResponse:
         """Send an HTTP `POST` request."""
-        return self.request("POST", url, headers=headers, body=body, json_body=json_body)
+        return self.request(
+            "POST",
+            url,
+            headers=headers,
+            body=body,
+            json_body=json_body,
+            data=data,
+            files=files,
+        )
 
-    def put(
+    def put(  # noqa: PLR0913
         self,
         url: str,
         *,
         headers: Mapping[str, str] | list[tuple[str, str]] | None = None,
-        body: str | None = None,
+        body: str | bytes | None = None,
         json_body: object | None = None,
+        data: Mapping[str, str] | None = None,
+        files: Mapping[str, MultipartFile] | None = None,
     ) -> HandoffResponse:
         """Send an HTTP `PUT` request."""
-        return self.request("PUT", url, headers=headers, body=body, json_body=json_body)
+        return self.request(
+            "PUT",
+            url,
+            headers=headers,
+            body=body,
+            json_body=json_body,
+            data=data,
+            files=files,
+        )
+
+    def patch(  # noqa: PLR0913
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | list[tuple[str, str]] | None = None,
+        body: str | bytes | None = None,
+        json_body: object | None = None,
+        data: Mapping[str, str] | None = None,
+        files: Mapping[str, MultipartFile] | None = None,
+    ) -> HandoffResponse:
+        """Send an HTTP `PATCH` request."""
+        return self.request(
+            "PATCH",
+            url,
+            headers=headers,
+            body=body,
+            json_body=json_body,
+            data=data,
+            files=files,
+        )
 
     def delete(
         self,
@@ -411,14 +582,16 @@ class AsyncHandoffHttpClient:
         """Hot-swap the active TLS/HTTP2 fingerprint and cookie jar without restarting."""
         await asyncio.to_thread(self._inner.update_fingerprint, fingerprint)
 
-    async def request(
+    async def request(  # noqa: PLR0913
         self,
         method: str,
         url: str,
         *,
         headers: Mapping[str, str] | list[tuple[str, str]] | None = None,
-        body: str | None = None,
+        body: str | bytes | None = None,
         json_body: object | None = None,
+        data: Mapping[str, str] | None = None,
+        files: Mapping[str, MultipartFile] | None = None,
     ) -> HandoffResponse:
         """Send an async HTTP request replaying the captured browser fingerprint."""
         result = await asyncio.to_thread(
@@ -428,6 +601,8 @@ class AsyncHandoffHttpClient:
             headers=headers,
             body=body,
             json_body=json_body,
+            data=data,
+            files=files,
         )
         if self._async_on_refresh is not None and result.status in self._refresh_statuses:
             refreshed = await self._async_on_refresh()
@@ -439,6 +614,8 @@ class AsyncHandoffHttpClient:
                 headers=headers,
                 body=body,
                 json_body=json_body,
+                data=data,
+                files=files,
             )
         return result
 
@@ -451,27 +628,68 @@ class AsyncHandoffHttpClient:
         """Send an async HTTP `GET` request."""
         return await self.request("GET", url, headers=headers)
 
-    async def post(
+    async def post(  # noqa: PLR0913
         self,
         url: str,
         *,
         headers: Mapping[str, str] | list[tuple[str, str]] | None = None,
-        body: str | None = None,
+        body: str | bytes | None = None,
         json_body: object | None = None,
+        data: Mapping[str, str] | None = None,
+        files: Mapping[str, MultipartFile] | None = None,
     ) -> HandoffResponse:
         """Send an async HTTP `POST` request."""
-        return await self.request("POST", url, headers=headers, body=body, json_body=json_body)
+        return await self.request(
+            "POST",
+            url,
+            headers=headers,
+            body=body,
+            json_body=json_body,
+            data=data,
+            files=files,
+        )
 
-    async def put(
+    async def put(  # noqa: PLR0913
         self,
         url: str,
         *,
         headers: Mapping[str, str] | list[tuple[str, str]] | None = None,
-        body: str | None = None,
+        body: str | bytes | None = None,
         json_body: object | None = None,
+        data: Mapping[str, str] | None = None,
+        files: Mapping[str, MultipartFile] | None = None,
     ) -> HandoffResponse:
         """Send an async HTTP `PUT` request."""
-        return await self.request("PUT", url, headers=headers, body=body, json_body=json_body)
+        return await self.request(
+            "PUT",
+            url,
+            headers=headers,
+            body=body,
+            json_body=json_body,
+            data=data,
+            files=files,
+        )
+
+    async def patch(  # noqa: PLR0913
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | list[tuple[str, str]] | None = None,
+        body: str | bytes | None = None,
+        json_body: object | None = None,
+        data: Mapping[str, str] | None = None,
+        files: Mapping[str, MultipartFile] | None = None,
+    ) -> HandoffResponse:
+        """Send an async HTTP `PATCH` request."""
+        return await self.request(
+            "PATCH",
+            url,
+            headers=headers,
+            body=body,
+            json_body=json_body,
+            data=data,
+            files=files,
+        )
 
     async def delete(
         self,
