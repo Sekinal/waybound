@@ -251,6 +251,16 @@ def test_snapshot_tree_truncation_and_strict_locator_mode() -> None:
         assert strict_err.value.code == "strict_mode_violation"
         assert "2 elements" in strict_err.value.message
 
+        # `.first` and `.nth(i)` disambiguate a strict locator without raising.
+        assert (
+            page.get_by_role(Role.CHECKBOX, strict=True).first.wait_for(timeout_ms=1_000).id
+            == "chk-nonstop"
+        )
+        assert (
+            page.get_by_role(Role.CHECKBOX, strict=True).nth(1).wait_for(timeout_ms=1_000).id
+            == "chk-insurance"
+        )
+
         # Non-strict mode still resolves the first match cleanly.
         assert page.get_by_role(Role.CHECKBOX).wait_for(timeout_ms=1_000).id == "chk-nonstop"
 

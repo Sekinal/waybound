@@ -107,7 +107,10 @@ export class Locator {
     if (!Number.isSafeInteger(index) || index < 0) {
       throw new RangeError(`nth index must be a non-negative integer, got ${index}`);
     }
-    return new Locator(this.#transport, Object.freeze({ ...this.query, nth: index }));
+    return new Locator(
+      this.#transport,
+      Object.freeze({ ...this.query, nth: index, strict: false }),
+    );
   }
 
   /** A child locator matched by role, spatially scoped inside this element. */
@@ -274,7 +277,10 @@ export class Page {
     text: string,
     options: TextOptions & TimeoutOptions = {},
   ): Promise<AccessibilityNode> {
-    return this.getByText(text, { exact: options.exact ?? false }).waitFor({
+    return this.getByText(text, {
+      exact: options.exact ?? false,
+      strict: options.strict ?? false,
+    }).waitFor({
       timeoutMs: options.timeoutMs ?? 10_000,
     });
   }

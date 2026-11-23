@@ -460,6 +460,18 @@ describe("launch() against misbehaving endpoints", { skip: process.platform === 
           err.message.includes("2 elements"),
       );
 
+      // `.first` and `.nth(i)` disambiguate a strict locator without raising.
+      const strictFirst = await page
+        .getByRole(Role.CHECKBOX, { strict: true })
+        .first.waitFor({ timeoutMs: 1_000 });
+      assert.equal(strictFirst.id, "chk-nonstop");
+
+      const strictSecond = await page
+        .getByRole(Role.CHECKBOX, { strict: true })
+        .nth(1)
+        .waitFor({ timeoutMs: 1_000 });
+      assert.equal(strictSecond.id, "chk-insurance");
+
       // Non-strict mode still resolves the first match.
       const firstCheckbox = await page.getByRole(Role.CHECKBOX).waitFor({ timeoutMs: 1_000 });
       assert.equal(firstCheckbox.id, "chk-nonstop");

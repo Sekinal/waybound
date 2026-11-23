@@ -294,6 +294,7 @@ except Exception as exc:
 
 _max_nodes_raw = os.environ.get("WAYBOUND_MAX_NODES", "").strip()
 MAX_NODES = max(1, min(20000, int(_max_nodes_raw))) if _max_nodes_raw.isdigit() else 4000
+SCAN_LIMIT = 4000
 CHROME_NAMES = ("chrome", "chromium", "google-chrome", "brave")
 
 target_pid_raw = os.environ.get("WAYBOUND_TARGET_PID", "").strip()
@@ -353,7 +354,7 @@ best_area = -1.0
 scan_queue = collections.deque([target_app])
 scanned = 0
 
-while scan_queue and scanned < MAX_NODES:
+while scan_queue and scanned < SCAN_LIMIT:
     acc = scan_queue.popleft()
     if acc is None:
         continue

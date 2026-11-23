@@ -46,7 +46,9 @@ class Locator:
         if index < 0:
             msg = f"nth index must be non-negative, got {index}"
             raise ValueError(msg)
-        return Locator(_transport=self._transport, query=replace(self.query, nth=index))
+        return Locator(
+            _transport=self._transport, query=replace(self.query, nth=index, strict=False)
+        )
 
     def get_by_role(
         self,

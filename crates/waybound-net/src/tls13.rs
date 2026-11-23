@@ -584,6 +584,10 @@ mod tests {
         let r1 = seal_record(&ks, 0, CONTENT_TYPE_APPLICATION_DATA, b"after-update", 1);
         let r2 = seal_record(&ks, 1, CONTENT_TYPE_APPLICATION_DATA, b"-and-more", 0);
 
+        assert!(r0.is_some());
+        assert!(ku.is_some());
+        assert!(r1.is_some());
+        assert!(r2.is_some());
         let (Some(r0), Some(ku), Some(r1), Some(r2)) = (r0, ku, r1, r2) else {
             return;
         };
@@ -623,6 +627,8 @@ mod tests {
 
         let r0 = seal_record(&ks, 0, CONTENT_TYPE_APPLICATION_DATA, b"chunk-one:", 0);
         let r1 = seal_record(&ks, 1, CONTENT_TYPE_APPLICATION_DATA, b"chunk-two", 3);
+        assert!(r0.is_some());
+        assert!(r1.is_some());
         let (Some(r0), Some(r1)) = (r0, r1) else {
             return;
         };
@@ -663,6 +669,9 @@ mod tests {
         let r0 = seal_record(&ks, 0, CONTENT_TYPE_APPLICATION_DATA, b"rec0-", 0);
         let r1 = seal_record(&ks, 1, CONTENT_TYPE_APPLICATION_DATA, b"rec1-", 0);
         let r2 = seal_record(&ks, 2, CONTENT_TYPE_APPLICATION_DATA, b"rec2", 0);
+        assert!(r0.is_some());
+        assert!(r1.is_some());
+        assert!(r2.is_some());
         let (Some(r0), Some(r1), Some(r2)) = (r0, r1, r2) else {
             return;
         };
@@ -696,6 +705,8 @@ mod tests {
 
         let c_ks = TrafficKeyState::from_secret(suite, client_secret.clone());
         let s_ks = TrafficKeyState::from_secret(suite, server_secret.clone());
+        assert!(c_ks.is_some());
+        assert!(s_ks.is_some());
         let (Some(c_ks), Some(s_ks)) = (c_ks, s_ks) else {
             return;
         };
@@ -706,6 +717,8 @@ mod tests {
 
         let req_rec = seal_record(&c_ks, 0, CONTENT_TYPE_APPLICATION_DATA, http_req, 0);
         let resp_rec = seal_record(&s_ks, 0, CONTENT_TYPE_APPLICATION_DATA, http_resp, 0);
+        assert!(req_rec.is_some());
+        assert!(resp_rec.is_some());
         let (Some(req_rec), Some(resp_rec)) = (req_rec, resp_rec) else {
             return;
         };
