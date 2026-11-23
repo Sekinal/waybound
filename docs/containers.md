@@ -48,7 +48,7 @@ with waybound.launch(opts) as page:
 
 When the script launches Chrome itself (`launch_chrome=True`) and sets `ssl_keylog=...`, decryption happens inside the daemon on the traffic it relays, so no extra capabilities are needed.
 
-The `tshark` path is only used when attaching to a Chrome the daemon did not launch (`pid=...`). That needs packet-capture capabilities:
+The `tshark` path is only used when attaching to a Chrome the daemon did not launch (`pid=...`). It captures on the `any` interface (override with `--net-iface` / `WAYBOUND_NET_IFACE`), and the daemon exits at startup if `tshark` is missing or cannot open the interface. That needs packet-capture capabilities:
 
 ```bash
 podman run --rm \
