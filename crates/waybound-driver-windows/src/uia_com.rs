@@ -40,6 +40,7 @@
 //! at most `max_nodes` calls) that stops at the caller's deadline and reports `truncated`,
 //! like the PowerShell walker did.
 
+use std::fmt::Write as _;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -65,12 +66,12 @@ use windows::Win32::UI::Accessibility::{
     TreeScope_Element, TreeScope_Subtree, UIA_BoundingRectanglePropertyId,
     UIA_ControlTypePropertyId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
     UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_HasKeyboardFocusPropertyId,
-    UIA_IsEnabledPropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
-    UIA_IsSelectionItemPatternAvailablePropertyId, UIA_IsTogglePatternAvailablePropertyId,
-    UIA_IsValuePatternAvailablePropertyId, UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
-    UIA_PROPERTY_ID, UIA_ProcessIdPropertyId, UIA_RuntimeIdPropertyId,
-    UIA_SelectionItemIsSelectedPropertyId, UIA_ToggleToggleStatePropertyId,
-    UIA_ValueValuePropertyId, UIA_WindowControlTypeId,
+    UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId,
+    UIA_IsExpandCollapsePatternAvailablePropertyId, UIA_IsSelectionItemPatternAvailablePropertyId,
+    UIA_IsTogglePatternAvailablePropertyId, UIA_IsValuePatternAvailablePropertyId,
+    UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId, UIA_PROPERTY_ID,
+    UIA_ProcessIdPropertyId, UIA_RuntimeIdPropertyId, UIA_SelectionItemIsSelectedPropertyId,
+    UIA_ToggleToggleStatePropertyId, UIA_ValueValuePropertyId, UIA_WindowControlTypeId,
 };
 use windows::core::{Interface, Owned, PWSTR};
 
@@ -79,7 +80,7 @@ use crate::uia_model::{
     self, HresultClass, Visit, WindowCandidate, bfs_limited, control_type,
     control_type_programmatic_name, is_address_bar_candidate, pick_browser_window,
     probes_expand_state, probes_selection_state, probes_toggle_state, process_name_from_image_path,
-    rect_to_xywh, runtime_id_to_string, select_web_root, worker_life,
+    rect_to_xywh, runtime_id_to_string, select_web_root_preferring_control, worker_life,
 };
 
 /// UIA connection timeout: how long UIA waits for a provider to accept a call.
@@ -92,10 +93,12 @@ const UIA_TRANSACTION_TIMEOUT_MS: u32 = 5_000;
 const MAX_ABANDONED_WORKERS: usize = 4;
 /// Attempts at creating the automation object, conditions and cache requests on a new worker.
 const SESSION_INIT_ATTEMPTS: u32 = 3;
-/// How often an empty tree from a window that exists is re-read (Chrome builds its
-/// accessibility tree lazily, on the first UIA query) and the pause between reads.
-const EMPTY_TREE_RETRIES: u32 = 4;
-const EMPTY_TREE_RETRY_PAUSE: Duration = Duration::from_millis(150);
+/// Start-up re-reads: how often the first snapshot for a pid is re-read while the browser is
+/// not ready (no window yet, unreadable tree, or no web document yet), and the pause between
+/// reads. Chrome builds its accessibility tree lazily, on the first UIA query. Spent at most
+/// once per pid per worker.
+const STARTUP_RETRIES: u32 = 10;
+const STARTUP_RETRY_PAUSE: Duration = Duration::from_millis(150);
 /// Time kept back from the caller's deadline when walking level by level.
 const WALK_DEADLINE_MARGIN: Duration = Duration::from_millis(500);
 
@@ -779,6 +782,16 @@ fn process_name(pid: i32) -> Option<String> {
     )))
 }
 
+/// What [`UiaSession::locate_chrome_parts`] found in the browser window.
+#[derive(Default)]
+struct Located {
+    current_url: Option<String>,
+    web_root: Option<IUIAutomationElement>,
+    viewport: Option<RawBounds>,
+    /// Counts and the chosen root, for the debug log.
+    summary: String,
+}
+
 /// Everything the worker thread keeps between requests. Never leaves the worker thread.
 struct UiaSession {
     automation: IUIAutomation,
@@ -793,6 +806,8 @@ struct UiaSession {
     tree_request: IUIAutomationCacheRequest,
     /// Element + children cache (full elements) for the level-by-level fallback walk.
     level_request: IUIAutomationCacheRequest,
+    /// Target pids whose start-up re-read budget has been spent (see [`STARTUP_RETRIES`]).
+    started_pids: std::cell::RefCell<std::collections::HashSet<Option<i32>>>,
 }
 
 /// Properties cached for every node of the walk.
@@ -818,19 +833,20 @@ const TREE_PROPERTIES: [UIA_PROPERTY_ID; 15] = [
 struct Attempt {
     raw: RawUiaSnapshot,
     window_found: bool,
-    /// Why the tree is empty, when it is (logged once at `info`).
+    /// Why the tree is empty, when it is (logged with the start-up summary).
     empty_reason: Option<String>,
     /// Microseconds spent finding the window, locating address bar + web root, and reading
     /// the tree (logged at `debug`, to show where a snapshot's time goes).
     phase_us: [u64; 3],
+    /// Which element the walk started from (logged at `debug`).
+    root: String,
+    /// `true` when the walk started at a web document (not the browser-window fallback).
+    document_root: bool,
 }
 
 fn micros_since(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
-
-/// Set after the first empty snapshot has been explained at `info`.
-static EMPTY_EXPLAINED: AtomicBool = AtomicBool::new(false);
 
 /// Tracks the address bar URL and viewport seen during a walk, mirroring the PowerShell
 /// walker's in-walk fallbacks.
@@ -946,19 +962,25 @@ impl UiaSession {
         let request = |properties: &[UIA_PROPERTY_ID], scope: TreeScope, cache_only: bool| {
             Self::cache_request(&automation, &control_view, properties, scope, cache_only)
         };
+        // The Edit/Document search runs over the raw view, caching `IsControlElement`, so a
+        // web document that is not (yet) in the control view is still found; control-view
+        // documents are preferred (see `select_web_root_preferring_control`).
         let window_request = request(
             &[UIA_ProcessIdPropertyId, UIA_ControlTypePropertyId],
             TreeScope_Element,
             false,
         )
         .map_err(|err| fail("creating window cache request", &err))?;
-        let locate_request = request(
+        let locate_request = Self::cache_request(
+            &automation,
+            &true_condition,
             &[
                 UIA_ControlTypePropertyId,
                 UIA_NamePropertyId,
                 UIA_BoundingRectanglePropertyId,
                 UIA_IsValuePatternAvailablePropertyId,
                 UIA_ValueValuePropertyId,
+                UIA_IsControlElementPropertyId,
             ],
             TreeScope_Element,
             false,
@@ -982,6 +1004,7 @@ impl UiaSession {
             locate_request,
             tree_request,
             level_request,
+            started_pids: std::cell::RefCell::default(),
         })
     }
 
@@ -1010,11 +1033,12 @@ impl UiaSession {
         }
     }
 
-    /// Builds a cache request over the control view (set explicitly, matching the PowerShell
-    /// walker's `ControlViewWalker` and .NET's default cache request).
+    /// Builds a cache request with an explicit tree filter: the control view for the walk
+    /// (matching the PowerShell walker's `ControlViewWalker`), the raw view for the
+    /// Edit/Document search.
     fn cache_request(
         automation: &IUIAutomation,
-        control_view: &IUIAutomationCondition,
+        filter: &IUIAutomationCondition,
         properties: &[UIA_PROPERTY_ID],
         scope: TreeScope,
         cache_only: bool,
@@ -1027,7 +1051,7 @@ impl UiaSession {
                 request.AddProperty(property)?;
             }
             request.SetTreeScope(scope)?;
-            request.SetTreeFilter(control_view)?;
+            request.SetTreeFilter(filter)?;
             if cache_only {
                 request.SetAutomationElementMode(AutomationElementMode_None)?;
             }
@@ -1064,19 +1088,22 @@ impl UiaSession {
         }
     }
 
-    /// Takes a snapshot with the stale-element retry, then re-reads an empty result up to
-    /// [`EMPTY_TREE_RETRIES`] times, [`EMPTY_TREE_RETRY_PAUSE`] apart, within the deadline.
+    /// Takes a snapshot with the stale-element retry, plus start-up re-reads.
     ///
-    /// Chrome builds its accessibility tree lazily on the first UIA query, and the PowerShell
-    /// walker's ~300 ms start-up used to hide that: the first CI run of this backend returned
-    /// an empty tree right after launch where PowerShell returned 4 nodes. The cost is up to
-    /// ~600 ms for a snapshot whose window really is gone or empty.
+    /// The first snapshot for a pid is re-read up to [`STARTUP_RETRIES`] times,
+    /// [`STARTUP_RETRY_PAUSE`] apart and within the deadline, while the browser is not ready:
+    /// no top-level window for the pid yet, an unreadable walk root, or no web document yet
+    /// (the walk would fall back to the browser window). Chrome builds its accessibility tree
+    /// lazily on the first UIA query, which the PowerShell walker's slow start used to hide.
+    /// The budget is spent once per pid; later snapshots never wait, so a page or window that
+    /// really is empty costs nothing extra.
     fn snapshot_with_retries(
         &self,
         pid: Option<i32>,
         limit: usize,
         deadline: Instant,
     ) -> Result<RawUiaSnapshot> {
+        let starting = !self.started_pids.borrow().contains(&pid);
         let mut retries = 0;
         loop {
             let attempt = Self::retry_stale(|| self.snapshot(pid, limit, deadline))
@@ -1086,34 +1113,34 @@ impl UiaSession {
                 locate_us = attempt.phase_us[1],
                 tree_us = attempt.phase_us[2],
                 nodes = attempt.raw.nodes.len(),
+                root = %attempt.root,
                 "Windows UIAutomation snapshot phases"
             );
+            let not_ready =
+                !attempt.window_found || attempt.raw.nodes.is_empty() || !attempt.document_root;
             let budget_left = deadline.saturating_duration_since(Instant::now());
-            // An existing window with an unreadable tree, or a configured pid whose window is
-            // not (yet) a top-level UIA element, is worth a few quick re-reads.
-            let worth_retrying =
-                attempt.raw.nodes.is_empty() && (attempt.window_found || pid.is_some());
-            if !worth_retrying
-                || retries >= EMPTY_TREE_RETRIES
-                || budget_left <= EMPTY_TREE_RETRY_PAUSE + WALK_DEADLINE_MARGIN
+            if !starting
+                || !not_ready
+                || retries >= STARTUP_RETRIES
+                || budget_left <= STARTUP_RETRY_PAUSE + WALK_DEADLINE_MARGIN
             {
-                if let Some(reason) = attempt.empty_reason.as_deref() {
-                    if EMPTY_EXPLAINED.swap(true, Ordering::Relaxed) {
-                        tracing::debug!(retries, reason, "empty Windows UIAutomation tree");
-                    } else {
-                        tracing::info!(retries, reason, "empty Windows UIAutomation tree");
-                    }
-                } else if retries > 0 {
+                if starting {
+                    let _ = self.started_pids.borrow_mut().insert(pid);
                     tracing::info!(
                         retries,
+                        ready = !not_ready,
                         nodes = attempt.raw.nodes.len(),
-                        "UIAutomation tree became readable after re-reading"
+                        root = %attempt.root,
+                        empty_reason = attempt.empty_reason.as_deref().unwrap_or(""),
+                        "first Windows UIAutomation snapshot for this target"
                     );
+                } else if let Some(reason) = attempt.empty_reason.as_deref() {
+                    tracing::debug!(reason, "empty Windows UIAutomation tree");
                 }
                 return Ok(attempt.raw);
             }
             retries += 1;
-            std::thread::sleep(EMPTY_TREE_RETRY_PAUSE);
+            std::thread::sleep(STARTUP_RETRY_PAUSE);
         }
     }
 
@@ -1135,10 +1162,10 @@ impl UiaSession {
         let Some(window) = self.find_window(pid)? else {
             return Ok(RawUiaSnapshot::default());
         };
-        let (current_url, _, viewport_bounds) = self.locate_chrome_parts(&window);
+        let located = self.locate_chrome_parts(&window);
         Ok(RawUiaSnapshot {
-            current_url,
-            viewport_bounds,
+            current_url: located.current_url,
+            viewport_bounds: located.viewport,
             ..RawUiaSnapshot::default()
         })
     }
@@ -1158,20 +1185,30 @@ impl UiaSession {
                 window_found: false,
                 empty_reason: Some(format!("no top-level UIA element for pid {pid:?}")),
                 phase_us: [window_us, 0, 0],
+                root: "none (no window)".to_owned(),
+                document_root: false,
             });
         };
 
         let started = Instant::now();
-        let (current_url, web_root, viewport) = self.locate_chrome_parts(&window);
+        let located = self.locate_chrome_parts(&window);
         let locate_us = micros_since(started);
-        let base_is_document = web_root.is_some();
+        let base_is_document = located.web_root.is_some();
+        let root = if base_is_document {
+            located.summary
+        } else {
+            format!(
+                "{}; root=browser window (fallback: no web document)",
+                located.summary
+            )
+        };
         let started = Instant::now();
         let mut parts = PageParts {
-            current_url,
-            viewport,
+            current_url: located.current_url,
+            viewport: located.viewport,
             last_skip: None,
         };
-        let base = web_root.unwrap_or(window);
+        let base = located.web_root.unwrap_or(window);
 
         // SAFETY: COM method on a live interface pointer with a live cache request; returns an
         // owned, cache-populated element.
@@ -1214,6 +1251,8 @@ impl UiaSession {
             window_found: true,
             empty_reason,
             phase_us: [window_us, locate_us, tree_us],
+            root,
+            document_root: base_is_document,
         })
     }
 
@@ -1351,14 +1390,7 @@ impl UiaSession {
     /// Finds the omnibox URL and the web content root among the window's descendants, like
     /// the PowerShell walker's two `FindAll` passes (in one call here). Failures are logged
     /// and ignored, as the walker's `try {} catch {}` did.
-    fn locate_chrome_parts(
-        &self,
-        window: &IUIAutomationElement,
-    ) -> (
-        Option<String>,
-        Option<IUIAutomationElement>,
-        Option<RawBounds>,
-    ) {
+    fn locate_chrome_parts(&self, window: &IUIAutomationElement) -> Located {
         // SAFETY: COM method on a live interface pointer with live condition and cache request;
         // returns an owned array.
         let found = elements_of(unsafe {
@@ -1371,43 +1403,77 @@ impl UiaSession {
         let elements = match found {
             Ok(elements) => elements,
             Err(err) => {
-                tracing::debug!(error = %describe(&err), "UIAutomation Edit/Document search failed");
-                return (None, None, None);
+                let error = describe(&err);
+                tracing::debug!(%error, "UIAutomation Edit/Document search failed");
+                return Located {
+                    summary: format!("Edit/Document search failed: {error}"),
+                    ..Located::default()
+                };
             }
         };
 
-        let mut current_url = None;
+        // Address bar: the first matching control-view Edit, else the first raw-only one.
+        let mut control_url = None;
+        let mut raw_url = None;
         let mut documents = Vec::new();
-        let mut document_rects = Vec::new();
+        let mut document_info = Vec::new();
+        let mut edits = 0usize;
         for element in elements {
             let Ok((ct, name, rect)) = cached_basics(&element) else {
                 continue;
             };
+            let is_control = cached_flag(&element, UIA_IsControlElementPropertyId);
             if ct == control_type::EDIT {
-                if current_url.is_none()
+                edits += 1;
+                let slot = if is_control {
+                    &mut control_url
+                } else {
+                    &mut raw_url
+                };
+                if slot.is_none()
                     && let Some(value) = cached_value(&element)
                     && is_address_bar_candidate(Some(&name), &value)
                 {
-                    current_url = Some(value);
+                    *slot = Some(value);
                 }
             } else if ct == control_type::DOCUMENT {
-                documents.push(element);
-                document_rects.push(rect);
+                documents.push((element, name, is_control));
+                document_info.push((rect, is_control));
             }
         }
 
-        match select_web_root(&document_rects) {
-            Some((idx, bounds)) => (
-                current_url,
-                documents.into_iter().nth(idx),
-                bounds.map(|b| RawBounds {
-                    x: b.x,
-                    y: b.y,
-                    width: b.width,
-                    height: b.height,
-                }),
-            ),
-            None => (current_url, None, None),
+        let control_docs = document_info.iter().filter(|(_, c)| *c).count();
+        let mut summary = format!(
+            "edits={edits} documents={} (control view: {control_docs})",
+            documents.len()
+        );
+        let picked = select_web_root_preferring_control(&document_info);
+        let (web_root, viewport) = match picked {
+            Some((idx, bounds)) => {
+                let chosen = documents.into_iter().nth(idx);
+                if let Some((_, name, is_control)) = &chosen {
+                    let _ = write!(
+                        summary,
+                        "; root=Document name={name:?} control_view={is_control}"
+                    );
+                }
+                (
+                    chosen.map(|(element, _, _)| element),
+                    bounds.map(|b| RawBounds {
+                        x: b.x,
+                        y: b.y,
+                        width: b.width,
+                        height: b.height,
+                    }),
+                )
+            }
+            None => (None, None),
+        };
+        Located {
+            current_url: control_url.or(raw_url),
+            web_root,
+            viewport,
+            summary,
         }
     }
 }
