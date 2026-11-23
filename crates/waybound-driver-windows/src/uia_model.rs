@@ -261,6 +261,9 @@ pub fn pick_browser_window(candidates: &[WindowCandidate]) -> Option<usize> {
 pub enum Visit<T, N> {
     /// Keep the node and offer its children.
     Node(T, Vec<N>),
+    /// Keep the node without fetching its children because none could be queued (`room`
+    /// was 0). The walk cannot tell whether children existed, so it is marked truncated.
+    NodeOnly(T),
     /// Drop the node and its subtree (the PowerShell walker's per-node `catch {}`).
     Skip,
     /// Stop the walk now (deadline); the result is marked truncated.
@@ -270,11 +273,13 @@ pub enum Visit<T, N> {
 /// Capped breadth-first walk with exactly the PowerShell walker's truncation rule.
 ///
 /// Children are enqueued until `items + queued` reaches `limit`; a child that no longer fits
-/// marks the walk truncated, as does [`Visit::Stop`].
+/// marks the walk truncated, as do [`Visit::Stop`] and [`Visit::NodeOnly`]. `visit` also gets
+/// `room`: how many children could still be queued if the node is kept, so a visitor whose
+/// child lookup is expensive can skip it when `room` is 0.
 pub fn bfs_limited<N, T>(
     root: N,
     limit: usize,
-    mut visit: impl FnMut(N) -> Visit<T, N>,
+    mut visit: impl FnMut(N, usize) -> Visit<T, N>,
 ) -> (Vec<T>, bool) {
     let mut queue = VecDeque::from([root]);
     let mut items = Vec::new();
@@ -283,8 +288,14 @@ pub fn bfs_limited<N, T>(
         let Some(node) = queue.pop_front() else {
             break;
         };
-        let (item, children) = match visit(node) {
+        let free_slots = limit.saturating_sub(items.len() + 1 + queue.len());
+        let (item, children) = match visit(node, free_slots) {
             Visit::Node(item, children) => (item, children),
+            Visit::NodeOnly(item) => {
+                items.push(item);
+                truncated = true;
+                continue;
+            }
             Visit::Skip => continue,
             Visit::Stop => {
                 truncated = true;
@@ -362,6 +373,19 @@ pub const fn classify_tree_hresult(code: u32) -> HresultClass {
         HresultClass::Stale
     } else {
         classify_hresult(code)
+    }
+}
+
+/// Classification for the Edit/Document search that decides the walk root.
+///
+/// A failure there must never read as "no document" (which would walk the browser window), so it is
+/// [`HresultClass::Timeout`] for `UIA_E_TIMEOUT` and [`HresultClass::Stale`] otherwise.
+#[must_use]
+pub const fn classify_search_hresult(code: u32) -> HresultClass {
+    if code == UIA_E_TIMEOUT {
+        HresultClass::Timeout
+    } else {
+        HresultClass::Stale
     }
 }
 
@@ -654,7 +678,10 @@ mod tests {
         skip: Option<usize>,
         stop: Option<usize>,
     ) -> (Vec<usize>, bool) {
-        bfs_limited(0usize, limit, |n| {
+        bfs_limited(0usize, limit, |n, room| {
+            if room == 0 && n == 99 {
+                return Visit::NodeOnly(n);
+            }
             if Some(n) == skip {
                 return Visit::Skip;
             }
@@ -681,6 +708,25 @@ mod tests {
         assert_eq!(walk(&tree, 100, Some(1), None), (vec![0, 2, 5], false));
         // A deadline stop keeps what was read and marks the walk truncated.
         assert_eq!(walk(&tree, 100, None, Some(3)), (vec![0, 1, 2], true));
+        // `room` counts the children that could still be queued.
+        let mut rooms = Vec::new();
+        let _ = bfs_limited(0usize, 3, |n, room| {
+            rooms.push((n, room));
+            Visit::Node(n, tree.get(n).cloned().unwrap_or_default())
+        });
+        assert_eq!(rooms, vec![(0, 2), (1, 0), (2, 0)]);
+        // A node kept without its children marks the walk truncated.
+        let leafy = [vec![99], vec![], vec![]];
+        assert_eq!(
+            bfs_limited(0usize, 2, |n, room| {
+                if room == 0 {
+                    return Visit::NodeOnly(n);
+                }
+                let children = if n == 0 { leafy[0].clone() } else { Vec::new() };
+                Visit::Node(n, children)
+            }),
+            (vec![0, 99], true)
+        );
     }
 
     #[test]
@@ -723,6 +769,12 @@ mod tests {
         assert_eq!(classify_hresult(E_FAIL), HresultClass::Other);
         assert_eq!(classify_tree_hresult(E_FAIL), HresultClass::Stale);
         assert_eq!(classify_tree_hresult(UIA_E_TIMEOUT), HresultClass::Timeout);
+        assert_eq!(
+            classify_search_hresult(UIA_E_TIMEOUT),
+            HresultClass::Timeout
+        );
+        assert_eq!(classify_search_hresult(0x8000_4005), HresultClass::Stale);
+        assert_eq!(classify_search_hresult(0x8007_000E), HresultClass::Stale);
         assert!(matches!(
             uia_error(classify_hresult(E_FAIL), E_FAIL, "x", "", 1),
             WayboundError::BackendUnavailable { .. }

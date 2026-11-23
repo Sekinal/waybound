@@ -11,7 +11,8 @@
 //!
 //! Three layers bound a hung provider:
 //! 1. `IUIAutomation2::SetConnectionTimeout` / `SetTransactionTimeout` make each cross-process
-//!    call fail with `UIA_E_TIMEOUT` instead of blocking.
+//!    call fail with `UIA_E_TIMEOUT` instead of blocking. The transaction timeout is re-armed
+//!    before each call to `min(5 s, time left - 300 ms)`.
 //! 2. Every job carries the caller's deadline. The worker skips jobs whose caller has already
 //!    given up, and the level-by-level fallback walk stops at the deadline.
 //! 3. The caller's channel wait. When it expires the caller returns
@@ -38,7 +39,22 @@
 //! the transaction timeout, or `E_FAIL` mid-navigation), the snapshot falls back to a
 //! level-by-level walk (`TreeScope_Element | TreeScope_Children`, one call per visited node,
 //! at most `max_nodes` calls) that stops at the caller's deadline and reports `truncated`,
-//! like the PowerShell walker did.
+//! like the PowerShell walker did. It is not started with less than a second left, and it
+//! does not fetch children of nodes whose children could no longer be queued.
+//! `WAYBOUND_WINDOWS_UIA_FORCE_LEVEL_WALK=1` (test-only) forces it, so CI exercises it.
+//!
+//! # Walk root and page transitions
+//!
+//! The walk root is chosen like the PowerShell walker's: the control-view `Document` with the
+//! largest area, else the browser window. Walking the window is only right for a window that
+//! has no web document at all, though: right after launch, and after a new tab, a cross-site
+//! navigation or a reload, Chrome's new `Document` exists in the raw view before it joins
+//! the control view, and the window walk would return the browser's own UI (tabs, omnibox,
+//! caption buttons). So when the control view has no `Document`, one raw-view search decides:
+//! with any raw-view `Document` the snapshot is `transient` ("web document not in the control
+//! view yet"); with none, the window is walked as before. A failed Edit/Document search is
+//! `transient` (or `timeout`), never "no document". Callers re-send `transient` queries for up
+//! to 2 s from their own thread (see [`run_job`]), so the worker is never parked.
 
 use std::fmt::Write as _;
 use std::marker::PhantomData;
@@ -94,12 +110,16 @@ const UIA_TRANSACTION_TIMEOUT_MS: u32 = 5_000;
 const MAX_ABANDONED_WORKERS: usize = 4;
 /// Attempts at creating the automation object, conditions and cache requests on a new worker.
 const SESSION_INIT_ATTEMPTS: u32 = 3;
-/// Start-up re-reads: how often the first snapshot for a pid is re-read while the browser is
-/// not ready (no window yet, unreadable tree, or no web document yet), and the pause between
-/// reads. Chrome builds its accessibility tree lazily, on the first UIA query. Spent at most
-/// once per pid per worker.
-const STARTUP_RETRIES: u32 = 20;
-const STARTUP_RETRY_PAUSE: Duration = Duration::from_millis(250);
+/// How long a caller re-sends a query that came back `transient` (page between documents,
+/// stale element), and the pause between attempts. The worker stays free in between.
+const TRANSIENT_RETRY_BUDGET: Duration = Duration::from_secs(2);
+const TRANSIENT_RETRY_PAUSE: Duration = Duration::from_millis(150);
+/// Kept back from the deadline when arming the per-call transaction timeout.
+const TRANSACTION_MARGIN: Duration = Duration::from_millis(300);
+/// The level-by-level walk is not started with less time than this left.
+const MIN_LEVEL_WALK: Duration = Duration::from_secs(1);
+/// Test-only switch that forces the level-by-level walk (see `UiaSession::force_level_walk`).
+pub const FORCE_LEVEL_WALK_ENV: &str = "WAYBOUND_WINDOWS_UIA_FORCE_LEVEL_WALK";
 /// Time kept back from the caller's deadline when walking level by level.
 const WALK_DEADLINE_MARGIN: Duration = Duration::from_millis(500);
 
@@ -187,8 +207,41 @@ pub fn query_page_info(pid: Option<i32>) -> NativeOutcome {
     run_job(JobKind::PageInfo { pid })
 }
 
+/// Runs `kind` on the worker, re-sending it while it comes back `transient` (page between
+/// documents, stale element) for up to [`TRANSIENT_RETRY_BUDGET`], never past the deadline.
+/// The pauses happen here, so the worker serves other callers meanwhile.
 fn run_job(kind: JobKind) -> NativeOutcome {
-    let deadline = Instant::now() + Duration::from_millis(UIA_QUERY_TIMEOUT_MS);
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(UIA_QUERY_TIMEOUT_MS);
+    let retry_until = (started + TRANSIENT_RETRY_BUDGET).min(
+        deadline
+            .checked_sub(WALK_DEADLINE_MARGIN)
+            .unwrap_or(deadline),
+    );
+    let mut attempts = 1u32;
+    loop {
+        let outcome = run_once(kind, deadline);
+        let transient = matches!(
+            &outcome,
+            NativeOutcome::Done(Err(WayboundError::Transient { .. }))
+        );
+        if !transient || Instant::now() + TRANSIENT_RETRY_PAUSE >= retry_until {
+            if attempts > 1 {
+                tracing::debug!(
+                    ?kind,
+                    attempts,
+                    transient,
+                    "Windows UIAutomation query re-sent"
+                );
+            }
+            return outcome;
+        }
+        attempts += 1;
+        std::thread::sleep(TRANSIENT_RETRY_PAUSE);
+    }
+}
+
+fn run_once(kind: JobKind, deadline: Instant) -> NativeOutcome {
     let worker = match acquire_worker(deadline) {
         Ok(worker) => worker,
         Err(WorkerStart::Unavailable(reason)) => return NativeOutcome::Unavailable(reason),
@@ -319,12 +372,20 @@ fn start_worker(deadline: Instant) -> std::result::Result<WorkerHandle, WorkerSt
             *INIT_FAILURE.lock().unwrap_or_else(PoisonError::into_inner) = Some(reason.clone());
             Err(WorkerStart::Unavailable(reason))
         }
-        Err(_) => {
+        Err(RecvTimeoutError::Timeout) => {
             // Stuck in CoCreateInstance; it exits once it notices `tx` is gone.
             let _ = worker_life::abandon(&life, &ABANDONED_WORKERS);
             Err(WorkerStart::Failed(timeout_error(
                 "Windows UIAutomation (native COM) initialization",
             )))
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            Err(WorkerStart::Failed(WayboundError::BackendUnavailable {
+                backend: "windows".to_owned(),
+                reason: "Windows UIAutomation (native COM) worker thread exited during \
+                         initialization"
+                    .to_owned(),
+            }))
         }
     }
 }
@@ -451,8 +512,17 @@ const fn hresult(err: &windows::core::Error) -> u32 {
 struct CallError {
     err: windows::core::Error,
     operation: &'static str,
-    /// The call read the web content tree, where `E_FAIL` means a document mid-navigation.
-    tree: bool,
+    kind: CallKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallKind {
+    /// Classified by `classify_hresult`.
+    Plain,
+    /// Read the web content tree, where `E_FAIL` means a document mid-navigation.
+    Tree,
+    /// The Edit/Document search: any failure is transient (or a timeout).
+    Search,
 }
 
 impl CallError {
@@ -460,7 +530,7 @@ impl CallError {
         Self {
             err,
             operation,
-            tree: false,
+            kind: CallKind::Plain,
         }
     }
 
@@ -468,15 +538,24 @@ impl CallError {
         Self {
             err,
             operation,
-            tree: true,
+            kind: CallKind::Tree,
+        }
+    }
+
+    const fn search(err: windows::core::Error, operation: &'static str) -> Self {
+        Self {
+            err,
+            operation,
+            kind: CallKind::Search,
         }
     }
 
     const fn class(&self) -> HresultClass {
-        if self.tree {
-            uia_model::classify_tree_hresult(hresult(&self.err))
-        } else {
-            uia_model::classify_hresult(hresult(&self.err))
+        let code = hresult(&self.err);
+        match self.kind {
+            CallKind::Plain => uia_model::classify_hresult(code),
+            CallKind::Tree => uia_model::classify_tree_hresult(code),
+            CallKind::Search => uia_model::classify_search_hresult(code),
         }
     }
 
@@ -798,21 +877,26 @@ struct UiaSession {
     automation: IUIAutomation,
     flavor: &'static str,
     edit_or_document: IUIAutomationCondition,
-    /// `ControlType == Document`, for the start-up diagnostic.
+    /// `ControlType == Document`, for the raw-view transition check.
     document_condition: IUIAutomationCondition,
     true_condition: IUIAutomationCondition,
     /// Element-scoped cache for top-level windows: process id and control type.
     window_request: IUIAutomationCacheRequest,
     /// Element-scoped cache for `Edit`/`Document` descendants: type, name, bounds, value.
     locate_request: IUIAutomationCacheRequest,
-    /// Raw-view cache for the start-up diagnostic of every `Document` in the window.
+    /// Raw-view cache for the transition check (and its debug log) of `Document` elements.
     diagnostic_request: IUIAutomationCacheRequest,
     /// Subtree cache over the control view (cache-only elements) for the node walk.
     tree_request: IUIAutomationCacheRequest,
     /// Element + children cache (full elements) for the level-by-level fallback walk.
     level_request: IUIAutomationCacheRequest,
-    /// Target pids whose start-up re-read budget has been spent (see [`STARTUP_RETRIES`]).
-    started_pids: std::cell::RefCell<std::collections::HashSet<Option<i32>>>,
+    /// For per-call transaction timeouts (`None` before Windows 8).
+    automation2: Option<IUIAutomation2>,
+    /// The transaction timeout last set on `automation2`, in milliseconds.
+    armed_ms: std::cell::Cell<u32>,
+    /// Test-only hook (`WAYBOUND_WINDOWS_UIA_FORCE_LEVEL_WALK=1`): skip the subtree call and
+    /// always walk level by level, so CI exercises the fallback.
+    force_level_walk: bool,
 }
 
 /// Properties cached for every node of the walk.
@@ -834,19 +918,40 @@ const TREE_PROPERTIES: [UIA_PROPERTY_ID; 15] = [
     UIA_ExpandCollapseExpandCollapseStatePropertyId,
 ];
 
-/// Result of one snapshot attempt: the raw snapshot, and whether a target window was found.
+/// Result of one snapshot.
 struct Attempt {
     raw: RawUiaSnapshot,
-    window_found: bool,
-    /// Why the tree is empty, when it is (logged with the start-up summary).
-    empty_reason: Option<String>,
     /// Microseconds spent finding the window, locating address bar + web root, and reading
     /// the tree (logged at `debug`, to show where a snapshot's time goes).
     phase_us: [u64; 3],
     /// Which element the walk started from (logged at `debug`).
     root: String,
-    /// `true` when the walk started at a web document (not the browser-window fallback).
-    document_root: bool,
+}
+
+/// Why a snapshot attempt did not produce a tree.
+enum SnapError {
+    /// A COM call failed.
+    Call(CallError),
+    /// The page is not readable yet (between documents, or an unreadable root): `transient`.
+    NotReady(String),
+}
+
+impl From<CallError> for SnapError {
+    fn from(err: CallError) -> Self {
+        Self::Call(err)
+    }
+}
+
+impl SnapError {
+    fn into_waybound(self) -> WayboundError {
+        match self {
+            Self::Call(err) => err.into_waybound(),
+            Self::NotReady(reason) => WayboundError::Transient {
+                backend: "windows".to_owned(),
+                reason: format!("Windows UIAutomation (native COM): {reason}"),
+            },
+        }
+    }
 }
 
 fn micros_since(start: Instant) -> u64 {
@@ -919,7 +1024,7 @@ impl UiaSession {
         let (automation, flavor) = Self::create_automation()?;
         let fail = |what: &str, err: &windows::core::Error| format!("{what}: {}", describe(err));
 
-        match automation.cast::<IUIAutomation2>() {
+        let automation2 = match automation.cast::<IUIAutomation2>() {
             Ok(automation2) => {
                 // SAFETY: COM methods on a live interface pointer owned by this thread, taking
                 // plain integers.
@@ -933,12 +1038,16 @@ impl UiaSession {
                 if let Err(err) = set {
                     tracing::warn!(error = %describe(&err), "could not set UIAutomation timeouts");
                 }
+                Some(automation2)
             }
-            Err(err) => tracing::warn!(
-                error = %describe(&err),
-                "IUIAutomation2 unavailable; UIAutomation calls use the system default timeouts"
-            ),
-        }
+            Err(err) => {
+                tracing::warn!(
+                    error = %describe(&err),
+                    "IUIAutomation2 unavailable; UIAutomation calls use the system default timeouts"
+                );
+                None
+            }
+        };
 
         let edit = OwnedVariant::from_i32(UIA_EditControlTypeId.0);
         let document = OwnedVariant::from_i32(UIA_DocumentControlTypeId.0);
@@ -1022,7 +1131,9 @@ impl UiaSession {
             diagnostic_request,
             tree_request,
             level_request,
-            started_pids: std::cell::RefCell::default(),
+            automation2,
+            armed_ms: std::cell::Cell::new(UIA_TRANSACTION_TIMEOUT_MS),
+            force_level_walk: std::env::var(FORCE_LEVEL_WALK_ENV).is_ok_and(|v| v.trim() == "1"),
         })
     }
 
@@ -1053,7 +1164,7 @@ impl UiaSession {
 
     /// Builds a cache request with an explicit tree filter: the control view for the walk
     /// (matching the PowerShell walker's `ControlViewWalker`), the raw view for the
-    /// start-up `Document` diagnostic.
+    /// raw-view `Document` transition check.
     fn cache_request(
         automation: &IUIAutomation,
         filter: &IUIAutomationCondition,
@@ -1079,22 +1190,38 @@ impl UiaSession {
 
     fn run(&self, kind: JobKind, deadline: Instant) -> Result<RawUiaSnapshot> {
         match kind {
-            JobKind::Snapshot { pid, limit } => self.snapshot_with_retries(pid, limit, deadline),
-            JobKind::PageInfo { pid } => {
-                Self::retry_stale(|| self.page_info(pid)).map_err(CallError::into_waybound)
+            JobKind::Snapshot { pid, limit } => {
+                match Self::retry_stale(|| self.snapshot(pid, limit, deadline)) {
+                    Ok(attempt) => {
+                        tracing::debug!(
+                            window_us = attempt.phase_us[0],
+                            locate_us = attempt.phase_us[1],
+                            tree_us = attempt.phase_us[2],
+                            nodes = attempt.raw.nodes.len(),
+                            root = %attempt.root,
+                            "Windows UIAutomation snapshot phases"
+                        );
+                        Ok(attempt.raw)
+                    }
+                    Err(err) => Err(err.into_waybound()),
+                }
             }
+            JobKind::PageInfo { pid } => Self::retry_stale(|| self.page_info(pid, deadline))
+                .map_err(SnapError::into_waybound),
             #[cfg(test)]
-            JobKind::DesktopProbe => self.desktop_probe().map_err(CallError::into_waybound),
+            JobKind::DesktopProbe => self
+                .desktop_probe(deadline)
+                .map_err(CallError::into_waybound),
         }
     }
 
     /// Runs `attempt`, and once more if it failed on a stale element (navigation or a tab
     /// switch replaced it mid-query).
     fn retry_stale<T>(
-        mut attempt: impl FnMut() -> std::result::Result<T, CallError>,
-    ) -> std::result::Result<T, CallError> {
+        mut attempt: impl FnMut() -> std::result::Result<T, SnapError>,
+    ) -> std::result::Result<T, SnapError> {
         match attempt() {
-            Err(err) if err.class() == HresultClass::Stale => {
+            Err(SnapError::Call(err)) if err.class() == HresultClass::Stale => {
                 tracing::debug!(
                     error = %describe(&err.err),
                     operation = err.operation,
@@ -1106,69 +1233,34 @@ impl UiaSession {
         }
     }
 
-    /// Takes a snapshot with the stale-element retry, plus start-up re-reads.
-    ///
-    /// The first snapshot for a pid is re-read up to [`STARTUP_RETRIES`] times,
-    /// [`STARTUP_RETRY_PAUSE`] apart and within the deadline, while the browser is not ready:
-    /// no top-level window for the pid yet, an unreadable walk root, or no web document yet
-    /// (the walk would fall back to the browser window). Chrome builds its accessibility tree
-    /// lazily on the first UIA query, which the PowerShell walker's slow start used to hide.
-    /// The budget is spent once per pid; later snapshots never wait, so a page or window that
-    /// really is empty costs nothing extra.
-    fn snapshot_with_retries(
-        &self,
-        pid: Option<i32>,
-        limit: usize,
-        deadline: Instant,
-    ) -> Result<RawUiaSnapshot> {
-        let starting = !self.started_pids.borrow().contains(&pid);
-        let mut diagnosed = !starting;
-        let mut retries = 0;
-        loop {
-            let diagnose = !diagnosed;
-            let attempt = Self::retry_stale(|| self.snapshot(pid, limit, deadline, diagnose))
-                .map_err(CallError::into_waybound)?;
-            diagnosed |= attempt.window_found;
-            tracing::debug!(
-                window_us = attempt.phase_us[0],
-                locate_us = attempt.phase_us[1],
-                tree_us = attempt.phase_us[2],
-                nodes = attempt.raw.nodes.len(),
-                root = %attempt.root,
-                "Windows UIAutomation snapshot phases"
-            );
-            let not_ready =
-                !attempt.window_found || attempt.raw.nodes.is_empty() || !attempt.document_root;
-            let budget_left = deadline.saturating_duration_since(Instant::now());
-            if !starting
-                || !not_ready
-                || retries >= STARTUP_RETRIES
-                || budget_left <= STARTUP_RETRY_PAUSE + WALK_DEADLINE_MARGIN
-            {
-                if starting {
-                    let _ = self.started_pids.borrow_mut().insert(pid);
-                    tracing::info!(
-                        retries,
-                        ready = !not_ready,
-                        nodes = attempt.raw.nodes.len(),
-                        root = %attempt.root,
-                        empty_reason = attempt.empty_reason.as_deref().unwrap_or(""),
-                        "first Windows UIAutomation snapshot for this target"
-                    );
-                } else if let Some(reason) = attempt.empty_reason.as_deref() {
-                    tracing::debug!(reason, "empty Windows UIAutomation tree");
-                }
-                return Ok(attempt.raw);
-            }
-            retries += 1;
-            std::thread::sleep(STARTUP_RETRY_PAUSE);
+    /// Sets the UIA transaction timeout for the next cross-process call so it ends before
+    /// the caller's deadline: `min(5 s, remaining - margin)`, at least 100 ms.
+    fn arm(&self, deadline: Instant) {
+        let Some(automation2) = &self.automation2 else {
+            return;
+        };
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(TRANSACTION_MARGIN);
+        let ms = u32::try_from(remaining.as_millis())
+            .unwrap_or(u32::MAX)
+            .clamp(100, UIA_TRANSACTION_TIMEOUT_MS);
+        if self.armed_ms.get() == ms {
+            return;
+        }
+        // SAFETY: COM method on a live interface pointer owned by this thread, taking a plain
+        // integer.
+        if unsafe { automation2.SetTransactionTimeout(ms) }.is_ok() {
+            self.armed_ms.set(ms);
         }
     }
 
     fn find_window(
         &self,
         pid: Option<i32>,
+        deadline: Instant,
     ) -> std::result::Result<Option<IUIAutomationElement>, CallError> {
+        self.arm(deadline);
         // SAFETY: COM method on a live interface pointer; returns an owned reference.
         let root = unsafe { self.automation.GetRootElement() }
             .map_err(|err| CallError::new(err, "GetRootElement"))?;
@@ -1179,11 +1271,24 @@ impl UiaSession {
         .map_err(|err| CallError::new(err, "window lookup"))
     }
 
-    fn page_info(&self, pid: Option<i32>) -> std::result::Result<RawUiaSnapshot, CallError> {
-        let Some(window) = self.find_window(pid)? else {
+    /// Address-bar URL and viewport only. Mid-transition (no control-view document yet) the
+    /// URL still comes from the omnibox, which is browser UI and valid throughout, and the
+    /// viewport is `None`, exactly what the PowerShell walker reported for a window without
+    /// a control-view document.
+    ///
+    /// The PowerShell walker also inferred the viewport during its walk and again in
+    /// `finalize_snapshot` (first control-view `Document` with a positive size). Both only see
+    /// control-view documents, which the `FindAll` above already covered, so they could only
+    /// add something when that search failed; a failed search is `transient` here instead.
+    fn page_info(
+        &self,
+        pid: Option<i32>,
+        deadline: Instant,
+    ) -> std::result::Result<RawUiaSnapshot, SnapError> {
+        let Some(window) = self.find_window(pid, deadline)? else {
             return Ok(RawUiaSnapshot::default());
         };
-        let located = self.locate_chrome_parts(&window);
+        let located = self.locate_chrome_parts(&window, deadline)?;
         Ok(RawUiaSnapshot {
             current_url: located.current_url,
             viewport_bounds: located.viewport,
@@ -1196,34 +1301,39 @@ impl UiaSession {
         pid: Option<i32>,
         limit: usize,
         deadline: Instant,
-        diagnose: bool,
-    ) -> std::result::Result<Attempt, CallError> {
+    ) -> std::result::Result<Attempt, SnapError> {
         let started = Instant::now();
-        let window = self.find_window(pid)?;
+        let window = self.find_window(pid, deadline)?;
         let window_us = micros_since(started);
         let Some(window) = window else {
+            // No top-level element for the pid: an empty tree, as the PowerShell walker
+            // returned. Wait loops poll on `ElementNotFound` anyway.
             return Ok(Attempt {
                 raw: RawUiaSnapshot::default(),
-                window_found: false,
-                empty_reason: Some(format!("no top-level UIA element for pid {pid:?}")),
                 phase_us: [window_us, 0, 0],
                 root: "none (no window)".to_owned(),
-                document_root: false,
             });
         };
 
-        if diagnose {
-            self.log_document_candidates(&window);
-        }
         let started = Instant::now();
-        let located = self.locate_chrome_parts(&window);
+        let located = self.locate_chrome_parts(&window, deadline)?;
         let locate_us = micros_since(started);
-        let base_is_document = located.web_root.is_some();
-        let root = if base_is_document {
+        let root = if located.web_root.is_some() {
             located.summary
         } else {
+            // No control-view document. If the raw view has one, the page is between
+            // documents (new renderer, navigation, reload): never return the browser UI then.
+            let raw_documents = self.raw_documents(&window, deadline)?;
+            if raw_documents > 0 {
+                return Err(SnapError::NotReady(format!(
+                    "web document not in the control view yet ({raw_documents} raw-view \
+                     documents, {})",
+                    located.summary
+                )));
+            }
+            // No document anywhere: not a browser page; walk the window like PowerShell.
             format!(
-                "{}; root=browser window (fallback: no web document)",
+                "{}; root=window (no document in the raw view either)",
                 located.summary
             )
         };
@@ -1235,16 +1345,22 @@ impl UiaSession {
         };
         let base = located.web_root.unwrap_or(window);
 
-        // SAFETY: COM method on a live interface pointer with a live cache request; returns an
-        // owned, cache-populated element.
-        let (nodes, truncated) = match unsafe { base.BuildUpdatedCache(&self.tree_request) } {
-            Ok(cached_root) => Self::walk_cached(cached_root, limit, &mut parts),
-            Err(err) => {
+        let subtree = if self.force_level_walk {
+            None
+        } else {
+            self.arm(deadline);
+            // SAFETY: COM method on a live interface pointer with a live cache request;
+            // returns an owned, cache-populated element.
+            Some(unsafe { base.BuildUpdatedCache(&self.tree_request) })
+        };
+        let (nodes, truncated) = match subtree {
+            Some(Ok(cached_root)) => Self::walk_cached(cached_root, limit, &mut parts),
+            Some(Err(err)) => {
                 let failed = CallError::tree(err, "tree snapshot (BuildUpdatedCache subtree)");
                 if failed.class() == HresultClass::Stale
                     && hresult(&failed.err) != uia_model::E_FAIL
                 {
-                    return Err(failed);
+                    return Err(failed.into());
                 }
                 tracing::info!(
                     error = %describe(&failed.err),
@@ -1252,20 +1368,21 @@ impl UiaSession {
                 );
                 self.walk_levels(&base, limit, deadline, &mut parts)?
             }
+            None => {
+                tracing::debug!(
+                    "WAYBOUND_WINDOWS_UIA_FORCE_LEVEL_WALK set; walking level by level"
+                );
+                self.walk_levels(&base, limit, deadline, &mut parts)?
+            }
         };
 
-        let tree_us = micros_since(started);
-        let empty_reason = nodes.is_empty().then(|| {
-            format!(
-                "walk root ({}) unreadable: {}",
-                if base_is_document {
-                    "web document"
-                } else {
-                    "browser window"
-                },
+        if nodes.is_empty() {
+            return Err(SnapError::NotReady(format!(
+                "walk root unreadable: {}",
                 parts.last_skip.as_deref().unwrap_or("no error recorded")
-            )
-        });
+            )));
+        }
+        let tree_us = micros_since(started);
         Ok(Attempt {
             raw: RawUiaSnapshot {
                 nodes,
@@ -1273,11 +1390,8 @@ impl UiaSession {
                 current_url: parts.current_url,
                 viewport_bounds: parts.viewport,
             },
-            window_found: true,
-            empty_reason,
             phase_us: [window_us, locate_us, tree_us],
             root,
-            document_root: base_is_document,
         })
     }
 
@@ -1287,7 +1401,7 @@ impl UiaSession {
         limit: usize,
         parts: &mut PageParts,
     ) -> (Vec<RawUiaNode>, bool) {
-        bfs_limited(cached_root, limit, |element| {
+        bfs_limited(cached_root, limit, |element, _room| {
             let (node, ct) = match read_node(&element) {
                 Ok(read) => read,
                 Err(err) => {
@@ -1304,23 +1418,30 @@ impl UiaSession {
         })
     }
 
-    /// Bounded fallback walk: one `BuildUpdatedCache(Element | Children)` per visited node,
-    /// stopping at `limit` nodes or shortly before `deadline` (then `truncated`).
+    /// Bounded fallback walk: one `BuildUpdatedCache(Element | Children)` per visited node
+    /// whose children can still be queued, stopping at `limit` nodes or shortly before
+    /// `deadline` (then `truncated`). Not started with less than [`MIN_LEVEL_WALK`] left.
     fn walk_levels(
         &self,
         base: &IUIAutomationElement,
         limit: usize,
         deadline: Instant,
         parts: &mut PageParts,
-    ) -> std::result::Result<(Vec<RawUiaNode>, bool), CallError> {
+    ) -> std::result::Result<(Vec<RawUiaNode>, bool), SnapError> {
+        if deadline.saturating_duration_since(Instant::now()) < MIN_LEVEL_WALK {
+            return Err(SnapError::NotReady(
+                "not enough time left for the level-by-level walk".to_owned(),
+            ));
+        }
+        self.arm(deadline);
         // SAFETY: COM method on a live interface pointer with a live cache request; returns an
-        // owned element whose own properties are cached.
+        // owned element whose own properties and children are cached.
         let root = unsafe { base.BuildUpdatedCache(&self.level_request) }
             .map_err(|err| CallError::tree(err, "tree snapshot (level walk root)"))?;
         let stop_at = deadline
             .checked_sub(WALK_DEADLINE_MARGIN)
             .unwrap_or(deadline);
-        Ok(bfs_limited(root, limit, |element| {
+        Ok(bfs_limited(root, limit, |element, room| {
             if Instant::now() >= stop_at {
                 return Visit::Stop;
             }
@@ -1334,6 +1455,10 @@ impl UiaSession {
                 }
             };
             parts.observe(&node, ct);
+            if room == 0 {
+                return Visit::NodeOnly(node);
+            }
+            self.arm(deadline);
             // SAFETY: COM methods on a live full-mode element with a live cache request; the
             // refreshed element and its cached children array are owned references.
             let children = unsafe {
@@ -1347,7 +1472,8 @@ impl UiaSession {
     }
 
     #[cfg(test)]
-    fn desktop_probe(&self) -> std::result::Result<RawUiaSnapshot, CallError> {
+    fn desktop_probe(&self, deadline: Instant) -> std::result::Result<RawUiaSnapshot, CallError> {
+        self.arm(deadline);
         // SAFETY: COM methods on live interface pointers owned by this thread.
         let root = unsafe {
             self.automation
@@ -1415,7 +1541,12 @@ impl UiaSession {
     /// Finds the omnibox URL and the web content root among the window's descendants, like
     /// the PowerShell walker's two `FindAll` passes (in one call here). Failures are logged
     /// and ignored, as the walker's `try {} catch {}` did.
-    fn locate_chrome_parts(&self, window: &IUIAutomationElement) -> Located {
+    fn locate_chrome_parts(
+        &self,
+        window: &IUIAutomationElement,
+        deadline: Instant,
+    ) -> std::result::Result<Located, CallError> {
+        self.arm(deadline);
         // SAFETY: COM method on a live interface pointer with live condition and cache request;
         // returns an owned array.
         let found = elements_of(unsafe {
@@ -1425,17 +1556,8 @@ impl UiaSession {
                 &self.locate_request,
             )
         });
-        let elements = match found {
-            Ok(elements) => elements,
-            Err(err) => {
-                let error = describe(&err);
-                tracing::debug!(%error, "UIAutomation Edit/Document search failed");
-                return Located {
-                    summary: format!("Edit/Document search failed: {error}"),
-                    ..Located::default()
-                };
-            }
-        };
+        // A failed search is never "no document": it is transient (or a timeout).
+        let elements = found.map_err(|err| CallError::search(err, "Edit/Document search"))?;
 
         // Same order and tie-break as the PowerShell walker: the first Edit (tree order) whose
         // name or value looks like an address bar; the Document with the largest positive
@@ -1481,57 +1603,59 @@ impl UiaSession {
             }
             None => (None, None),
         };
-        Located {
+        Ok(Located {
             current_url,
             web_root,
             viewport,
             summary,
-        }
+        })
     }
 
-    /// Logs every `Document` under the window in the raw view (name, bounds,
-    /// `IsControlElement`, `IsOffscreen`, raw child count). Start-up only: it costs one
-    /// cross-process call plus one per document.
-    fn log_document_candidates(&self, window: &IUIAutomationElement) {
+    /// Counts the `Document` elements under the window in the raw view (one cross-process
+    /// call), logging each one (name, bounds, `IsControlElement`, `IsOffscreen`, raw child
+    /// count) when debug logging is on. Only called when the control view has no document.
+    fn raw_documents(
+        &self,
+        window: &IUIAutomationElement,
+        deadline: Instant,
+    ) -> std::result::Result<usize, CallError> {
+        self.arm(deadline);
         // SAFETY: COM method on a live interface pointer with live condition and cache request;
         // returns an owned array.
-        let found = elements_of(unsafe {
+        let documents = elements_of(unsafe {
             window.FindAllBuildCache(
                 TreeScope_Descendants,
                 &self.document_condition,
                 &self.diagnostic_request,
             )
-        });
-        let documents = match found {
-            Ok(documents) => documents,
-            Err(err) => {
-                tracing::debug!(error = %describe(&err), "raw-view Document search failed");
-                return;
+        })
+        .map_err(|err| CallError::search(err, "raw-view Document search"))?;
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for (idx, document) in documents.iter().enumerate() {
+                let (name, rect) = cached_basics(document)
+                    .map(|(_, name, rect)| (name, rect))
+                    .unwrap_or_default();
+                // SAFETY: COM method on a live element with a live condition; returns an owned
+                // array. Debug logging only.
+                let children = elements_of(unsafe {
+                    document.FindAll(TreeScope_Children, &self.true_condition)
+                })
+                .map_or(-1, |c| i64::try_from(c.len()).unwrap_or(i64::MAX));
+                tracing::debug!(
+                    idx,
+                    name = %name,
+                    x = rect.0,
+                    y = rect.1,
+                    width = rect.2,
+                    height = rect.3,
+                    control = cached_flag(document, UIA_IsControlElementPropertyId),
+                    offscreen = cached_flag(document, UIA_IsOffscreenPropertyId),
+                    raw_children = children,
+                    "raw-view Document candidate"
+                );
             }
-        };
-        tracing::debug!(count = documents.len(), "raw-view Document candidates");
-        for (idx, document) in documents.iter().enumerate() {
-            let (name, rect) = cached_basics(document)
-                .map(|(_, name, rect)| (name, rect))
-                .unwrap_or_default();
-            // SAFETY: COM method on a live element with a live condition; returns an owned
-            // array.
-            let children =
-                elements_of(unsafe { document.FindAll(TreeScope_Children, &self.true_condition) })
-                    .map_or(-1, |c| i64::try_from(c.len()).unwrap_or(i64::MAX));
-            tracing::debug!(
-                idx,
-                name = %name,
-                x = rect.0,
-                y = rect.1,
-                width = rect.2,
-                height = rect.3,
-                control = cached_flag(document, UIA_IsControlElementPropertyId),
-                offscreen = cached_flag(document, UIA_IsOffscreenPropertyId),
-                raw_children = children,
-                "raw-view Document candidate"
-            );
         }
+        Ok(documents.len())
     }
 }
 
