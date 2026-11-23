@@ -12,11 +12,11 @@ access. Cookie values are never decrypted, read or printed.
 
 ## The short version
 
-| Where you logged in | Where you restore | Works? |
+| Where you logged in | Where you restore | Expected result |
 | --- | --- | --- |
-| Any machine | **The same machine and OS user** | Yes |
-| Linux, `password_store="basic"` (including any container) | Any Linux Chrome, including Podman/Docker containers | **Yes** |
-| Linux desktop with GNOME Keyring / KWallet (Chrome's default there) | Another machine or container | No: cookies are encrypted with a key held in that desktop's keyring |
+| Any machine | **The same machine and OS user** | Expected to work (not verified with a real Chrome) |
+| Linux, `password_store="basic"` (including any container) | Any Linux Chrome, including Podman/Docker containers | **Expected to work** (not verified with a real Chrome) |
+| Linux desktop with GNOME Keyring / KWallet (Chrome's default there) | Another machine or container, or Chromium instead of Chrome on the same machine | No: cookies are encrypted with a key held in that desktop's keyring |
 | macOS | Another Mac, Linux, a container, Windows | No: the key is in the source user's login Keychain |
 | Windows | Anything else (and usually even another Windows user) | No: DPAPI and App-Bound Encryption tie the key to the user and machine |
 
@@ -24,6 +24,11 @@ If you work on macOS or Windows and want a session inside a Linux container, the
 to be created by a Linux Chrome that uses the `basic` store: log in from inside the container
 (or a Linux VM/desktop) with `LaunchOptions(password_store="basic")`, export there, and reuse
 that bundle in later container runs.
+
+Every "expected" above comes from reading Chromium's synchronous `os_crypt` code at one pinned
+commit (see the end of this page). Newer Chrome versions route encryption through
+`os_crypt_async`, whose Linux behaviour was not checked. Nobody has yet run a real logged-in
+profile through this round trip as part of this project's tests.
 
 ## Workflow
 
@@ -61,12 +66,23 @@ Chrome picks a store itself, exactly as before this option existed) and Chrome i
 macOS and Windows. In a container without a desktop session Chrome already falls back to the
 basic store, but setting it explicitly removes the guesswork.
 
-### 2. Close Chrome and export
+### 2. Close the session, wait, then export
+
+Leave the `with waybound.launch(...)` block (or call `Session.close()`) and let it return
+before exporting. On Linux and macOS the daemon stops Chrome with `SIGTERM` and waits up to
+5 seconds before resorting to `SIGKILL`; Chromium handles `SIGTERM` with its normal shutdown,
+which is expected to write batched cookie changes to disk (Chrome delays them by up to about
+30 seconds) and remove `SingletonLock`. A hard kill, a crashed container or pulling the plug
+can lose a login made just before the end and leave the lock behind.
 
 Chrome must not be running against the profile: its SQLite databases may have unflushed
 journals and the leveldb stores are locked. `export` refuses while `SingletonLock` (or
-Windows `lockfile`) is present, unless it can prove the lock is stale (same hostname, pid
-gone).
+Windows `lockfile`) is present, with two exceptions:
+
+- the lock names this host and its pid is gone (a stale lock): exported with a warning;
+- the lock names **another** host, typically a container that has since exited: refused
+  unless you pass `--ignore-lock` (`ignore_lock=True`). Only use it when you know that Chrome
+  is gone. It never overrides a lock held by a Chrome running on this machine.
 
 ```bash
 waybound profile export /home/me/wb-profiles/airline ./airline.session.tar.gz
@@ -77,9 +93,9 @@ waybound profile export /home/me/wb-profiles/airline ./airline.session.tar.gz
 Wrote airline.session.tar.gz
   source: linux/x86_64, chrome 131.0.6778.85, cookie key store basic
   files: 214 (5839312 bytes uncompressed), saved passwords/autofill excluded
-  restore on linux: portable
-  restore on macos: incompatible
-  restore on windows: incompatible
+  restore on linux: expected to work (not verified against a real Chrome)
+  restore on macos: cookies will not decrypt
+  restore on windows: cookies will not decrypt
 SECURITY: this bundle contains live session cookies ...
 ```
 
@@ -174,33 +190,69 @@ The manifest records:
 }
 ```
 
-`chrome_version` comes from the profile's `Last Version` file. `password_store` is inferred
-from the version prefix of the encrypted cookie values (only the first three bytes are read,
-through a read-only SQLite connection): on Linux `v10` means the basic store and `v11` a
-keyring; on macOS it is the Keychain; on Windows `v20` means App-Bound Encryption, otherwise
-DPAPI. Override it with `--password-store` when you know better.
+The manifest is written as compact JSON; it is shown indented here. `chrome_version` comes
+from the profile's `Last Version` file. `password_store` is inferred from the version prefix
+of the encrypted cookie values: on Linux `v10` means the basic store and `v11` a keyring; on
+macOS it is the Keychain; on Windows `v20` means App-Bound Encryption, otherwise DPAPI. To
+see rows that are still only in the SQLite write-ahead log, the cookie database and its
+`-wal`/`-journal` files are copied into a private temporary directory and opened there; the
+source files are never opened for writing, and only the first three bytes of each value are
+read. `cookie_encryption_prefixes` is `[]` when there are no encrypted cookies and `null`
+when the database could not be read.
+
+`--password-store` is only recorded when nothing can be detected. If it contradicts the
+prefixes, the detected store is recorded and a warning is printed, so an override cannot make
+a non-portable bundle look portable. On import the prefixes win over the recorded store for
+the same reason.
+
+Export also skips (and reports) files whose names the importer would refuse, such as names
+containing `:` or reserved Windows device names, and refuses to write the bundle inside the
+profile directory. It is limited to 200 000 files.
 
 ## Import safety
+
+Bundles are read with a small, strict tar reader rather than Python's `tarfile`, because
+`tarfile` loads a whole extended (PAX/GNU) header into memory before any check can run, so a
+1 MB bundle can ask for gigabytes. The reader counts every decompressed byte against a budget
+derived from the manifest, caps PAX headers at 64 KiB, and refuses GNU long-name/long-link and
+global headers. `inspect` uses the same reader and honours `--max-bytes`.
 
 Before anything in the target is touched, `import`:
 
 - reads the manifest and checks its schema, format version, sizes and SHA-256 digests;
-- rejects absolute paths, `..`, `.`, backslashes, drive letters, NUL bytes, paths that differ
-  only in case, and any path the include policy would not have exported (a bundle cannot
-  plant `Extensions/` or `NativeMessagingHosts/`);
+- rejects absolute paths, `..`, `.`, backslashes, NUL bytes, characters or names Windows
+  cannot store (`<>:"|?*`, control characters, trailing dots or spaces, `CON`, `NUL`, `COM1`
+  and the like, with or without an extension), path components over 255 bytes, and any path
+  the include policy would not have exported (a bundle cannot plant `Extensions/` or
+  `NativeMessagingHosts/`);
+- rejects two entries that would land on the same file on a case-insensitive or
+  Unicode-normalizing file system (APFS, NTFS), including a file and a directory that differ
+  only in case or NFC/NFD form;
 - rejects symlinks, hard links, devices, FIFOs and directories as archive members, members
   not in the manifest, repeated members, and missing ones;
-- enforces a size cap (`--max-bytes`, default 2 GiB uncompressed, 200 000 files);
-- refuses a non-empty target unless `--force`, a target that is a symlink, `/` or your home
-  directory, and a target where Chrome appears to be running;
+- enforces a size cap (`--max-bytes`, default 2 GiB uncompressed, must be positive) and at
+  most 200 000 files;
+- refuses a non-empty target unless `--force`; with `--force`, refuses anything that does not
+  look like a Chrome user-data-dir (`Local State` or `Default/` present) or a previous import
+  (which carries a `.waybound-import.json` marker);
+- refuses a target that is a symlink, a filesystem root, a mount point, your home directory
+  or any of its ancestors, and a target where Chrome appears to be running (`--ignore-lock`
+  accepts a lock from another host, as for export);
 - refuses a bundle whose cookies cannot decrypt on this OS (see below) unless
   `--allow-incompatible`, and prints a loud warning when they only decrypt on the original
-  machine or the key store is unknown.
+  machine or the key store is unknown. A bundle without any encrypted cookies is not refused
+  across OSes, since there is no cookie session to lose; its other storage is expected to
+  carry over.
 
-Files are extracted with `O_EXCL | O_NOFOLLOW` into a private staging directory **inside**
-the target, every digest is verified, and only then are the target's old contents removed
-(with `--force`) and the staged files moved into place. Nothing outside the target directory
-is ever deleted. Restored directories are `0700`, files `0600`.
+Files are extracted with `O_EXCL | O_NOFOLLOW` into a new private (`0700`) staging directory
+**next to** the target (`.<name>.waybound-import-*`, same file system), every digest is
+verified, and permissions are set to `0700` for directories and `0600` for files without
+following symlinks. Only then is the target replaced, by renames: the existing target is
+renamed to `.<name>.waybound-backup-*`, the staging directory is renamed to the target, and
+the backup is deleted last. If the second rename fails (or is interrupted), the backup is
+renamed back. A verified staging directory is never deleted after a late failure: the error
+says where it is. If the old profile cannot be fully deleted, the import still succeeds and a
+warning says where the rest of it is. Deleting the backup never follows symlinks.
 
 ## Why portability depends on the OS (and what was checked)
 
@@ -208,14 +260,16 @@ Chrome encrypts each cookie value (`encrypted_value`) and, likewise, saved passw
 key from the operating system. Copying the files is easy; the key is the hard part.
 
 - **Linux.** Chrome picks a key store from `--password-store` or the desktop environment:
-  KWallet on KDE, libsecret (GNOME Keyring) on GNOME, Cinnamon, XFCE, Unity and similar, and
-  the **basic** store for `--password-store=basic`, for unrecognised desktops (no
-  `XDG_CURRENT_DESKTOP`, as in this repo's container), or when the requested store is not
-  available. Basic-store values are prefixed `v10` and encrypted with a key derived from a
+  KWallet on KDE, libsecret (GNOME Keyring) on GNOME, Cinnamon, Deepin, Pantheon, UKUI, XFCE
+  and Unity, and the **basic** store for `--password-store=basic`, for KDE3, LXQt and
+  unrecognised desktops (no `XDG_CURRENT_DESKTOP`, as in this repo's container), or when the
+  requested store is not available. Basic-store values are prefixed `v10` and encrypted with a key derived from a
   constant compiled into Chrome (`"peanuts"`, PBKDF2 with salt `"saltysalt"`, 1 iteration,
   AES-128). Keyring-backed values are prefixed `v11`, and Chrome does not fall back to the
-  `v10` key for them. So `v10` profiles move between Linux machines; `v11` ones do not.
-  Sources: Chromium `components/os_crypt/sync/key_storage_util_linux.cc` (`SelectBackend`)
+  `v10` key for them. So `v10` profiles are expected to move between Linux machines; `v11`
+  ones do not, not even between Chrome and Chromium on one machine, because the two use
+  different keyring entries. This is the synchronous `os_crypt` implementation; newer
+  Chrome's `os_crypt_async` key providers were not checked. Sources: Chromium `components/os_crypt/sync/key_storage_util_linux.cc` (`SelectBackend`)
   and `os_crypt_linux.cc` at commit `913eaefa55be`; `docs/linux/password_storage.md`.
 - **macOS.** The key is derived (PBKDF2, salt `"saltysalt"`, 1003 iterations) from a random
   password stored in the user's login Keychain under the service "Chrome Safe Storage",
@@ -238,6 +292,10 @@ key is portable.
 
 ### Not verified / caveats
 
+- Chromium's `SIGTERM` handling was read in `chrome/browser/chrome_browser_main_posix.cc` at
+  the same pinned commit (on Linux it calls `chrome::SessionEnding()`). That it flushes the
+  cookie database before exiting was not verified.
+
 - These behaviours were checked against Chromium source at one commit and public docs, and the
   feature was tested with synthetic profiles. A round trip of a real logged-in Chrome profile
   between two Linux containers has not been run as part of the test suite.
@@ -257,3 +315,14 @@ key is portable.
 - Session-only cookies (no expiry) travel only if Chrome wrote them to the `Cookies`
   database before exiting, which depends on its "continue where you left off" setting (not
   verified here).
+
+## Relation to `ProfileStore` (issue #69)
+
+Issue #69 proposes a copy-on-write `ProfileStore` that clones pre-warmed profiles for worker
+pools, keeping HTTP and V8 caches, and can archive them across container restarts. This module
+does something different: a minimal, verified, security-reviewed bundle for moving a *login*
+between machines, with caches deliberately left out. The names do not overlap (`waybound.profile`,
+`export_profile`, `import_profile`, `waybound profile ...`). A future `ProfileStore` could reuse
+the safe import path (staging, hash checks, atomic swap) and the lock checks here, but it
+would need a wider include policy for warm caches.
+
