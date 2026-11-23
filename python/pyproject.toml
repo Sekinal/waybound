@@ -29,6 +29,9 @@ classifiers = [
 crawlee = [
   "crawlee>=1.0.0",
 ]
+scrapy = [
+  "scrapy>=2.11",
+]
 
 [project.urls]
 Homepage = "https://github.com/Sekinal/waybound"
@@ -48,6 +51,7 @@ dev = [
   "pytest>=8.3.0",
   "pytest-asyncio>=0.26.0",
   "ruff>=0.11.0",
+  "scrapy>=2.11",
 ]
 
 [tool.hatch.build.targets.wheel]
