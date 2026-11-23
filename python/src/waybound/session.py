@@ -175,6 +175,27 @@ def _daemon_env(
     return env
 
 
+_DESKTOP_BACKENDS = ("macos", "linux", "windows")
+
+
+def _reject_unobservable_capture(opts: LaunchOptions) -> None:
+    """Refuse `ssl_keylog` + `proxy` when attaching to a running desktop browser.
+
+    When attaching (`pid=...` without `launch_chrome`), the daemon cannot route the browser
+    through `proxy`, and its `tshark` fallback only sees direct HTTPS on port 443, so captures
+    would silently stay empty. The daemon rejects the same combination given as `--proxy`; the
+    SDK passes the proxy in `WAYBOUND_PROXY` (to keep credentials out of argv), which the
+    daemon treats as inherited configuration, so the check is made here.
+    """
+    attaching = opts.backend in _DESKTOP_BACKENDS and not opts.launch_chrome
+    if attaching and opts.proxy is not None and opts.ssl_keylog is not None:
+        msg = (
+            "ssl_keylog with proxy requires launch_chrome=True: when attaching to a running "
+            "browser the proxy is not applied and the tshark fallback cannot see proxied traffic"
+        )
+        raise ValueError(msg)
+
+
 class Session:
     """Context manager that starts `waybound-daemon`, connects, and cleans up on exit."""
 
@@ -185,6 +206,7 @@ class Session:
         extra_env: Mapping[str, str] | None = None,
     ) -> None:
         opts = options if options is not None else LaunchOptions()
+        _reject_unobservable_capture(opts)
         self._options = opts
         self._extra_env: dict[str, str] | None = dict(extra_env) if extra_env is not None else None
         self._daemon_binary = _resolve_daemon_binary(opts.daemon_binary)

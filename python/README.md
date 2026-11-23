@@ -39,7 +39,7 @@ pip install "waybound[crawlee]"      # + WayboundCrawler for Crawlee Python
 pip install "waybound[scrapy]"       # + WayboundDownloadHandler for Scrapy
 
 waybound fetch v0.6.0                # Downloads prebuilt waybound-daemon (macOS/Linux/Windows)
-waybound doctor                      # Verifies daemon, Chrome, tshark, and adb/waydroid
+waybound doctor                      # Finds daemon, Chrome, adb/waydroid; probes tshark's capture interface
 ```
 
 ### TypeScript / Node.js (>= 22.12)
@@ -222,8 +222,10 @@ Understanding how `waybound` captures network traffic without MITM or CDP is imp
    - **Why HTTP/3/QUIC is not silently missed:** Because Chrome tunnels proxied HTTPS requests through an HTTP/1.1 `CONNECT` tunnel over TCP, Chrome automatically negotiates **TCP + TLS 1.3 + HTTP/2 (or HTTP/1.1)** for every proxied origin rather than UDP/QUIC. As a result, API responses are captured reliably without silent QUIC bypass.
    - Supports TLS 1.2 and TLS 1.3 (AES-GCM and ChaCha20-Poly1305), HTTP/1.1 and HTTP/2 (HPACK), WebSocket frames, and `gzip`/`deflate`/`br` decompression. Does not decrypt plain `http://` or `zstd` bodies, and does not passively tap when chaining through an upstream `http://` proxy (`socks5://` and direct upstreams work).
 2. **Attached Chrome (`pid=...` with `ssl_keylog=...`, no proxy forwarder):**
-   - Falls back to `tshark` packet capture on `en0` (macOS) or `any` (Linux; override with `WAYBOUND_NET_IFACE`).
-   - Because Chrome is not forced through the HTTP/1.1 `CONNECT` proxy in this mode, origins advertising `Alt-Svc: h3` may upgrade to **UDP/QUIC (HTTP/3)**, which depends on `tshark`'s QUIC dissector and is not guaranteed.
+   - Falls back to `tshark` packet capture (desktop backends only). The running Chrome must have been started with `SSLKEYLOGFILE` pointing at that same file. The tap only sees HTTPS on TCP/UDP port 443 sent directly from this host: it captures on `any` (Linux) or the default-route interface (macOS); Windows (Npcap) has no `any` device, so pass `--net-iface` there. `--net-iface` / `WAYBOUND_NET_IFACE` overrides the choice (see `tshark -D`). `tshark` is looked up on the absolute entries of `PATH`, then in the usual install locations. HTTP/1.1 and HTTP/2 are decoded frame by frame.
+   - Because Chrome is not forced through the HTTP/1.1 `CONNECT` proxy in this mode, origins advertising `Alt-Svc: h3` may upgrade to **UDP/QUIC (HTTP/3)**. HTTP/3 via `tshark` is parsed on a best-effort basis and has never been verified.
+   - The daemon **exits at startup** instead of capturing nothing when this fallback cannot work: `tshark` missing, no interface, or `tshark` exiting during startup (its stderr is in the error). If `tshark` dies later, `wait_for_response()` fails with `backend_unavailable` rather than time out (`captured_responses()` still returns what was captured before). Attaching with `ssl_keylog` and an explicit `--proxy` (or the SDK's `proxy=`) is rejected, because the proxy is not applied to a browser the daemon did not launch and `tshark` cannot see proxied traffic; an inherited `WAYBOUND_PROXY` environment variable is only reported as ignored. With `--backend android` (without `--launch-waydroid`) or `mock`, `ssl_keylog` is ignored with a warning.
+   - `waybound doctor` resolves `tshark` the same way and runs `tshark -L -i <interface>`, which opens the capture device without capturing, so it reports missing capture permission or a missing interface.
 3. **Proxy credentials and local users:**
    - The upstream proxy URL is passed via `WAYBOUND_PROXY` (never argv) and stripped from child processes. On Linux the loopback forwarder enforces same-UID peer verification via `/proc/net/tcp`; on macOS and Windows any local user can relay through the loopback port while a session runs. See [ARCHITECTURE.md](ARCHITECTURE.md#upstream-proxy-forwarder).
 
@@ -235,7 +237,7 @@ Understanding how `waybound` captures network traffic without MITM or CDP is imp
 |---|---|---|---|---|
 | `linux` (Wayland) | AT-SPI2 over D-Bus (`zbus`) | Pure-Rust `waybound-compositor` (`wl_seat` pointer + xkb keyboard) | Direct per-surface `wl_buffer` PNG | **Live stock Chrome CI (`--ozone-platform=wayland`, zero Xvfb)** |
 | `linux` (X11/Xvfb) | AT-SPI2 over D-Bus (`zbus`, `pyatspi` fallback) | X11 `XTEST` (`x11rb`, `xdotool` fallback) | X11 `GetImage` (`import`/`scrot` fallback) | **Live stock Chrome CI (`Xvfb` + `openbox`)** |
-| `windows` | UI Automation | Win32 `SendInput` | Primary screen (`System.Drawing`) | **Live stock Chrome CI** |
+| `windows` | UI Automation, in-process over COM (`WAYBOUND_WINDOWS_UIA=powershell` selects the PowerShell fallback) | Win32 `SendInput` | Primary screen (`System.Drawing`) | **Live stock Chrome CI** |
 | `macos` | `AXUIElement` (`AXWebArea`-scoped) | `CGEvent` HID tap | Browser window (`screencapture`) | Unit + workspace tests in CI (main dev platform) |
 | `android` | `uiautomator dump` over ADB | `adb shell input` | `screencap` | Unit tests in CI; Waydroid launch experimental ([docs/waydroid-linux.md](docs/waydroid-linux.md)) |
 
@@ -256,7 +258,7 @@ Understanding how `waybound` captures network traffic without MITM or CDP is imp
 - **`crates/waybound-compositor`** (`#![forbid(unsafe_code)]`) — Pure-Rust headless Wayland compositor (`wayland-server` + `xdg_shell` + `wl_shm` + `wl_seat`) for zero-Xvfb Linux Chrome concurrency.
 - **`crates/waybound-driver-linux`** (`#![forbid(unsafe_code)]`) — AT-SPI2 (`zbus`), `HeadlessCompositor` Wayland integration, X11 `XTEST`/`GetImage` (`x11rb`), and RAII `Xvfb`.
 - **`crates/waybound-driver-macos`** — `AXUIElement` (`AXWebArea`-scoped), `CGEvent` HID input, and `screencapture`.
-- **`crates/waybound-driver-windows`** — UI Automation, audited Win32 `SendInput`, and PNG screenshots.
+- **`crates/waybound-driver-windows`** — UI Automation over in-process COM (PowerShell fallback), audited Win32 `SendInput`, and PNG screenshots.
 - **`crates/waybound-driver-android`** (`#![forbid(unsafe_code)]`) — Pure-Rust ADB + `uiautomator` XML parser + experimental Waydroid launcher.
 - **`crates/waybound-net`** (`#![forbid(unsafe_code)]`) — Passive TLS 1.3 decryptor, `SSLKEYLOGFILE` reader, HTTP/1.1 & HTTP/2 (HPACK) + WebSocket correlator, `SessionFingerprint` recorder, host blocker presets, and bandwidth accounting.
 - **`crates/waybound-http`** (`#![forbid(unsafe_code)]`) — Tier 2 replay client (`BoringSSL` via `wreq` with TLS session resumption & warm H2 pooling, lossless binary/multipart bodies, and opt-in pure-Rust HTTP/3 via `quinn` + `h3`).

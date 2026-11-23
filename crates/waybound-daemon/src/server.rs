@@ -1616,6 +1616,46 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_response_reports_a_dead_tshark_tap() {
+        let driver = MockDriver::sample_page();
+        let state = state();
+        state.responses.upsert(
+            1,
+            waybound_core::CapturedResponse {
+                url: "https://a.test/before".to_owned(),
+                status: 200,
+                ..waybound_core::CapturedResponse::default()
+            },
+        );
+        state
+            .responses
+            .mark_capture_failed("tshark capture on interface en0 stopped".to_owned());
+
+        // What was captured before the tap died stays listable.
+        let listed = handle_request(
+            &driver,
+            &state,
+            Request::CapturedResponses { url_contains: None },
+        );
+        assert!(
+            matches!(listed, Response::HttpResponses { ref responses } if responses.len() == 1)
+        );
+
+        let waited = handle_request(
+            &driver,
+            &state,
+            Request::WaitForResponse {
+                url_contains: "/api".to_owned(),
+                timeout_ms: 5_000,
+            },
+        );
+        assert!(
+            matches!(waited, Response::Error { ref code, .. } if code == "backend_unavailable"),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
     fn fill_selects_existing_content_before_typing() {
         let driver = MockDriver::sample_page();
         let query = LocatorQuery::by_role(Role::TextBox, Some("Origin".to_owned()));

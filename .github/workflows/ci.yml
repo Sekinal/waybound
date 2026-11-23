@@ -91,6 +91,12 @@ jobs:
         run: uv sync --dev
       - name: Run live Windows Chrome UIA + SendInput smoke test
         working-directory: python
+        env:
+          # Fail instead of silently falling back to PowerShell, so a pass proves the
+          # in-process COM backend served every snapshot.
+          WAYBOUND_WINDOWS_UIA: native-strict
+          # The smoke echoes the daemon's UIAutomation log lines (per-phase timings at debug).
+          RUST_LOG: info,waybound_driver_windows=debug
         run: uv run python ../scripts/windows_live_smoke.py
 
   linux-live-smoke:

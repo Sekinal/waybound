@@ -48,7 +48,7 @@ with waybound.launch(opts) as page:
 
 When the script launches Chrome itself (`launch_chrome=True`) and sets `ssl_keylog=...`, decryption happens inside the daemon on the traffic it relays, so no extra capabilities are needed.
 
-The `tshark` path is only used when attaching to a Chrome the daemon did not launch (`pid=...`). That needs packet-capture capabilities:
+The `tshark` path is only used when attaching to a Chrome the daemon did not launch (`pid=...`). It captures on the `any` interface (override with `--net-iface` / `WAYBOUND_NET_IFACE`), and the daemon exits at startup if `tshark` is missing or cannot open the interface. That needs packet-capture capabilities:
 
 ```bash
 podman run --rm \
@@ -63,6 +63,13 @@ podman run --rm \
 ## Reusing a Logged-In Session
 
 Mount a session bundle read-only and restore it with `waybound profile import` before launching Chrome. Only bundles created by a Linux Chrome using the `basic` password store (`LaunchOptions(password_store="basic")`) decrypt inside the container; see [profile-portability.md](profile-portability.md).
+
+## Debugging Accessibility Snapshots
+
+Snapshots walk Chrome's AT-SPI2 tree with pipelined D-Bus calls. To rule that out when a
+snapshot looks wrong, pass `-e WAYBOUND_ATSPI_WALK=sequential` to `podman run` to force the
+original one-call-at-a-time walk (slower, same output); `RUST_LOG=waybound_driver_linux=debug`
+logs which walk ran. See [ARCHITECTURE.md](../ARCHITECTURE.md#linux-at-spi2-tree-walk).
 
 ## Compose
 
