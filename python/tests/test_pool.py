@@ -668,3 +668,98 @@ def test_display_stacks_are_closed_at_interpreter_exit() -> None:
     pool_mod._close_live_stacks()  # what the atexit hook runs
     assert proc.poll() is not None
     assert stack not in pool_mod._LIVE_STACKS
+
+
+async def test_close_does_not_spin_on_finished_teardowns() -> None:
+    # Python 3.12's gather() completes synchronously when every child is already done, so a
+    # close() that looped while the set was merely non-empty never yielded to the loop and
+    # the done-callbacks that would have emptied it could never run.
+    pool = BrowserPool(size=1, launch_options=LaunchOptions(backend="mock"))
+    finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    finished.set_result(None)
+    pool._background.add(finished)
+    await asyncio.wait_for(pool.close(), timeout=2.0)
+    assert not pool._background
+
+
+async def test_close_and_a_borrower_tear_a_slot_down_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_daemon_binary()
+    closes: list[int] = []
+    original = pool_mod._PoolSlot._close_once
+
+    def counting(self: pool_mod._PoolSlot) -> None:
+        closes.append(id(self))
+        original(self)
+
+    monkeypatch.setattr(pool_mod._PoolSlot, "_close_once", counting)
+    pool = BrowserPool(size=1, launch_options=LaunchOptions(backend="mock"))
+    await pool.start()
+
+    async def borrower() -> None:
+        async with pool.acquire() as page:
+            await page.url()
+            await asyncio.sleep(0.3)
+
+    task = asyncio.create_task(borrower())
+    await asyncio.sleep(0.15)
+    await asyncio.gather(pool.close(), task, return_exceptions=True)
+    assert len(closes) == 1
+
+
+async def test_cancelled_health_check_never_oversubscribes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daemon_bin = _daemon_bin_for_tests()
+    before = _live_daemon_pids(daemon_bin)
+    pool = BrowserPool(size=1, launch_options=LaunchOptions(backend="mock"))
+    await pool.start()
+    async with pool.acquire():
+        pass
+    original = pool_mod._PoolSlot.ping
+
+    def slow_ping(self: pool_mod._PoolSlot) -> None:
+        time.sleep(0.4)
+        original(self)
+
+    monkeypatch.setattr(pool_mod._PoolSlot, "ping", slow_ping)
+
+    async def use() -> None:
+        async with pool.acquire():
+            await asyncio.sleep(0.05)
+
+    for _ in range(3):
+        first = asyncio.create_task(use())
+        await asyncio.sleep(0.1)  # inside the slow health check of the idle slot
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        second = asyncio.create_task(use())
+        await asyncio.gather(second, return_exceptions=True)
+        await asyncio.sleep(0.6)
+        assert len(pool._idle) + len(pool._active_slots) <= 1
+        assert len(_live_daemon_pids(daemon_bin) - before) <= 1
+    monkeypatch.undo()
+    await pool.close()
+    await _assert_no_new_daemons(daemon_bin, before)
+
+
+def test_stacks_hook_closes_sessions_before_stacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    order: list[str] = []
+    monkeypatch.setattr(pool_mod, "_close_live_sessions", lambda: order.append("sessions"))
+
+    def terminate(proc: subprocess.Popen[bytes]) -> None:
+        order.append("stack")
+        proc.kill()
+        proc.wait()
+
+    monkeypatch.setattr(pool_mod, "_terminate_process", terminate)
+    proc = subprocess.Popen(["/bin/sleep", "30"])
+    pool_mod._IsolatedDisplayStack(display_num=998, env={}, processes=[proc])
+    pool_mod._close_live_stacks()
+    assert order == ["sessions", "stack"]
+
+
+def test_parallel_refusal_points_crawlee_users_at_the_fix() -> None:
+    with pytest.raises(ValueError, match="pool_size=1"):
+        BrowserPool(size=2, launch_options=LaunchOptions(backend="macos", launch_chrome=True))
