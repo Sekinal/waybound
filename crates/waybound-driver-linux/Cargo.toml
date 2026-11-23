@@ -7,6 +7,9 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Both are already in the graph through `zbus`; used to pipeline AT-SPI2 calls.
+futures-lite = { version = "2", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 png = "0.17"
 serde.workspace = true
 serde_json.workspace = true

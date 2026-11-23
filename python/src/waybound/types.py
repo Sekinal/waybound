@@ -104,7 +104,7 @@ def _header_values(headers: tuple[HttpHeader, ...], name: str) -> list[str]:
 
 @dataclass(frozen=True, slots=True)
 class CapturedResponse:
-    """Passively decrypted HTTP/1.1, HTTP/2, or HTTP/3 response.
+    """Passively decrypted HTTP/1.1 or HTTP/2 response (HTTP/3 only via the unverified tshark path).
 
     `headers`, `request_method`, `request_headers`, and `request_body` are empty when the
     daemon did not observe them (for example with the legacy `tshark` capture path or an

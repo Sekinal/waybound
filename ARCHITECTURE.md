@@ -94,6 +94,39 @@ logged only at `debug` in between.
 | macOS | Unrestricted. | Any local process, under any user, can relay through the upstream proxy while a session runs. Socket ownership needs `libproc` FFI (not allowed in the daemon) or a per-connection `lsof`, which is too slow. |
 | Windows | Unrestricted. | Same as macOS; `GetExtendedTcpTable` would need FFI. |
 
+## Linux AT-SPI2 Tree Walk
+
+`waybound-driver-linux` reads Chrome's accessibility tree over the AT-SPI2 D-Bus with one
+persistent `zbus` connection (`crates/waybound-driver-linux/src/atspi_native.rs`). There is
+no bulk call to lean on: Chromium's ATK bridge answers `org.a11y.atspi.Cache.GetItems` with
+`UnknownMethod`, and `GetItems` would not carry extents, link URIs or text anyway. Each node
+costs 4–6 calls (`GetRoleName`, `Name`, `GetExtents`, `GetChildren`, plus `GetState`,
+`GetURI` or the text depending on the role).
+
+The default walk is **pipelined**: up to 64 nodes have their calls in flight at once on the
+one connection, and replies are consumed in breadth-first order, so the node list (order,
+ids, fields, `max_nodes` truncation) is the same as a one-call-at-a-time walk while the
+D-Bus round trip is paid once per window instead of once per call. Nothing is cached
+between snapshots, so a snapshot always reflects the live page. The original
+**sequential** walk is kept as the reference, and the snapshot is redone with it if the bus
+refuses the pipelined walk's outstanding calls (`LimitsExceeded`). Set
+`WAYBOUND_ATSPI_WALK=sequential` in the daemon's environment to force it; the walk used is
+logged at `debug` level.
+
+**Time limits.** Each AT-SPI2 call times out after 6 s and each snapshot / URL / viewport
+lookup stops starting calls after 15 s, so a hung or stopped browser yields a `timeout`
+error within about 6 s (and never more than about 21 s, under the SDKs' 30 s request
+timeout) instead of holding the driver for the bus's 5-minute reply timeout. A stall
+shorter than 6 s only delays the snapshot. The connection stays usable after a timeout;
+a dead connection (I/O error) fails the request and the driver reconnects on the next one.
+
+`scripts/atspi_walk_bench.sh` (not run in CI) benchmarks both walks against real Chromium
+in the container and checks that they return identical snapshots. Measured on arm64
+Chromium 156 in `waybound:local` (median of 30 runs): 32 nodes 88 → 8.2 ms, 1,077 nodes
+766 → 62 ms, 5,367 nodes 3,561 → 298 ms. About 6 ms of the small-page time is locating the
+web document in the browser UI tree; on large pages the walk is bound by Chromium serving
+~12 µs per call.
+
 ## Ownership & Safety Rules
 
 - All OS handles (`CFTypeRef`, `AXUIElementRef`, `CGEventRef`) inside `waybound-driver-macos` must be wrapped in RAII structs implementing `Drop` so no CoreFoundation/CoreGraphics objects can leak on early `?` returns.

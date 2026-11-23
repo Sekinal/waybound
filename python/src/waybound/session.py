@@ -294,6 +294,27 @@ def _kill_process_group(pgid: int | None) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
+_DESKTOP_BACKENDS = ("macos", "linux", "windows")
+
+
+def _reject_unobservable_capture(opts: LaunchOptions) -> None:
+    """Refuse `ssl_keylog` + `proxy` when attaching to a running desktop browser.
+
+    When attaching (`pid=...` without `launch_chrome`), the daemon cannot route the browser
+    through `proxy`, and its `tshark` fallback only sees direct HTTPS on port 443, so captures
+    would silently stay empty. The daemon rejects the same combination given as `--proxy`; the
+    SDK passes the proxy in `WAYBOUND_PROXY` (to keep credentials out of argv), which the
+    daemon treats as inherited configuration, so the check is made here.
+    """
+    attaching = opts.backend in _DESKTOP_BACKENDS and not opts.launch_chrome
+    if attaching and opts.proxy is not None and opts.ssl_keylog is not None:
+        msg = (
+            "ssl_keylog with proxy requires launch_chrome=True: when attaching to a running "
+            "browser the proxy is not applied and the tshark fallback cannot see proxied traffic"
+        )
+        raise ValueError(msg)
+
+
 class Session:
     """Context manager that starts `waybound-daemon`, connects, and cleans up on exit.
 
@@ -319,6 +340,7 @@ class Session:
         _reap_pgid: int | None = None,
     ) -> None:
         opts = options if options is not None else LaunchOptions()
+        _reject_unobservable_capture(opts)
         if extra_env is not None and (reserved := set(extra_env) & set(_SDK_ONLY_ENV)):
             # Rejected rather than silently dropped: these make the daemon exit or signal a
             # process group, so a caller setting them is a bug worth surfacing.
