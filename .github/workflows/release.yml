@@ -77,8 +77,40 @@ jobs:
           name: python-dist
           path: python/dist/*
 
+  build-typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/waybound-ts
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: packages/waybound-ts/package-lock.json
+      - name: Install dependencies and build TypeScript SDK
+        run: |
+          npm ci
+          npm run build
+          npm run lint
+      - name: Pack npm tarball and verify contents
+        run: |
+          mkdir -p dist-pack
+          npm pack --pack-destination dist-pack
+          TARBALL=$(ls dist-pack/*.tgz)
+          tar -tzf "$TARBALL"
+          if tar -tzf "$TARBALL" | grep -E '^package/(test|build-test)/'; then
+            echo "ERROR: tarball contains test artifacts"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: typescript-dist
+          path: packages/waybound-ts/dist-pack/*.tgz
+
   publish-release:
-    needs: [build-daemon, build-python]
+    needs: [build-daemon, build-python, build-typescript]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -103,6 +135,25 @@ jobs:
           name: python-dist
           path: dist
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  publish-npm:
+    needs: [build-typescript, publish-release]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: typescript-dist
+          path: dist
+      - name: Publish to npm with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish dist/*.tgz --provenance --access public
 
   publish-container:
     needs: [publish-release]
