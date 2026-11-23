@@ -311,6 +311,7 @@ struct SurfaceState {
     pending_callbacks: Vec<WlCallback>,
     current_frame: Option<CommittedFrame>,
     toplevel_id: Option<u64>,
+    parent_surface_id: Option<u64>,
     popup: Option<PopupState>,
 }
 
@@ -433,22 +434,46 @@ impl CompositorState {
             })
     }
 
+    fn root_toplevel_id(&self, surface_id: u64) -> Option<u64> {
+        let mut current = Some(surface_id);
+        for _ in 0..16 {
+            let sid = current?;
+            let surface = self.surfaces.get(&sid)?;
+            if let Some(tid) = surface.toplevel_id {
+                return Some(tid);
+            }
+            current = surface.parent_surface_id;
+        }
+        None
+    }
+
+    fn best_window_frame(&self, window_id: u64) -> Option<&CommittedFrame> {
+        let mut best: Option<&CommittedFrame> = None;
+        let mut best_area: u64 = 0;
+        for (&sid, surface) in &self.surfaces {
+            if self.root_toplevel_id(sid) == Some(window_id)
+                && let Some(ref frame) = surface.current_frame
+            {
+                let area = u64::from(frame.width).saturating_mul(u64::from(frame.height));
+                if area >= best_area {
+                    best_area = area;
+                    best = Some(frame);
+                }
+            }
+        }
+        best
+    }
+
     fn screenshot_png(&self, window_id: Option<u64>) -> Result<Vec<u8>> {
         let target_id = self.resolve_target_window_id(window_id)?;
-        let win = self
+        let _win = self
             .windows
             .get(&target_id)
             .ok_or_else(|| WayboundError::ElementNotFound {
                 query: format!("window id {target_id}"),
             })?;
-        let surface = self.surfaces.get(&win.surface_id).ok_or_else(|| {
-            WayboundError::InvalidElementState {
-                detail: format!("window {target_id} surface is no longer active"),
-            }
-        })?;
-        let frame = surface
-            .current_frame
-            .as_ref()
+        let frame = self
+            .best_window_frame(target_id)
             .ok_or_else(|| WayboundError::Transient {
                 backend: "wayland-compositor".to_owned(),
                 reason: format!("window {target_id} has not committed a pixel buffer yet"),
@@ -1009,6 +1034,7 @@ impl Dispatch<WlCompositor, ()> for CompositorState {
                         pending_callbacks: Vec::new(),
                         current_frame: None,
                         toplevel_id: None,
+                        parent_surface_id: None,
                         popup: None,
                     },
                 );
@@ -1049,7 +1075,7 @@ impl GlobalDispatch<WlSubcompositor, ()> for CompositorState {
 
 impl Dispatch<WlSubcompositor, ()> for CompositorState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &WlSubcompositor,
         request: wl_subcompositor::Request,
@@ -1057,7 +1083,18 @@ impl Dispatch<WlSubcompositor, ()> for CompositorState {
         _dhandle: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        if let wl_subcompositor::Request::GetSubsurface { id, .. } = request {
+        if let wl_subcompositor::Request::GetSubsurface {
+            id,
+            surface,
+            parent,
+        } = request
+        {
+            if let (Some(child_data), Some(parent_data)) =
+                (surface.data::<SurfaceData>(), parent.data::<SurfaceData>())
+                && let Some(child_state) = state.surfaces.get_mut(&child_data.0)
+            {
+                child_state.parent_surface_id = Some(parent_data.0);
+            }
             let _ = data_init.init(id, ());
         }
     }
@@ -1156,11 +1193,16 @@ impl Dispatch<WlSurface, SurfaceData> for CompositorState {
                             if let Some(surface) = state.surfaces.get_mut(&surface_id) {
                                 surface.current_frame = Some(frame);
                             }
-                            if let Some(window_id) = toplevel_id
+                            if let Some(window_id) = state.root_toplevel_id(surface_id)
                                 && let Some(win) = state.windows.get_mut(&window_id)
                             {
-                                win.width = fw;
-                                win.height = fh;
+                                let new_area = u64::from(fw).saturating_mul(u64::from(fh));
+                                let cur_area =
+                                    u64::from(win.width).saturating_mul(u64::from(win.height));
+                                if !win.has_buffer || new_area >= cur_area {
+                                    win.width = fw;
+                                    win.height = fh;
+                                }
                                 win.has_buffer = true;
                             }
                         }
@@ -1169,10 +1211,11 @@ impl Dispatch<WlSurface, SurfaceData> for CompositorState {
                         if let Some(surface) = state.surfaces.get_mut(&surface_id) {
                             surface.current_frame = None;
                         }
-                        if let Some(window_id) = toplevel_id
-                            && let Some(win) = state.windows.get_mut(&window_id)
-                        {
-                            win.has_buffer = false;
+                        if let Some(window_id) = state.root_toplevel_id(surface_id) {
+                            let still_has_frame = state.best_window_frame(window_id).is_some();
+                            if let Some(win) = state.windows.get_mut(&window_id) {
+                                win.has_buffer = still_has_frame;
+                            }
                         }
                     }
                     PendingBuffer::Unchanged => {}
