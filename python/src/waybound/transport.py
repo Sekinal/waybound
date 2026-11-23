@@ -29,6 +29,7 @@ from waybound.types import (
     TreeSnapshot,
     WebSocketDirection,
     WebSocketOpcode,
+    WindowSummary,
 )
 
 if TYPE_CHECKING:
@@ -172,11 +173,15 @@ class UnixSocketTransport:
         alive = response.get("browser_alive")
         return version, alive if isinstance(alive, bool) else None
 
-    def snapshot_tree(self, *, max_nodes: int | None = None) -> list[AccessibilityNode]:
+    def snapshot_tree(
+        self, *, max_nodes: int | None = None, window_id: int | None = None
+    ) -> list[AccessibilityNode]:
         """Fetch the current accessibility tree from the daemon."""
-        return self.snapshot_tree_with_meta(max_nodes=max_nodes).nodes
+        return self.snapshot_tree_with_meta(max_nodes=max_nodes, window_id=window_id).nodes
 
-    def snapshot_tree_with_meta(self, *, max_nodes: int | None = None) -> TreeSnapshot:
+    def snapshot_tree_with_meta(
+        self, *, max_nodes: int | None = None, window_id: int | None = None
+    ) -> TreeSnapshot:
         """Fetch the current accessibility tree along with truncation metadata."""
         payload: dict[str, object] = {"method": "snapshot_tree"}
         if max_nodes is not None:
@@ -184,7 +189,7 @@ class UnixSocketTransport:
                 msg = f"max_nodes must be a positive integer, got {max_nodes}"
                 raise ValueError(msg)
             payload["max_nodes"] = max_nodes
-        response = self._request(payload)
+        response = self._request(_with_window_id(payload, window_id))
         raw_nodes = response.get("nodes")
         if not isinstance(raw_nodes, list):
             msg = f"unexpected tree response: {response!r}"
@@ -194,33 +199,46 @@ class UnixSocketTransport:
         truncated = response.get("truncated") is True
         return TreeSnapshot(nodes=nodes, truncated=truncated)
 
-    def locate_all(self, query: LocatorQuery) -> list[AccessibilityNode]:
+    def locate_all(
+        self, query: LocatorQuery, *, window_id: int | None = None
+    ) -> list[AccessibilityNode]:
         """Return all accessibility nodes matching `query`."""
-        response = self._request({"method": "locate_all", "query": _encode_query(query)})
+        response = self._request(
+            _with_window_id({"method": "locate_all", "query": _encode_query(query)}, window_id)
+        )
         raw_nodes = response.get("nodes")
         if not isinstance(raw_nodes, list):
             msg = f"unexpected locate_all response: {response!r}"
             raise WayboundDaemonError("protocol_error", msg)
         return [_parse_node(item) for item in raw_nodes if isinstance(item, dict)]
 
-    def current_url(self) -> str | None:
+    def current_url(self, *, window_id: int | None = None) -> str | None:
         """Return the active tab URL from the daemon, if available."""
-        response = self._request({"method": "current_url"})
+        response = self._request(_with_window_id({"method": "current_url"}, window_id))
         url = response.get("url")
         if url is None or isinstance(url, str):
             return url
         msg = f"unexpected current_url response: {response!r}"
         raise WayboundDaemonError("protocol_error", msg)
 
-    def wait_for(self, query: LocatorQuery, *, timeout_ms: int = 10_000) -> AccessibilityNode:
+    def wait_for(
+        self,
+        query: LocatorQuery,
+        *,
+        timeout_ms: int = 10_000,
+        window_id: int | None = None,
+    ) -> AccessibilityNode:
         """Poll until an element matching `query` appears or `timeout_ms` elapses."""
         clamped_ms = max(0, timeout_ms)
         response = self._request(
-            {
-                "method": "wait_for",
-                "query": _encode_query(query),
-                "timeout_ms": clamped_ms,
-            },
+            _with_window_id(
+                {
+                    "method": "wait_for",
+                    "query": _encode_query(query),
+                    "timeout_ms": clamped_ms,
+                },
+                window_id,
+            ),
             timeout_override_s=max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0),
         )
         raw_node = response.get("node")
@@ -228,6 +246,31 @@ class UnixSocketTransport:
             msg = f"unexpected wait_for response: {response!r}"
             raise WayboundDaemonError("protocol_error", msg)
         return _parse_node(raw_node)
+
+    def list_windows(self) -> list[WindowSummary]:
+        """Return open browser windows tracked by the active backend."""
+        response = self._request({"method": "list_windows"})
+        raw_windows = response.get("windows")
+        if response.get("status") != "windows" or not isinstance(raw_windows, list):
+            msg = f"unexpected list_windows response: {response!r}"
+            raise WayboundDaemonError("protocol_error", msg)
+        return [_parse_window_summary(item) for item in raw_windows if isinstance(item, dict)]
+
+    def new_window(self, url: str | None = None, *, incognito: bool = False) -> WindowSummary:
+        """Open a new browser window in the active session, optionally navigating to `url`."""
+        response = self._request(
+            {"method": "new_window", "url": url, "incognito": incognito},
+        )
+        raw_window = response.get("window")
+        if response.get("status") != "window" or not isinstance(raw_window, dict):
+            msg = f"unexpected new_window response: {response!r}"
+            raise WayboundDaemonError("protocol_error", msg)
+        return _parse_window_summary(raw_window)
+
+    def close_window(self, window_id: int) -> None:
+        """Request that the browser cleanly close the window identified by `window_id`."""
+        _validate_window_id(window_id)
+        self._expect_ok({"method": "close_window", "window_id": window_id}, "close_window")
 
     def shutdown(self) -> None:
         """Request a graceful daemon shutdown so RAII browser & socket guards run."""
@@ -294,17 +337,26 @@ class UnixSocketTransport:
             raise WayboundDaemonError("protocol_error", msg)
         return _parse_http_response(raw_resp)
 
-    def hover(self, query: LocatorQuery) -> None:
+    def hover(self, query: LocatorQuery, *, window_id: int | None = None) -> None:
         """Locate the target element and move the pointer over it without clicking."""
-        self._expect_ok({"method": "hover", "query": _encode_query(query)}, "hover")
+        self._expect_ok(
+            _with_window_id({"method": "hover", "query": _encode_query(query)}, window_id),
+            "hover",
+        )
 
-    def click(self, query: LocatorQuery) -> None:
+    def click(self, query: LocatorQuery, *, window_id: int | None = None) -> None:
         """Locate the target element and dispatch a native click."""
-        self._expect_ok({"method": "click", "query": _encode_query(query)}, "click")
+        self._expect_ok(
+            _with_window_id({"method": "click", "query": _encode_query(query)}, window_id),
+            "click",
+        )
 
-    def dblclick(self, query: LocatorQuery) -> None:
+    def dblclick(self, query: LocatorQuery, *, window_id: int | None = None) -> None:
         """Locate the target element and dispatch a native double-click."""
-        self._expect_ok({"method": "dbl_click", "query": _encode_query(query)}, "dblclick")
+        self._expect_ok(
+            _with_window_id({"method": "dbl_click", "query": _encode_query(query)}, window_id),
+            "dblclick",
+        )
 
     def select_option(
         self,
@@ -312,15 +364,19 @@ class UnixSocketTransport:
         *,
         label: str | None = None,
         index: int | None = None,
+        window_id: int | None = None,
     ) -> None:
         """Select an option from a `<select>` or combobox by label or 0-based index."""
         self._expect_ok(
-            {
-                "method": "select_option",
-                "query": _encode_query(query),
-                "label": label,
-                "index": index,
-            },
+            _with_window_id(
+                {
+                    "method": "select_option",
+                    "query": _encode_query(query),
+                    "label": label,
+                    "index": index,
+                },
+                window_id,
+            ),
             "select_option",
         )
 
@@ -337,15 +393,19 @@ class UnixSocketTransport:
             timeout_override_s=max(self._base_timeout_s, clamped_ms / 1000.0 + 5.0),
         )
 
-    def fill(self, query: LocatorQuery, text: str) -> None:
+    def fill(self, query: LocatorQuery, text: str, *, window_id: int | None = None) -> None:
         """Focus the target element and type text via native keyboard events."""
         self._expect_ok(
-            {"method": "fill", "query": _encode_query(query), "text": text},
+            _with_window_id(
+                {"method": "fill", "query": _encode_query(query), "text": text}, window_id
+            ),
             "fill",
             timeout_override_s=self._base_timeout_s + _FILL_SECONDS_PER_CHAR * len(text),
         )
 
-    def set_checked(self, query: LocatorQuery, *, checked: bool) -> AccessibilityNode:
+    def set_checked(
+        self, query: LocatorQuery, *, checked: bool, window_id: int | None = None
+    ) -> AccessibilityNode:
         """Idempotently drive a checkbox/radio/switch to `checked`; return the re-read node.
 
         The daemon auto-waits for the element (and for it to become enabled when a click is
@@ -354,7 +414,10 @@ class UnixSocketTransport:
         when the state differs, and verifies the new state.
         """
         response = self._request(
-            {"method": "set_checked", "query": _encode_query(query), "checked": checked},
+            _with_window_id(
+                {"method": "set_checked", "query": _encode_query(query), "checked": checked},
+                window_id,
+            ),
             timeout_override_s=self._base_timeout_s + _SET_CHECKED_WAIT_S,
         )
         raw_node = response.get("node")
@@ -363,41 +426,43 @@ class UnixSocketTransport:
             raise WayboundDaemonError("protocol_error", msg)
         return _parse_node(raw_node)
 
-    def navigate(self, url: str) -> None:
+    def navigate(self, url: str, *, window_id: int | None = None) -> None:
         """Navigate the active browser tab to `url`."""
-        self._expect_ok({"method": "navigate", "url": url}, "navigate")
+        self._expect_ok(_with_window_id({"method": "navigate", "url": url}, window_id), "navigate")
 
-    def reload(self) -> None:
+    def reload(self, *, window_id: int | None = None) -> None:
         """Reload the active browser tab via native OS shortcut."""
-        self._expect_ok({"method": "reload"}, "reload")
+        self._expect_ok(_with_window_id({"method": "reload"}, window_id), "reload")
 
-    def go_back(self) -> None:
+    def go_back(self, *, window_id: int | None = None) -> None:
         """Navigate back in browser history via native OS shortcut."""
-        self._expect_ok({"method": "go_back"}, "go_back")
+        self._expect_ok(_with_window_id({"method": "go_back"}, window_id), "go_back")
 
-    def go_forward(self) -> None:
+    def go_forward(self, *, window_id: int | None = None) -> None:
         """Navigate forward in browser history via native OS shortcut."""
-        self._expect_ok({"method": "go_forward"}, "go_forward")
+        self._expect_ok(_with_window_id({"method": "go_forward"}, window_id), "go_forward")
 
-    def new_tab(self, url: str | None = None) -> None:
+    def new_tab(self, url: str | None = None, *, window_id: int | None = None) -> None:
         """Open a new browser tab via native OS shortcut, optionally navigating to `url`."""
-        self._expect_ok({"method": "new_tab", "url": url}, "new_tab")
+        self._expect_ok(_with_window_id({"method": "new_tab", "url": url}, window_id), "new_tab")
 
-    def close_tab(self) -> None:
+    def close_tab(self, *, window_id: int | None = None) -> None:
         """Close the active browser tab via native OS shortcut."""
-        self._expect_ok({"method": "close_tab"}, "close_tab")
+        self._expect_ok(_with_window_id({"method": "close_tab"}, window_id), "close_tab")
 
-    def next_tab(self) -> None:
+    def next_tab(self, *, window_id: int | None = None) -> None:
         """Switch to the next browser tab (Ctrl+Tab)."""
-        self._expect_ok({"method": "next_tab"}, "next_tab")
+        self._expect_ok(_with_window_id({"method": "next_tab"}, window_id), "next_tab")
 
-    def prev_tab(self) -> None:
+    def prev_tab(self, *, window_id: int | None = None) -> None:
         """Switch to the previous browser tab (Ctrl+Shift+Tab)."""
-        self._expect_ok({"method": "prev_tab"}, "prev_tab")
+        self._expect_ok(_with_window_id({"method": "prev_tab"}, window_id), "prev_tab")
 
-    def screenshot(self, path: str) -> None:
+    def screenshot(self, path: str, *, window_id: int | None = None) -> None:
         """Capture a native OS PNG screenshot to `path` (browser window on macOS, else screen)."""
-        self._expect_ok({"method": "screenshot", "path": path}, "screenshot")
+        self._expect_ok(
+            _with_window_id({"method": "screenshot", "path": path}, window_id), "screenshot"
+        )
 
     def export_fingerprint(self) -> SessionFingerprint:
         """Export the live TLS, HTTP/2, header, and cookie fingerprint captured from the session."""
@@ -422,37 +487,59 @@ class UnixSocketTransport:
             connections_blocked=_parse_int(raw_stats.get("connections_blocked")),
         )
 
-    def scroll(self, delta_x: float, delta_y: float) -> None:
+    def scroll(self, delta_x: float, delta_y: float, *, window_id: int | None = None) -> None:
         """Emit a native scroll event."""
-        self._expect_ok({"method": "scroll", "delta_x": delta_x, "delta_y": delta_y}, "scroll")
+        self._expect_ok(
+            _with_window_id(
+                {"method": "scroll", "delta_x": delta_x, "delta_y": delta_y}, window_id
+            ),
+            "scroll",
+        )
 
-    def press(self, key: str, *, modifiers: tuple[KeyModifier, ...] = ()) -> None:
+    def press(
+        self,
+        key: str,
+        *,
+        modifiers: tuple[KeyModifier, ...] = (),
+        window_id: int | None = None,
+    ) -> None:
         """Emit a key press (`enter`, `tab`, `escape`, `backspace`, or single char)."""
         encoded_key: object = key.lower() if key.lower() in _NAMED_KEYS else {"char": key}
         if isinstance(encoded_key, dict) and len(key) != 1:
             msg = f"key must be one of {sorted(_NAMED_KEYS)} or a single character, got {key!r}"
             raise ValueError(msg)
         self._expect_ok(
-            {
-                "method": "press",
-                "key": encoded_key,
-                "modifiers": [m.value for m in modifiers],
-            },
+            _with_window_id(
+                {
+                    "method": "press",
+                    "key": encoded_key,
+                    "modifiers": [m.value for m in modifiers],
+                },
+                window_id,
+            ),
             "press",
         )
 
     def drag_to(
-        self, source: LocatorQuery, target: LocatorQuery, *, timeout_ms: int = 5_000
+        self,
+        source: LocatorQuery,
+        target: LocatorQuery,
+        *,
+        timeout_ms: int = 5_000,
+        window_id: int | None = None,
     ) -> None:
         """Press on `source`, drag along a native pointer path to `target`, and release."""
         clamped_ms = max(0, timeout_ms)
         self._expect_ok(
-            {
-                "method": "drag_to",
-                "source": _encode_query(source),
-                "target": _encode_query(target),
-                "timeout_ms": clamped_ms,
-            },
+            _with_window_id(
+                {
+                    "method": "drag_to",
+                    "source": _encode_query(source),
+                    "target": _encode_query(target),
+                    "timeout_ms": clamped_ms,
+                },
+                window_id,
+            ),
             "drag_to",
             # Both element waits run back to back before the drag itself starts.
             timeout_override_s=self._base_timeout_s + _DRAG_WAITED_ELEMENTS * clamped_ms / 1000.0,
@@ -522,6 +609,36 @@ class UnixSocketTransport:
                 if timeout_override_s is not None and self._sock is not None:
                     with contextlib.suppress(OSError):
                         self._sock.settimeout(self._base_timeout_s)
+
+
+def _validate_window_id(window_id: object) -> None:
+    if not isinstance(window_id, int) or isinstance(window_id, bool) or window_id < 0:
+        msg = f"window_id must be a non-negative integer, got {window_id!r}"
+        raise ValueError(msg)
+
+
+def _with_window_id(payload: dict[str, object], window_id: int | None) -> dict[str, object]:
+    if window_id is not None:
+        _validate_window_id(window_id)
+        payload["window_id"] = window_id
+    return payload
+
+
+def _parse_window_summary(item: dict[object, object]) -> WindowSummary:
+    raw_id = item.get("id")
+    if not isinstance(raw_id, int) or isinstance(raw_id, bool) or raw_id < 0:
+        msg = f"expected non-negative integer window id, got {raw_id!r}"
+        raise WayboundDaemonError("protocol_error", msg)
+    raw_title = item.get("title")
+    raw_app_id = item.get("app_id")
+    return WindowSummary(
+        id=raw_id,
+        title=raw_title if isinstance(raw_title, str) else "",
+        app_id=raw_app_id if isinstance(raw_app_id, str) else "",
+        width=_parse_int(item.get("width")),
+        height=_parse_int(item.get("height")),
+        has_buffer=item.get("has_buffer") is True,
+    )
 
 
 def _parse_role(raw: object) -> Role:

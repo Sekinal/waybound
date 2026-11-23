@@ -29,6 +29,8 @@ const MAX_DISPLAY_SCAN = 10_000;
 const XVFB_READY_TIMEOUT_MS = 3_000;
 const DBUS_READY_TIMEOUT_MS = 3_000;
 const XVFB_POLL_INTERVAL_MS = 50;
+const INITIAL_WINDOW_POLL_INTERVAL_MS = 50;
+const DEFAULT_STARTUP_TIMEOUT_MS = 5_000;
 const ATSPI_SETTLE_DELAY_MS = 200;
 const CHILD_STOP_TIMEOUT_MS = 2_000;
 const CHILD_KILL_TIMEOUT_MS = 1_000;
@@ -63,6 +65,11 @@ export interface BrowserPoolOptions {
   readonly maxUsesPerSlot?: number;
   /** Default timeout in milliseconds waiting for a free slot in `acquire()`. Default `60_000`. */
   readonly acquireTimeoutMs?: number;
+  /**
+   * Maximum concurrent stacked browser windows multiplexed per spawned browser host.
+   * Default `1`. Values `> 1` require `displayBackend: "wayland"` on Linux (or `backend: "mock"`).
+   */
+  readonly windowsPerBrowser?: number;
 }
 
 /** Point-in-time observability counters for a `BrowserPool`. */
@@ -537,6 +544,115 @@ class IsolatedDisplayStack {
   }
 }
 
+class BrowserHost {
+  readonly proxy: string | undefined;
+  readonly overrideProxy: boolean;
+  readonly maxWindows: number;
+  readonly readyPromise: Promise<void>;
+  #resolveReady!: () => void;
+  #rejectReady!: (err: unknown) => void;
+  #readySettled = false;
+
+  launchPromise: Promise<void> | null = null;
+  session: Session | null = null;
+  displayStack: IsolatedDisplayStack | null = null;
+  initialWindowId: number | undefined = undefined;
+  initialWindowClaimed = false;
+  pendingOpens = 0;
+  closingWindows = 0;
+  readonly activeSlots = new Set<PoolSlot>();
+  readonly idleSlots: PoolSlot[] = [];
+  retired = false;
+  #closePromise: Promise<void> | null = null;
+
+  constructor(args: {
+    readonly proxy: string | undefined;
+    readonly overrideProxy: boolean;
+    readonly maxWindows: number;
+  }) {
+    this.proxy = args.proxy;
+    this.overrideProxy = args.overrideProxy;
+    this.maxWindows = args.maxWindows;
+    this.readyPromise = new Promise<void>((resolve, reject) => {
+      this.#resolveReady = resolve;
+      this.#rejectReady = reject;
+    });
+    // Prevent unhandled rejection noise if every waiter already left before launch failed.
+    this.readyPromise.catch(() => undefined);
+  }
+
+  get readySettled(): boolean {
+    return this.#readySettled;
+  }
+
+  get openWindowCount(): number {
+    return this.activeSlots.size + this.idleSlots.length;
+  }
+
+  get liveWindowCount(): number {
+    return this.openWindowCount + this.pendingOpens;
+  }
+
+  get capacityUsed(): number {
+    return this.liveWindowCount + this.closingWindows;
+  }
+
+  get inUseCount(): number {
+    return this.activeSlots.size + this.pendingOpens + this.closingWindows;
+  }
+
+  resolveReady(): void {
+    if (!this.#readySettled) {
+      this.#readySettled = true;
+      this.#resolveReady();
+    }
+  }
+
+  rejectReady(err: unknown): void {
+    if (!this.#readySettled) {
+      this.#readySettled = true;
+      this.#rejectReady(err);
+    }
+  }
+
+  async ping(): Promise<string> {
+    if (this.session === null) {
+      throw new Error("browser host is closed");
+    }
+    const health = await this.session.pingHealth(HEALTH_PING_TIMEOUT_MS);
+    if (health.browserAlive === false) {
+      throw new Error("browser host reports its browser is no longer running");
+    }
+    return health.version;
+  }
+
+  close(): Promise<void> {
+    if (!this.#readySettled) {
+      this.retired = true;
+      return this.launchPromise ?? Promise.resolve();
+    }
+    if (this.#closePromise !== null) {
+      return this.#closePromise;
+    }
+    this.#closePromise = (async () => {
+      try {
+        if (this.session !== null) {
+          const s = this.session;
+          this.session = null;
+          await s.close().catch(() => undefined);
+        }
+      } finally {
+        if (this.displayStack !== null) {
+          const stack = this.displayStack;
+          this.displayStack = null;
+          await stack.close().catch(() => undefined);
+        }
+      }
+    })();
+    return this.#closePromise;
+  }
+}
+
 interface PoolSlot {
   readonly page: Page;
   readonly proxy: string | undefined;
@@ -544,8 +660,33 @@ interface PoolSlot {
   uses: number;
   remoteWorker: string | undefined;
   displayNum: number | undefined;
+  readonly host?: BrowserHost;
+  readonly windowId?: number;
   ping(): Promise<string>;
   close(): Promise<void>;
+}
+
+function makeWindowSlot(host: BrowserHost, windowId: number): PoolSlot {
+  if (host.session === null) {
+    throw new Error("browser host has no active session");
+  }
+  const page = new Page(host.session.page.transport, windowId);
+  return {
+    page,
+    proxy: host.proxy,
+    overrideProxy: host.overrideProxy,
+    uses: 0,
+    remoteWorker: undefined,
+    displayNum: undefined,
+    host,
+    windowId,
+    ping(): Promise<string> {
+      return host.ping();
+    },
+    close(): Promise<void> {
+      return page.closeWindow().catch(() => undefined);
+    },
+  };
 }
 
 function makeLocalSlot(args: {
@@ -568,7 +709,11 @@ function makeLocalSlot(args: {
       if (session === null) {
         throw new Error("local slot is closed");
       }
-      return session.ping(HEALTH_PING_TIMEOUT_MS);
+      const health = await session.pingHealth(HEALTH_PING_TIMEOUT_MS);
+      if (health.browserAlive === false) {
+        throw new Error("local slot reports its browser is no longer running");
+      }
+      return health.version;
     },
     async close(): Promise<void> {
       try {
@@ -601,7 +746,11 @@ function makeRemoteSlot(args: { transport: Transport; remoteWorker: string }): P
       if (transport === null) {
         throw new Error("remote slot is closed");
       }
-      return transport.ping(HEALTH_PING_TIMEOUT_MS);
+      const health = await transport.pingHealth(HEALTH_PING_TIMEOUT_MS);
+      if (health.browserAlive === false) {
+        throw new Error("remote worker reports its browser is no longer running");
+      }
+      return health.version;
     },
     async close(): Promise<void> {
       // Never send `shutdown` to remote workers; close only our client socket.
@@ -628,6 +777,7 @@ function createTimeoutError(message: string): Error {
 /** Async pool of isolated local or remote `waybound` browser sessions. */
 export class BrowserPool implements AsyncDisposable {
   readonly #size: number;
+  readonly #windowsPerBrowser: number;
   readonly #launchOptions: LaunchOptions;
   readonly #proxies: readonly string[];
   readonly #isolatedDisplays: boolean;
@@ -642,6 +792,9 @@ export class BrowserPool implements AsyncDisposable {
   readonly #waiters: PermitWaiter[] = [];
   readonly #idle: PoolSlot[] = [];
   readonly #activeSlots = new Set<PoolSlot>();
+  readonly #hosts: BrowserHost[] = [];
+  readonly #retiringHosts = new Set<BrowserHost>();
+  readonly #background = new Set<Promise<void>>();
   readonly #reservedDisplays = new Set<number>();
   #proxyCursor = 0;
   #started = false;
@@ -677,15 +830,51 @@ export class BrowserPool implements AsyncDisposable {
       );
     }
 
-    const resolvedLaunchOptions = options.launchOptions ?? {};
-    if (
-      this.#remoteEndpoints.size === 0 &&
-      resolvedSize > 1 &&
-      resolvedLaunchOptions.profileDir !== undefined
-    ) {
+    const displayBackend = options.displayBackend ?? "xvfb";
+    if (!DISPLAY_BACKENDS.has(displayBackend)) {
       throw new RangeError(
-        "launchOptions.profileDir cannot be set when size > 1 (multiple Chrome slots cannot share one --user-data-dir)",
+        `displayBackend must be 'xvfb' or 'wayland', got ${JSON.stringify(displayBackend)}`,
       );
+    }
+
+    const windowsPerBrowser = options.windowsPerBrowser ?? 1;
+    if (!Number.isInteger(windowsPerBrowser) || windowsPerBrowser < 1) {
+      throw new RangeError(`windowsPerBrowser must be an integer >= 1, got ${windowsPerBrowser}`);
+    }
+
+    const resolvedLaunchOptions = options.launchOptions ?? {};
+    const effectiveBackend = resolvedLaunchOptions.backend ?? "mock";
+    if (windowsPerBrowser > 1) {
+      if (this.#remoteEndpoints.size > 0) {
+        throw new RangeError("windowsPerBrowser > 1 is not supported with remoteWorkers");
+      }
+      if (
+        effectiveBackend !== "mock" &&
+        (displayBackend !== "wayland" || effectiveBackend !== "linux")
+      ) {
+        throw new RangeError(
+          "windowsPerBrowser > 1 requires displayBackend: 'wayland' on Linux (or launchOptions.backend: 'mock')",
+        );
+      }
+      if (effectiveBackend === "linux" && resolvedLaunchOptions.launchChrome !== true) {
+        throw new RangeError(
+          "windowsPerBrowser > 1 with backend: 'linux' requires launchChrome: true",
+        );
+      }
+    }
+
+    const maxHosts = Math.ceil(resolvedSize / windowsPerBrowser);
+    if (this.#remoteEndpoints.size === 0 && resolvedLaunchOptions.profileDir !== undefined) {
+      if (maxHosts > 1) {
+        throw new RangeError(
+          "launchOptions.profileDir cannot be set when size > windowsPerBrowser (multiple Chrome slots cannot share one --user-data-dir)",
+        );
+      }
+      if (options.proxies !== undefined && new Set(options.proxies).size > 1) {
+        throw new RangeError(
+          "launchOptions.profileDir cannot be combined with multiple distinct proxies (multiple Chrome hosts cannot share one --user-data-dir)",
+        );
+      }
     }
     if (
       options.maxUsesPerSlot !== undefined &&
@@ -700,18 +889,13 @@ export class BrowserPool implements AsyncDisposable {
     if (acquireTimeoutMs <= 0) {
       throw new RangeError(`acquireTimeoutMs must be > 0, got ${acquireTimeoutMs}`);
     }
-    const displayBackend = options.displayBackend ?? "xvfb";
-    if (!DISPLAY_BACKENDS.has(displayBackend)) {
-      throw new RangeError(
-        `displayBackend must be 'xvfb' or 'wayland', got ${JSON.stringify(displayBackend)}`,
-      );
-    }
     const displayBase = options.displayBase ?? DEFAULT_DISPLAY_BASE;
     if (!Number.isInteger(displayBase) || displayBase < 0) {
       throw new RangeError(`displayBase must be a non-negative integer, got ${displayBase}`);
     }
 
     this.#size = resolvedSize;
+    this.#windowsPerBrowser = windowsPerBrowser;
     this.#availablePermits = resolvedSize;
     this.#launchOptions = resolvedLaunchOptions;
     this.#proxies = options.proxies !== undefined ? [...options.proxies] : [];
@@ -757,6 +941,18 @@ export class BrowserPool implements AsyncDisposable {
     if (this.#closed) {
       throw new Error("BrowserPool is closed");
     }
+    if (
+      this.#remoteEndpoints.size === 0 &&
+      this.#launchOptions.profileDir !== undefined &&
+      options?.proxy !== undefined
+    ) {
+      const defaultProxy = this.#proxies.length > 0 ? this.#proxies[0] : this.#launchOptions.proxy;
+      if (options.proxy !== defaultProxy) {
+        throw new RangeError(
+          "per-checkout proxy override cannot be used when launchOptions.profileDir is set (multiple Chrome hosts cannot share one --user-data-dir)",
+        );
+      }
+    }
     const timeoutMs =
       options?.timeoutMs !== undefined
         ? checkMs(options.timeoutMs, "timeoutMs")
@@ -775,12 +971,22 @@ export class BrowserPool implements AsyncDisposable {
       const reused = await this.#popHealthyIdle(options?.proxy);
       if (this.#closed) {
         if (reused !== null) {
-          await this.#destroySlot(reused);
+          if (reused.host !== undefined) {
+            reused.host.activeSlots.delete(reused);
+            this.#retireHost(reused.host);
+            if (reused.host.inUseCount === 0 && reused.host.readySettled) {
+              await this.#destroyHost(reused.host);
+            }
+          } else {
+            await this.#destroySlot(reused);
+          }
         }
         throw new Error("BrowserPool is closed");
       }
       if (reused !== null) {
         slot = reused;
+      } else if (this.#windowsPerBrowser > 1) {
+        slot = await this.#acquireStackedWindow(options?.proxy);
       } else {
         try {
           slot = await this.#launchSlot(options?.proxy);
@@ -794,6 +1000,7 @@ export class BrowserPool implements AsyncDisposable {
         }
       }
       this.#activeSlots.add(slot);
+      slot.host?.activeSlots.add(slot);
       slot.uses += 1;
     } catch (err) {
       this.#releasePermit();
@@ -843,6 +1050,7 @@ export class BrowserPool implements AsyncDisposable {
   /** Close all idle and active browser slots and terminate any isolated display stacks. */
   async close(): Promise<void> {
     if (this.#closed) {
+      await this.#waitForBackground();
       return;
     }
     this.#closed = true;
@@ -856,11 +1064,36 @@ export class BrowserPool implements AsyncDisposable {
       }
     }
 
-    const slots: PoolSlot[] = [...this.#idle, ...this.#activeSlots];
+    const slots: PoolSlot[] = [
+      ...this.#idle.filter((s) => s.host === undefined),
+      ...[...this.#activeSlots].filter((s) => s.host === undefined),
+    ];
     this.#idle.length = 0;
     this.#activeSlots.clear();
 
-    await Promise.allSettled(slots.map((slot) => this.#destroySlot(slot)));
+    const hosts = [...this.#hosts.splice(0, this.#hosts.length), ...this.#retiringHosts];
+    const seenHosts = new Set<BrowserHost>();
+    for (const host of hosts) {
+      if (seenHosts.has(host)) {
+        continue;
+      }
+      seenHosts.add(host);
+      host.retired = true;
+      host.idleSlots.length = 0;
+      host.activeSlots.clear();
+      if (host.readySettled) {
+        if (host.session !== null || host.displayStack !== null) {
+          this.#trackBackground(this.#destroyHost(host));
+        } else {
+          this.#retiringHosts.delete(host);
+        }
+      }
+    }
+
+    await Promise.allSettled([
+      ...slots.map((slot) => this.#destroySlot(slot)),
+      this.#waitForBackground(),
+    ]);
   }
 
   async [Symbol.asyncDispose](): Promise<void> {
@@ -942,7 +1175,76 @@ export class BrowserPool implements AsyncDisposable {
     }
   }
 
+  #trackBackground(promise: Promise<void>): void {
+    const tracked = promise.catch(() => undefined);
+    this.#background.add(tracked);
+    void tracked.finally(() => {
+      this.#background.delete(tracked);
+    });
+  }
+
+  async #waitForBackground(): Promise<void> {
+    while (this.#background.size > 0) {
+      await Promise.allSettled([...this.#background]);
+    }
+  }
+
+  async #destroyHost(host: BrowserHost): Promise<void> {
+    if (!host.readySettled) {
+      host.retired = true;
+      this.#retiringHosts.add(host);
+      await (host.launchPromise ?? Promise.resolve());
+      return;
+    }
+    const p = host.close();
+    this.#trackBackground(p);
+    try {
+      await p;
+    } finally {
+      this.#retiringHosts.delete(host);
+    }
+  }
+
+  #closePageWithReservation(page: Page, host: BrowserHost): void {
+    host.closingWindows += 1;
+    const p = page
+      .closeWindow()
+      .catch(() => undefined)
+      .finally(() => {
+        host.closingWindows -= 1;
+        if ((this.#closed || host.retired) && host.inUseCount === 0 && host.readySettled) {
+          this.#trackBackground(this.#destroyHost(host));
+        }
+      });
+    this.#trackBackground(p);
+  }
+
+  #retireHost(host: BrowserHost): void {
+    host.retired = true;
+    const hostIdx = this.#hosts.indexOf(host);
+    if (hostIdx !== -1) {
+      this.#hosts.splice(hostIdx, 1);
+    }
+    if (host.idleSlots.length > 0) {
+      const stale = new Set(host.idleSlots);
+      host.idleSlots.length = 0;
+      for (let i = this.#idle.length - 1; i >= 0; i -= 1) {
+        const item = this.#idle[i];
+        if (item !== undefined && stale.has(item)) {
+          this.#idle.splice(i, 1);
+        }
+      }
+    }
+    this.#retiringHosts.add(host);
+    if (host.inUseCount === 0 && host.readySettled) {
+      this.#trackBackground(this.#destroyHost(host));
+    }
+  }
+
   async #popHealthyIdle(proxy: string | undefined): Promise<PoolSlot | null> {
+    if (this.#windowsPerBrowser > 1) {
+      return this.#popHealthyIdleStacked(proxy);
+    }
     while (this.#idle.length > 0) {
       let slot: PoolSlot | undefined;
       if (proxy !== undefined) {
@@ -981,6 +1283,311 @@ export class BrowserPool implements AsyncDisposable {
       return slot;
     }
     return null;
+  }
+
+  #takeMatchingIdleStacked(proxy: string | undefined): PoolSlot | null {
+    for (let i = 0; i < this.#idle.length; i += 1) {
+      const candidate = this.#idle[i];
+      if (candidate === undefined) {
+        continue;
+      }
+      const host = candidate.host;
+      if (host === undefined || host.retired) {
+        continue;
+      }
+      const matches = proxy !== undefined ? candidate.proxy === proxy : !host.overrideProxy;
+      if (matches) {
+        this.#idle.splice(i, 1);
+        const hIdx = host.idleSlots.indexOf(candidate);
+        if (hIdx !== -1) {
+          host.idleSlots.splice(hIdx, 1);
+        }
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  async #popHealthyIdleStacked(proxy: string | undefined): Promise<PoolSlot | null> {
+    while (this.#idle.length > 0) {
+      const slot = this.#takeMatchingIdleStacked(proxy);
+      if (slot === null) {
+        return null;
+      }
+      const host = slot.host;
+      if (host === undefined) {
+        continue;
+      }
+      host.activeSlots.add(slot);
+      try {
+        await slot.ping();
+      } catch {
+        host.activeSlots.delete(slot);
+        this.#failed += 1;
+        this.#recycled += 1;
+        this.#retireHost(host);
+        continue;
+      }
+      if (this.#closed || host.retired) {
+        host.activeSlots.delete(slot);
+        if (host.inUseCount === 0 && host.readySettled) {
+          await this.#destroyHost(host);
+        }
+        if (this.#closed) {
+          return null;
+        }
+        continue;
+      }
+      return slot;
+    }
+    return null;
+  }
+
+  #findHostWithCapacity(proxy: string | undefined): BrowserHost | null {
+    for (const host of this.#hosts) {
+      if (host.retired || host.overrideProxy) {
+        continue;
+      }
+      if (host.capacityUsed >= host.maxWindows) {
+        continue;
+      }
+      if (proxy !== undefined && host.proxy !== proxy) {
+        continue;
+      }
+      return host;
+    }
+    return null;
+  }
+
+  async #waitForInitialWindow(session: Session, host: BrowserHost): Promise<number | undefined> {
+    let windows = await session.page.listWindows();
+    if (windows.length > 0 && windows[0] !== undefined) {
+      return windows[0].id;
+    }
+
+    const effectiveBackend = this.#launchOptions.backend ?? "mock";
+    if (this.#launchOptions.launchChrome === true && effectiveBackend !== "mock") {
+      const timeoutMs = checkMs(
+        this.#launchOptions.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS,
+        "startupTimeoutMs",
+      );
+      const deadline = performance.now() + timeoutMs;
+      while (performance.now() < deadline) {
+        if (this.#closed || host.retired) {
+          return undefined;
+        }
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) {
+          break;
+        }
+        const health = await session.pingHealth(HEALTH_PING_TIMEOUT_MS);
+        if (health.browserAlive === false) {
+          throw new Error("browser host exited while waiting for initial window");
+        }
+        await sleep(Math.min(INITIAL_WINDOW_POLL_INTERVAL_MS, remaining));
+        if (this.#closed || host.retired) {
+          return undefined;
+        }
+        windows = await session.page.listWindows();
+        if (windows.length > 0 && windows[0] !== undefined) {
+          return windows[0].id;
+        }
+      }
+    }
+
+    if (this.#closed || host.retired) {
+      return undefined;
+    }
+    const opened = await session.page.newPage();
+    if (opened.windowId === undefined) {
+      throw new Error("newPage() returned an unscoped Page");
+    }
+    return opened.windowId;
+  }
+
+  #startHostLaunch(host: BrowserHost): void {
+    const useWayland = this.#displayBackend === "wayland";
+    const useIsolated = this.#isolatedDisplays && process.platform === "linux";
+
+    const run = (async () => {
+      let displayStack: IsolatedDisplayStack | null = null;
+      let session: Session | null = null;
+      try {
+        let slotOptions: LaunchOptions =
+          host.proxy !== undefined
+            ? { ...this.#launchOptions, proxy: host.proxy }
+            : { ...this.#launchOptions };
+
+        if (useWayland) {
+          if (useIsolated) {
+            displayStack = await IsolatedDisplayStack.startWaylandDbus();
+          }
+          const { display: _omitDisplay, ...withoutDisplay } = slotOptions;
+          slotOptions = {
+            ...withoutDisplay,
+            headlessXvfb: false,
+            headlessWayland: true,
+            ...(displayStack !== null
+              ? { extraEnv: { ...slotOptions.extraEnv, ...displayStack.env } }
+              : {}),
+          };
+        }
+
+        session = await launch(slotOptions);
+        const initialWid = await this.#waitForInitialWindow(session, host);
+
+        host.session = session;
+        host.displayStack = displayStack;
+        host.initialWindowId = initialWid;
+        session = null;
+        displayStack = null;
+        this.#launched += 1;
+
+        if (this.#closed || host.retired || initialWid === undefined) {
+          host.retired = true;
+          const idx = this.#hosts.indexOf(host);
+          if (idx !== -1) {
+            this.#hosts.splice(idx, 1);
+          }
+          this.#retiringHosts.add(host);
+          host.rejectReady(new Error("BrowserPool is closed"));
+          await this.#destroyHost(host);
+          return;
+        }
+
+        host.resolveReady();
+      } catch (err) {
+        if (session !== null) {
+          await session.close().catch(() => undefined);
+        }
+        if (displayStack !== null) {
+          await displayStack.close().catch(() => undefined);
+        }
+        host.retired = true;
+        const idx = this.#hosts.indexOf(host);
+        if (idx !== -1) {
+          this.#hosts.splice(idx, 1);
+        }
+        this.#retiringHosts.delete(host);
+        this.#failed += 1;
+        host.rejectReady(err);
+      }
+    })();
+
+    host.launchPromise = run;
+    this.#trackBackground(run);
+  }
+
+  async #acquireStackedWindow(proxy: string | undefined): Promise<PoolSlot> {
+    let evictedOnce = false;
+    for (;;) {
+      if (this.#closed) {
+        throw new Error("BrowserPool is closed");
+      }
+
+      let host = this.#findHostWithCapacity(proxy);
+      if (host === null) {
+        const { proxy: effectiveProxy, overrideProxy } = this.#nextProxy(proxy);
+        if (proxy !== undefined && !evictedOnce) {
+          let evicted = false;
+          for (const candidate of [...this.#hosts]) {
+            if (
+              candidate.readySettled &&
+              candidate.inUseCount === 0 &&
+              candidate.proxy !== effectiveProxy
+            ) {
+              this.#recycled += 1;
+              this.#retireHost(candidate);
+              await this.#destroyHost(candidate);
+              evicted = true;
+              evictedOnce = true;
+              break;
+            }
+          }
+          if (this.#closed) {
+            throw new Error("BrowserPool is closed");
+          }
+          if (evicted) {
+            continue;
+          }
+        }
+        host = new BrowserHost({
+          proxy: effectiveProxy,
+          overrideProxy,
+          maxWindows: overrideProxy ? 1 : this.#windowsPerBrowser,
+        });
+        host.pendingOpens = 1;
+        this.#hosts.push(host);
+        this.#startHostLaunch(host);
+      } else {
+        host.pendingOpens += 1;
+      }
+
+      try {
+        await host.readyPromise;
+      } catch (err) {
+        host.pendingOpens -= 1;
+        if (host.retired && host.inUseCount === 0 && host.readySettled) {
+          this.#trackBackground(this.#destroyHost(host));
+        }
+        throw err;
+      }
+
+      if (this.#closed) {
+        host.pendingOpens -= 1;
+        if (host.inUseCount === 0 && host.readySettled) {
+          this.#retireHost(host);
+          await this.#destroyHost(host);
+        }
+        throw new Error("BrowserPool is closed");
+      }
+
+      if (host.retired || host.session === null) {
+        host.pendingOpens -= 1;
+        if (host.inUseCount === 0 && host.readySettled) {
+          this.#retireHost(host);
+        }
+        continue;
+      }
+
+      if (!host.initialWindowClaimed && host.initialWindowId !== undefined) {
+        host.initialWindowClaimed = true;
+        const wid = host.initialWindowId;
+        host.pendingOpens -= 1;
+        return makeWindowSlot(host, wid);
+      }
+
+      let openedPage: Page;
+      try {
+        openedPage = await host.session.page.newPage();
+      } catch (err) {
+        host.pendingOpens -= 1;
+        this.#failed += 1;
+        this.#retireHost(host);
+        throw err;
+      }
+
+      host.pendingOpens -= 1;
+      if (this.#closed || host.retired || host.session === null) {
+        if (host.inUseCount === 0 && host.readySettled) {
+          await this.#destroyHost(host);
+        } else if (!this.#closed && host.session !== null && openedPage.windowId !== undefined) {
+          this.#closePageWithReservation(openedPage, host);
+        }
+        if (this.#closed) {
+          throw new Error("BrowserPool is closed");
+        }
+        continue;
+      }
+
+      if (openedPage.windowId === undefined) {
+        this.#failed += 1;
+        this.#retireHost(host);
+        throw new Error("newPage() returned an unscoped Page");
+      }
+
+      return makeWindowSlot(host, openedPage.windowId);
+    }
   }
 
   async #launchSlot(proxy: string | undefined): Promise<PoolSlot> {
@@ -1084,6 +1691,11 @@ export class BrowserPool implements AsyncDisposable {
   }
 
   async #returnOrRecycle(slot: PoolSlot, forceRecycle: boolean): Promise<void> {
+    if (slot.host !== undefined) {
+      await this.#returnOrRecycleStacked(slot, slot.host, forceRecycle);
+      return;
+    }
+
     if (this.#closed) {
       await this.#destroySlot(slot);
       return;
@@ -1110,6 +1722,98 @@ export class BrowserPool implements AsyncDisposable {
       return;
     }
 
+    this.#idle.push(slot);
+  }
+
+  async #recycleStackedWindow(slot: PoolSlot, host: BrowserHost): Promise<void> {
+    this.#recycled += 1;
+    if (host.openWindowCount === 0) {
+      this.#retireHost(host);
+      if (host.inUseCount === 0 && host.readySettled) {
+        await this.#destroyHost(host);
+      }
+      return;
+    }
+
+    host.closingWindows += 1;
+    try {
+      await slot.close();
+      if (this.#closed || host.retired || host.openWindowCount === 0) {
+        if (host.openWindowCount === 0 && !host.retired) {
+          this.#retireHost(host);
+        }
+        return;
+      }
+      try {
+        await host.ping();
+      } catch {
+        this.#failed += 1;
+        this.#retireHost(host);
+        return;
+      }
+    } finally {
+      host.closingWindows -= 1;
+      if ((this.#closed || host.retired) && host.inUseCount === 0 && host.readySettled) {
+        await this.#destroyHost(host);
+      }
+    }
+  }
+
+  async #returnOrRecycleStacked(
+    slot: PoolSlot,
+    host: BrowserHost,
+    forceRecycle: boolean,
+  ): Promise<void> {
+    if (this.#closed || host.overrideProxy) {
+      host.activeSlots.delete(slot);
+      if (host.overrideProxy && !this.#closed) {
+        this.#recycled += 1;
+      }
+      this.#retireHost(host);
+      if (host.inUseCount === 0 && host.readySettled) {
+        await this.#destroyHost(host);
+      }
+      return;
+    }
+
+    if (host.retired) {
+      host.activeSlots.delete(slot);
+      this.#recycled += 1;
+      if (host.inUseCount === 0 && host.readySettled) {
+        await this.#destroyHost(host);
+      }
+      return;
+    }
+
+    const reachedMaxUses = this.#maxUsesPerSlot !== undefined && slot.uses >= this.#maxUsesPerSlot;
+    if (forceRecycle || reachedMaxUses) {
+      host.activeSlots.delete(slot);
+      await this.#recycleStackedWindow(slot, host);
+      return;
+    }
+
+    try {
+      await slot.ping();
+    } catch {
+      host.activeSlots.delete(slot);
+      this.#failed += 1;
+      this.#recycled += 1;
+      this.#retireHost(host);
+      if (host.inUseCount === 0 && host.readySettled) {
+        await this.#destroyHost(host);
+      }
+      return;
+    }
+
+    host.activeSlots.delete(slot);
+    if (this.#closed || host.retired) {
+      if (host.inUseCount === 0 && host.readySettled) {
+        await this.#destroyHost(host);
+      }
+      return;
+    }
+
+    host.idleSlots.push(slot);
     this.#idle.push(slot);
   }
 }

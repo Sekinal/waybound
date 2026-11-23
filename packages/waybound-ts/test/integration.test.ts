@@ -485,4 +485,59 @@ describe("launch() against misbehaving endpoints", { skip: process.platform === 
       await session.close();
     }
   });
+
+  it("supports listWindows, newPage, isolated windowId routing, and closeWindow", async () => {
+    const session = await launch({ backend: "mock", daemonBinary: DAEMON_BIN });
+    try {
+      const root = session.page;
+      assert.equal(root.windowId, undefined);
+
+      const initial = await root.listWindows();
+      assert.equal(initial.length, 1);
+      assert.equal(initial[0]?.id, 1);
+      assert.equal(initial[0]?.hasBuffer, true);
+
+      const win2 = await root.newPage({ url: "https://win2.example/home" });
+      const win3 = await root.newPage({ url: "https://win3.example/home", incognito: true });
+      assert.ok(win2.windowId !== undefined);
+      assert.ok(win3.windowId !== undefined);
+      assert.notEqual(win2.windowId, win3.windowId);
+
+      const listed = await root.listWindows();
+      assert.deepEqual(
+        listed.map((w) => w.id).sort((a, b) => a - b),
+        [1, win2.windowId, win3.windowId].sort((a, b) => a - b),
+      );
+      const incSummary = listed.find((w) => w.id === win3.windowId);
+      assert.ok(incSummary?.title.includes("Incognito"));
+
+      assert.equal(await root.url(), "https://mock.waybound.local/");
+      assert.equal(await win2.url(), "https://win2.example/home");
+      assert.equal(await win3.url(), "https://win3.example/home");
+
+      assert.equal((await win2.snapshotTree()).length, 5);
+      await win2.getByRole(Role.BUTTON, { name: "Search" }).click();
+      await win3.getByRole(Role.TEXTBOX, { name: "Origin" }).fill("LAX");
+
+      await win2.closeWindow();
+      assert.deepEqual(
+        (await root.listWindows()).map((w) => w.id).sort((a, b) => a - b),
+        [1, win3.windowId].sort((a, b) => a - b),
+      );
+
+      await assert.rejects(
+        () => win2.url(),
+        (err: unknown) => err instanceof WayboundDaemonError && err.code === "element_not_found",
+      );
+      assert.equal(await win3.url(), "https://win3.example/home");
+
+      await win3.closeWindow();
+      assert.deepEqual(
+        (await root.listWindows()).map((w) => w.id),
+        [1],
+      );
+    } finally {
+      await session.close();
+    }
+  });
 });

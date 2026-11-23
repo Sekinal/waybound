@@ -1,5 +1,6 @@
 //! Deterministic in-memory driver for hermetic IPC and SDK testing.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -7,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use waybound_core::{
     AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, MouseButton, Point, Result, Role,
-    WayboundError,
+    WayboundError, WindowSummary,
 };
 
 /// Minimal valid 1x1 transparent PNG bytes for hermetic screenshot tests.
@@ -25,9 +26,13 @@ const ONE_BY_ONE_PNG: &[u8] = &[
 /// `check()` / `uncheck()` can be exercised end to end. Tests can additionally make clicks
 /// inert, hide the tree for a few snapshots after a click, enable a node after a number of
 /// snapshots, or rename a node when it toggles.
+#[derive(Clone)]
 pub struct MockDriver {
-    state: Mutex<MockState>,
-    events: Mutex<Vec<InputEvent>>,
+    state: Arc<Mutex<MockState>>,
+    events: Arc<Mutex<Vec<InputEvent>>>,
+    windows: Arc<Mutex<MockWindows>>,
+    /// Target window ID when created via [`Driver::for_window`].
+    scoped_window: Option<u64>,
     /// When set, the `n`-th (0-based) [`InputEvent::PointerDrag`] fails instead of being
     /// recorded, to exercise cleanup paths in the middle of a drag.
     fail_drag_at: Option<usize>,
@@ -40,7 +45,32 @@ pub struct MockDriver {
     /// simulate a daemon shutdown arriving mid-drag.
     raise_on_drag: Option<Arc<AtomicBool>>,
     /// Number of [`Driver::cancel_pointer_gesture`] calls (aborted drags).
-    cancels: AtomicUsize,
+    cancels: Arc<AtomicUsize>,
+}
+
+struct MockWindows {
+    next_id: u64,
+    windows: Vec<WindowSummary>,
+    urls: HashMap<u64, String>,
+    scoped_events: Vec<(Option<u64>, InputEvent)>,
+}
+
+impl Default for MockWindows {
+    fn default() -> Self {
+        Self {
+            next_id: 2,
+            windows: vec![WindowSummary {
+                id: 1,
+                title: "Mock Window 1".to_owned(),
+                app_id: "google-chrome".to_owned(),
+                width: 1920,
+                height: 1080,
+                has_buffer: true,
+            }],
+            urls: HashMap::new(),
+            scoped_events: Vec::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -130,16 +160,18 @@ impl MockDriver {
     #[must_use]
     pub fn with_nodes(nodes: Vec<AccessibilityNode>) -> Self {
         Self {
-            state: Mutex::new(MockState {
+            state: Arc::new(Mutex::new(MockState {
                 nodes,
                 ..MockState::default()
-            }),
-            events: Mutex::new(Vec::new()),
+            })),
+            events: Arc::new(Mutex::new(Vec::new())),
+            windows: Arc::new(Mutex::new(MockWindows::default())),
+            scoped_window: None,
             fail_drag_at: None,
             fail_press: false,
             viewport: None,
             raise_on_drag: None,
-            cancels: AtomicUsize::new(0),
+            cancels: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -242,6 +274,14 @@ impl MockDriver {
             .map_or_else(|_| Vec::new(), |g| g.clone())
     }
 
+    /// Returns every `(window_id, InputEvent)` dispatched to this driver so far.
+    #[cfg(test)]
+    pub fn recorded_scoped_events(&self) -> Vec<(Option<u64>, InputEvent)> {
+        self.windows
+            .lock()
+            .map_or_else(|_| Vec::new(), |g| g.scoped_events.clone())
+    }
+
     /// Toggles the checked state of the enabled checkable node under the pointer, if any.
     fn click(&self) {
         let Ok(mut guard) = self.state.lock() else {
@@ -313,7 +353,84 @@ impl Driver for MockDriver {
     }
 
     fn current_url(&self) -> Result<Option<String>> {
+        if let Some(wid) = self.scoped_window
+            && let Ok(guard) = self.windows.lock()
+            && let Some(url) = guard.urls.get(&wid)
+        {
+            return Ok(Some(url.clone()));
+        }
         Ok(Some("https://mock.waybound.local/".to_owned()))
+    }
+
+    fn for_window(&self, window_id: u64) -> Option<Arc<dyn Driver>> {
+        let exists = self
+            .windows
+            .lock()
+            .is_ok_and(|g| g.windows.iter().any(|w| w.id == window_id));
+        if !exists {
+            return None;
+        }
+        Some(Arc::new(Self {
+            scoped_window: Some(window_id),
+            ..self.clone()
+        }))
+    }
+
+    fn list_windows(&self) -> Result<Vec<WindowSummary>> {
+        Ok(self
+            .windows
+            .lock()
+            .map_or_else(|_| Vec::new(), |g| g.windows.clone()))
+    }
+
+    fn close_window(&self, window_id: u64) -> Result<()> {
+        let mut guard = self
+            .windows
+            .lock()
+            .map_err(|_| WayboundError::BackendUnavailable {
+                backend: "mock".to_owned(),
+                reason: "mock window lock poisoned".to_owned(),
+            })?;
+        let Some(pos) = guard.windows.iter().position(|w| w.id == window_id) else {
+            return Err(WayboundError::ElementNotFound {
+                query: format!("window {window_id}"),
+            });
+        };
+        let _ = guard.windows.remove(pos);
+        let _ = guard.urls.remove(&window_id);
+        drop(guard);
+        Ok(())
+    }
+
+    fn open_window(&self, url: Option<&str>, incognito: bool) -> Result<Option<WindowSummary>> {
+        let mut guard = self
+            .windows
+            .lock()
+            .map_err(|_| WayboundError::BackendUnavailable {
+                backend: "mock".to_owned(),
+                reason: "mock window lock poisoned".to_owned(),
+            })?;
+        let id = guard.next_id;
+        guard.next_id = guard.next_id.saturating_add(1);
+        let title = if incognito {
+            format!("Mock Window {id} (Incognito)")
+        } else {
+            format!("Mock Window {id}")
+        };
+        let summary = WindowSummary {
+            id,
+            title,
+            app_id: "google-chrome".to_owned(),
+            width: 1920,
+            height: 1080,
+            has_buffer: true,
+        };
+        guard.windows.push(summary.clone());
+        if let Some(dest) = url {
+            let _ = guard.urls.insert(id, dest.to_owned());
+        }
+        drop(guard);
+        Ok(Some(summary))
     }
 
     fn cancel_pointer_gesture(&self, button: MouseButton) -> Result<()> {
@@ -363,6 +480,11 @@ impl Driver for MockDriver {
                 }
             }
             guard.push(event.clone());
+        }
+        if let Ok(mut guard) = self.windows.lock() {
+            guard
+                .scoped_events
+                .push((self.scoped_window, event.clone()));
         }
         if let (InputEvent::PointerDrag { .. }, Some(flag)) = (event, &self.raise_on_drag) {
             flag.store(true, Ordering::Release);

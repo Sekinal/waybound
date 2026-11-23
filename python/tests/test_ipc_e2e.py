@@ -304,3 +304,64 @@ async def test_async_snapshot_tree_truncation_and_strict_mode() -> None:
         with pytest.raises(WayboundDaemonError) as strict_err:
             await page.get_by_role(Role.CHECKBOX, strict=True).wait_for(timeout_ms=1_000)
         assert strict_err.value.code == "strict_mode_violation"
+
+
+def test_multi_window_lifecycle_and_isolation_against_mock_daemon() -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    with launch(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as root:
+        assert root.window_id is None
+        initial = root.list_windows()
+        assert len(initial) == 1
+        assert initial[0].id == 1
+        assert initial[0].has_buffer is True
+
+        win2 = root.new_page("https://window-two.example/page")
+        win3 = root.new_page("https://window-three.example/page", incognito=True)
+        assert win2.window_id is not None
+        assert win3.window_id is not None
+        assert win2.window_id != win3.window_id
+
+        listed = root.list_windows()
+        assert {w.id for w in listed} == {1, win2.window_id, win3.window_id}
+        incognito_summary = next(w for w in listed if w.id == win3.window_id)
+        assert "Incognito" in incognito_summary.title
+
+        # Each scoped Page reads its own window's isolated URL and drives its own commands.
+        assert root.url() == "https://mock.waybound.local/"
+        assert win2.url() == "https://window-two.example/page"
+        assert win3.url() == "https://window-three.example/page"
+
+        assert len(win2.snapshot_tree()) == 5
+        win2.get_by_role(Role.BUTTON, name="Search").click()
+        assert len(win3.snapshot_tree()) == 5
+        win3.get_by_role(Role.TEXTBOX, name="Origin").fill("SFO")
+
+        # Closing win2 removes only win2; win3 stays open and responsive.
+        win2.close_window()
+        assert {w.id for w in root.list_windows()} == {1, win3.window_id}
+        with pytest.raises(WayboundDaemonError) as closed_err:
+            win2.url()
+        assert closed_err.value.code == "element_not_found"
+        assert win3.url() == "https://window-three.example/page"
+
+        win3.close_window()
+        assert [w.id for w in root.list_windows()] == [1]
+
+
+async def test_async_multi_window_lifecycle_against_mock_daemon() -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    async with launch_async(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as root:
+        assert root.window_id is None
+        win2 = await root.new_page("https://async-win2.example/")
+        assert win2.window_id == 2
+        assert await win2.url() == "https://async-win2.example/"
+        assert len(await win2.snapshot_tree()) == 5
+        await win2.get_by_role(Role.BUTTON, name="Search").click()
+        assert len(await root.list_windows()) == 2
+
+        await win2.close_window()
+        assert [w.id for w in await root.list_windows()] == [1]

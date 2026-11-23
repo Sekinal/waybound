@@ -7,6 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { WayboundDaemonError } from "./errors.js";
 import {
   checkMs,
+  type NewWindowOptions,
   type ResponseWaiter,
   type SnapshotTreeOptions,
   type Transport,
@@ -20,6 +21,7 @@ import {
   type NetworkStats,
   Role,
   type TreeSnapshot,
+  type WindowSummary,
 } from "./types.js";
 
 const URL_POLL_INTERVAL_MS = 75;
@@ -74,6 +76,11 @@ export interface NetworkIdleOptions {
   readonly timeoutMs?: number;
 }
 
+export interface PageSnapshotTreeOptions {
+  /** Optional maximum number of nodes to return (clamped to `1..=20_000` by the daemon). */
+  readonly maxNodes?: number | null;
+}
+
 function makeQuery(
   role: Role | null,
   name: string | null,
@@ -90,12 +97,14 @@ function makeQuery(
  */
 export class Locator {
   readonly #transport: Transport;
+  readonly #windowId: number | undefined;
   /** The query this locator resolves. */
   readonly query: LocatorQuery;
 
-  constructor(transport: Transport, query: LocatorQuery) {
+  constructor(transport: Transport, query: LocatorQuery, windowId?: number) {
     this.#transport = transport;
     this.query = query;
+    this.#windowId = windowId;
   }
 
   /** A locator narrowed to the first match (`nth(0)`). */
@@ -111,6 +120,7 @@ export class Locator {
     return new Locator(
       this.#transport,
       Object.freeze({ ...this.query, nth: index, strict: false }),
+      this.#windowId,
     );
   }
 
@@ -125,6 +135,7 @@ export class Locator {
         this.query,
         options.strict ?? false,
       ),
+      this.#windowId,
     );
   }
 
@@ -133,12 +144,15 @@ export class Locator {
     return new Locator(
       this.#transport,
       makeQuery(null, text, options.exact ?? false, this.query, options.strict ?? false),
+      this.#windowId,
     );
   }
 
   /** All nodes matching this locator (ignoring `nth`). */
   all(): Promise<AccessibilityNode[]> {
-    return this.#transport.locateAll(this.query);
+    return this.#windowId === undefined
+      ? this.#transport.locateAll(this.query)
+      : this.#transport.locateAll(this.query, this.#windowId);
   }
 
   /** Number of nodes matching this locator. */
@@ -154,12 +168,17 @@ export class Locator {
 
   /** Move the pointer over the element without clicking. */
   hover(): Promise<void> {
-    return this.#transport.hover(this.query);
+    return this.#windowId === undefined
+      ? this.#transport.hover(this.query)
+      : this.#transport.hover(this.query, this.#windowId);
   }
 
   /** Wait until this element appears in the accessibility tree. */
   waitFor(options: TimeoutOptions = {}): Promise<AccessibilityNode> {
-    return this.#transport.waitFor(this.query, options.timeoutMs ?? 10_000);
+    const timeoutMs = options.timeoutMs ?? 10_000;
+    return this.#windowId === undefined
+      ? this.#transport.waitFor(this.query, timeoutMs)
+      : this.#transport.waitFor(this.query, timeoutMs, this.#windowId);
   }
 
   /** Accessible name (or value, if unnamed) of the element. */
@@ -176,32 +195,47 @@ export class Locator {
 
   /** Native click. */
   click(): Promise<void> {
-    return this.#transport.click(this.query);
+    return this.#windowId === undefined
+      ? this.#transport.click(this.query)
+      : this.#transport.click(this.query, this.#windowId);
   }
 
   /** Native double-click. */
   dblclick(): Promise<void> {
-    return this.#transport.dblclick(this.query);
+    return this.#windowId === undefined
+      ? this.#transport.dblclick(this.query)
+      : this.#transport.dblclick(this.query, this.#windowId);
   }
 
   /** Select an option of a `<select>`/combobox by label or 0-based index. */
   selectOption(options: SelectOptionOptions = {}): Promise<void> {
-    return this.#transport.selectOption(this.query, options);
+    return this.#transport.selectOption(
+      this.query,
+      this.#windowId === undefined ? options : { ...options, windowId: this.#windowId },
+    );
   }
 
   /** Focus the element and type `text` with native key events. */
   fill(text: string): Promise<void> {
-    return this.#transport.fill(this.query, text);
+    return this.#windowId === undefined
+      ? this.#transport.fill(this.query, text)
+      : this.#transport.fill(this.query, text, this.#windowId);
   }
 }
 
 /** High-level semantic interface to a controlled browser session. */
 export class Page {
   readonly #transport: Transport;
+  /** Backend window identifier this page is scoped to, or `undefined` for the default window. */
+  readonly windowId: number | undefined;
   #lastTreeTruncated = false;
 
-  constructor(transport: Transport) {
+  constructor(transport: Transport, windowId?: number) {
+    if (windowId !== undefined && (!Number.isSafeInteger(windowId) || windowId < 0)) {
+      throw new RangeError(`windowId must be a non-negative integer, got ${windowId}`);
+    }
     this.#transport = transport;
+    this.windowId = windowId;
   }
 
   /** The underlying daemon connection. */
@@ -214,9 +248,30 @@ export class Page {
     return this.#lastTreeTruncated;
   }
 
+  /** Return open browser windows tracked by the active backend. */
+  listWindows(): Promise<WindowSummary[]> {
+    return this.#transport.listWindows();
+  }
+
+  /** Open a new browser window on this transport and return a `Page` scoped to it. */
+  async newPage(options: NewWindowOptions = {}): Promise<Page> {
+    const win = await this.#transport.newWindow(options);
+    return new Page(this.#transport, win.id);
+  }
+
+  /** Close the browser window this page is scoped to. Throws if `windowId` is `undefined`. */
+  async closeWindow(): Promise<void> {
+    if (this.windowId === undefined) {
+      throw new Error("cannot closeWindow() on an unscoped Page (windowId is undefined)");
+    }
+    await this.#transport.closeWindow(this.windowId);
+  }
+
   /** Active tab URL, if available. */
   url(): Promise<string | null> {
-    return this.#transport.currentUrl();
+    return this.windowId === undefined
+      ? this.#transport.currentUrl()
+      : this.#transport.currentUrl(this.windowId);
   }
 
   /** Poll until the active tab URL contains `urlContains` (case-insensitive). */
@@ -225,7 +280,7 @@ export class Page {
     const needle = urlContains.toLowerCase();
     const deadline = performance.now() + timeoutMs;
     for (;;) {
-      const current = await this.#transport.currentUrl();
+      const current = await this.url();
       if (typeof current === "string" && current.toLowerCase().includes(needle)) {
         return current;
       }
@@ -241,36 +296,52 @@ export class Page {
 
   /** Navigate the active tab to `url` via native OS shortcut. */
   goto(url: string): Promise<void> {
-    return this.#transport.navigate(url);
+    return this.windowId === undefined
+      ? this.#transport.navigate(url)
+      : this.#transport.navigate(url, this.windowId);
   }
 
   reload(): Promise<void> {
-    return this.#transport.reload();
+    return this.windowId === undefined
+      ? this.#transport.reload()
+      : this.#transport.reload(this.windowId);
   }
 
   goBack(): Promise<void> {
-    return this.#transport.goBack();
+    return this.windowId === undefined
+      ? this.#transport.goBack()
+      : this.#transport.goBack(this.windowId);
   }
 
   goForward(): Promise<void> {
-    return this.#transport.goForward();
+    return this.windowId === undefined
+      ? this.#transport.goForward()
+      : this.#transport.goForward(this.windowId);
   }
 
   /** Open a new tab, optionally navigating to `url`. */
   newTab(url?: string | null): Promise<void> {
-    return this.#transport.newTab(url);
+    return this.windowId === undefined
+      ? this.#transport.newTab(url)
+      : this.#transport.newTab(url, this.windowId);
   }
 
   closeTab(): Promise<void> {
-    return this.#transport.closeTab();
+    return this.windowId === undefined
+      ? this.#transport.closeTab()
+      : this.#transport.closeTab(this.windowId);
   }
 
   nextTab(): Promise<void> {
-    return this.#transport.nextTab();
+    return this.windowId === undefined
+      ? this.#transport.nextTab()
+      : this.#transport.nextTab(this.windowId);
   }
 
   prevTab(): Promise<void> {
-    return this.#transport.prevTab();
+    return this.windowId === undefined
+      ? this.#transport.prevTab()
+      : this.#transport.prevTab(this.windowId);
   }
 
   /** Wait until any element with accessible text matching `text` appears. */
@@ -288,21 +359,28 @@ export class Page {
 
   /** Scroll the viewport. Defaults to `deltaY: -300`, like the Python SDK. */
   scroll(options: ScrollOptions = {}): Promise<void> {
-    return this.#transport.scroll(options.deltaX ?? 0, options.deltaY ?? -300);
+    const deltaX = options.deltaX ?? 0;
+    const deltaY = options.deltaY ?? -300;
+    return this.windowId === undefined
+      ? this.#transport.scroll(deltaX, deltaY)
+      : this.#transport.scroll(deltaX, deltaY, this.windowId);
   }
 
   /** Native key press: a named key (`enter`, `arrow_left`, ...) or a single character. */
   press(key: NamedKey | (string & {}), options: PressOptions = {}): Promise<void> {
-    return this.#transport.press(key, options.modifiers ?? []);
+    const modifiers = options.modifiers ?? [];
+    return this.windowId === undefined
+      ? this.#transport.press(key, modifiers)
+      : this.#transport.press(key, modifiers, this.windowId);
   }
 
   /** Snapshot of the live accessibility tree. */
-  async snapshotTree(options: SnapshotTreeOptions = {}): Promise<AccessibilityNode[]> {
+  async snapshotTree(options: PageSnapshotTreeOptions = {}): Promise<AccessibilityNode[]> {
     return (await this.snapshotTreeWithMeta(options)).nodes;
   }
 
   /** All link nodes on the current page that expose a non-empty target URL. */
-  async links(options: SnapshotTreeOptions = {}): Promise<AccessibilityNode[]> {
+  async links(options: PageSnapshotTreeOptions = {}): Promise<AccessibilityNode[]> {
     const nodes = await this.snapshotTree(options);
     return nodes.filter(
       (node) => node.role === Role.LINK && typeof node.url === "string" && node.url.length > 0,
@@ -310,8 +388,17 @@ export class Page {
   }
 
   /** Snapshot of the live accessibility tree along with truncation metadata. */
-  async snapshotTreeWithMeta(options: SnapshotTreeOptions = {}): Promise<TreeSnapshot> {
-    const snap = await this.#transport.snapshotTreeWithMeta(options);
+  async snapshotTreeWithMeta(options: PageSnapshotTreeOptions = {}): Promise<TreeSnapshot> {
+    const merged: SnapshotTreeOptions =
+      this.windowId !== undefined
+        ? {
+            ...(options.maxNodes !== undefined ? { maxNodes: options.maxNodes } : {}),
+            windowId: this.windowId,
+          }
+        : options.maxNodes !== undefined
+          ? { maxNodes: options.maxNodes }
+          : {};
+    const snap = await this.#transport.snapshotTreeWithMeta(merged);
     this.#lastTreeTruncated = snap.truncated;
     return snap;
   }
@@ -361,13 +448,21 @@ export class Page {
   async screenshot(filePath?: string | null): Promise<Buffer> {
     if (filePath !== undefined && filePath !== null) {
       const out = path.resolve(filePath);
-      await this.#transport.screenshot(out);
+      if (this.windowId === undefined) {
+        await this.#transport.screenshot(out);
+      } else {
+        await this.#transport.screenshot(out, this.windowId);
+      }
       return readFile(out);
     }
     const dir = await mkdtemp(path.join(tmpdir(), "wb-shot-"));
     try {
       const out = path.join(dir, "shot.png");
-      await this.#transport.screenshot(out);
+      if (this.windowId === undefined) {
+        await this.#transport.screenshot(out);
+      } else {
+        await this.#transport.screenshot(out, this.windowId);
+      }
       return await readFile(out);
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -379,6 +474,7 @@ export class Page {
     return new Locator(
       this.#transport,
       makeQuery(role, options.name ?? null, options.exact ?? false, null, options.strict ?? false),
+      this.windowId,
     );
   }
 
@@ -387,6 +483,7 @@ export class Page {
     return new Locator(
       this.#transport,
       makeQuery(null, text, options.exact ?? false, null, options.strict ?? false),
+      this.windowId,
     );
   }
 }

@@ -379,6 +379,18 @@ class TreeSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class WindowSummary:
+    """Metadata describing an open browser window tracked by the backend."""
+
+    id: int
+    title: str
+    app_id: str
+    width: int
+    height: int
+    has_buffer: bool
+
+
+@dataclass(frozen=True, slots=True)
 class LocatorQuery:
     """Semantic query resolved by the Rust control daemon."""
 
@@ -531,4 +543,21 @@ class SupportsTreeSnapshot(Protocol):
 
     def snapshot_tree_with_meta(self, *, max_nodes: int | None = None) -> TreeSnapshot:
         """Return a `TreeSnapshot` capped at `max_nodes` (if given), with `truncated` flag."""
+        ...
+
+
+@runtime_checkable
+class SupportsWindows(Protocol):
+    """Optional transport capability: stacked multi-window management."""
+
+    def list_windows(self) -> list[WindowSummary]:
+        """Return open browser windows tracked by the active backend."""
+        ...
+
+    def new_window(self, url: str | None = None, *, incognito: bool = False) -> WindowSummary:
+        """Open a new browser window in the active session, optionally navigating to `url`."""
+        ...
+
+    def close_window(self, window_id: int) -> None:
+        """Request that the browser cleanly close the window identified by `window_id`."""
         ...

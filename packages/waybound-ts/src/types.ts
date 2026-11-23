@@ -144,6 +144,16 @@ export interface TreeSnapshot {
   readonly truncated: boolean;
 }
 
+/** Metadata describing an open browser window tracked by the backend. */
+export interface WindowSummary {
+  readonly id: number;
+  readonly title: string;
+  readonly appId: string;
+  readonly width: number;
+  readonly height: number;
+  readonly hasBuffer: boolean;
+}
+
 /** Semantic query resolved by the daemon. */
 export interface LocatorQuery {
   readonly role: Role | null;

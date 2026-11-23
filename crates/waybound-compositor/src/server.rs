@@ -79,6 +79,10 @@ pub enum Command {
         event: InputEvent,
         reply: Sender<Result<()>>,
     },
+    CloseWindow {
+        window_id: u64,
+        reply: Sender<Result<()>>,
+    },
     Shutdown,
 }
 
@@ -182,6 +186,15 @@ impl ServerHandle {
         self.send_command(Command::DispatchInput {
             window_id,
             event: event.clone(),
+            reply: reply_tx,
+        })?;
+        reply_rx.recv().map_err(|_| compositor_stopped_error())?
+    }
+
+    pub(crate) fn close_window(&self, window_id: u64) -> Result<()> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.send_command(Command::CloseWindow {
+            window_id,
             reply: reply_tx,
         })?;
         reply_rx.recv().map_err(|_| compositor_stopped_error())?
@@ -350,8 +363,8 @@ struct CompositorState {
     client_outputs: HashMap<ClientId, Vec<WlOutput>>,
     client_pointers: HashMap<ClientId, Vec<WlPointer>>,
     client_keyboards: HashMap<ClientId, Vec<WlKeyboard>>,
-    pointer_focus: Option<u64>,
-    keyboard_focus: Option<u64>,
+    pointer_focus: Option<(ClientId, u64)>,
+    keyboard_focus: Option<(ClientId, u64)>,
     last_pointer_pos: Point,
 }
 
@@ -407,6 +420,44 @@ impl CompositorState {
                 has_buffer: win.has_buffer,
             })
             .collect()
+    }
+
+    fn close_window(&self, window_id: u64) -> Result<()> {
+        let win = self
+            .windows
+            .get(&window_id)
+            .ok_or_else(|| WayboundError::ElementNotFound {
+                query: format!("window id {window_id}"),
+            })?;
+        if win.xdg_toplevel.is_alive() {
+            win.xdg_toplevel.close();
+        }
+        Ok(())
+    }
+
+    fn remove_window(&mut self, window_id: u64) {
+        if let Some(win) = self.windows.remove(&window_id) {
+            if let Some(surface) = self.surfaces.get_mut(&win.surface_id)
+                && surface.toplevel_id == Some(window_id)
+            {
+                surface.toplevel_id = None;
+            }
+            if self
+                .pointer_focus
+                .as_ref()
+                .is_some_and(|(_, sid)| *sid == win.surface_id)
+            {
+                self.pointer_focus = None;
+            }
+            if self
+                .keyboard_focus
+                .as_ref()
+                .is_some_and(|(_, sid)| *sid == win.surface_id)
+            {
+                self.keyboard_focus = None;
+            }
+        }
+        self.window_order.retain(|&id| id != window_id);
     }
 
     fn resolve_target_window_id(&self, requested: Option<u64>) -> Result<u64> {
@@ -656,21 +707,35 @@ impl CompositorState {
         if pointers.is_empty() {
             return;
         }
-        if self.pointer_focus == Some(surface_id) {
+        if self
+            .pointer_focus
+            .as_ref()
+            .is_some_and(|(old_cid, old_sid)| old_cid == cid && *old_sid == surface_id)
+        {
             return;
         }
-        if let Some(old_id) = self.pointer_focus
+        if let Some((old_cid, old_id)) = self.pointer_focus.take()
             && let Some(old_surface) = self.surfaces.get(&old_id).map(|s| s.wl_surface.clone())
+            && old_surface.is_alive()
         {
-            let serial = self.next_serial();
-            for ptr in &pointers {
-                ptr.leave(serial, &old_surface);
-                if ptr.version() >= 5 {
-                    ptr.frame();
+            let old_pointers: Vec<WlPointer> = self
+                .client_pointers
+                .get(&old_cid)
+                .map(|list| list.iter().filter(|p| p.is_alive()).cloned().collect())
+                .unwrap_or_default();
+            if !old_pointers.is_empty() {
+                let serial = self.next_serial();
+                for ptr in &old_pointers {
+                    ptr.leave(serial, &old_surface);
+                    if ptr.version() >= 5 {
+                        ptr.frame();
+                    }
                 }
             }
         }
-        if let Some(new_surface) = self.surfaces.get(&surface_id).map(|s| s.wl_surface.clone()) {
+        if let Some(new_surface) = self.surfaces.get(&surface_id).map(|s| s.wl_surface.clone())
+            && new_surface.is_alive()
+        {
             let serial = self.next_serial();
             for ptr in &pointers {
                 ptr.enter(serial, &new_surface, pos.x, pos.y);
@@ -678,7 +743,7 @@ impl CompositorState {
                     ptr.frame();
                 }
             }
-            self.pointer_focus = Some(surface_id);
+            self.pointer_focus = Some((cid.clone(), surface_id));
         }
     }
 
@@ -756,22 +821,35 @@ impl CompositorState {
         if keyboards.is_empty() {
             return keyboards;
         }
-        if self.keyboard_focus != Some(surface_id) {
-            if let Some(old_id) = self.keyboard_focus
+        let already_focused = self
+            .keyboard_focus
+            .as_ref()
+            .is_some_and(|(old_cid, old_sid)| old_cid == cid && *old_sid == surface_id);
+        if !already_focused {
+            if let Some((old_cid, old_id)) = self.keyboard_focus.take()
                 && let Some(old_surface) = self.surfaces.get(&old_id).map(|s| s.wl_surface.clone())
+                && old_surface.is_alive()
             {
-                let serial = self.next_serial();
-                for kb in &keyboards {
-                    kb.leave(serial, &old_surface);
+                let old_keyboards: Vec<WlKeyboard> = self
+                    .client_keyboards
+                    .get(&old_cid)
+                    .map(|list| list.iter().filter(|k| k.is_alive()).cloned().collect())
+                    .unwrap_or_default();
+                if !old_keyboards.is_empty() {
+                    let serial = self.next_serial();
+                    for kb in &old_keyboards {
+                        kb.leave(serial, &old_surface);
+                    }
                 }
             }
             if let Some(new_surface) = self.surfaces.get(&surface_id).map(|s| s.wl_surface.clone())
+                && new_surface.is_alive()
             {
                 let serial = self.next_serial();
                 for kb in &keyboards {
                     kb.enter(serial, &new_surface, Vec::new());
                 }
-                self.keyboard_focus = Some(surface_id);
+                self.keyboard_focus = Some((cid.clone(), surface_id));
             }
         }
         keyboards
@@ -865,6 +943,57 @@ impl CompositorState {
 
         Ok(())
     }
+    fn destroy_surface(&mut self, surface_id: u64) {
+        if let Some(removed) = self.surfaces.remove(&surface_id)
+            && let Some(window_id) = removed.toplevel_id
+        {
+            self.remove_window(window_id);
+        }
+        if self
+            .pointer_focus
+            .as_ref()
+            .is_some_and(|(_, sid)| *sid == surface_id)
+        {
+            self.pointer_focus = None;
+        }
+        if self
+            .keyboard_focus
+            .as_ref()
+            .is_some_and(|(_, sid)| *sid == surface_id)
+        {
+            self.keyboard_focus = None;
+        }
+    }
+
+    fn process_commands(
+        &mut self,
+        cmd_rx: &Receiver<Command>,
+        display: &mut Display<Self>,
+    ) -> bool {
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                Command::ListWindows { reply } => {
+                    let _ = reply.send(self.list_windows());
+                }
+                Command::ScreenshotPng { window_id, reply } => {
+                    let _ = reply.send(self.screenshot_png(window_id));
+                }
+                Command::DispatchInput {
+                    window_id,
+                    event,
+                    reply,
+                } => {
+                    let res = self.dispatch_input(window_id, &event, display);
+                    let _ = reply.send(res);
+                }
+                Command::CloseWindow { window_id, reply } => {
+                    let _ = reply.send(self.close_window(window_id));
+                }
+                Command::Shutdown => return true,
+            }
+        }
+        false
+    }
 }
 
 fn run_event_loop(
@@ -924,30 +1053,7 @@ fn run_event_loop(
         }
 
         // 2. Process all queued control commands.
-        let mut shutdown = false;
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                Command::ListWindows { reply } => {
-                    let _ = reply.send(state.list_windows());
-                }
-                Command::ScreenshotPng { window_id, reply } => {
-                    let _ = reply.send(state.screenshot_png(window_id));
-                }
-                Command::DispatchInput {
-                    window_id,
-                    event,
-                    reply,
-                } => {
-                    let res = state.dispatch_input(window_id, &event, &mut display);
-                    let _ = reply.send(res);
-                }
-                Command::Shutdown => {
-                    shutdown = true;
-                    break;
-                }
-            }
-        }
-        if shutdown {
+        if state.process_commands(cmd_rx, &mut display) {
             break;
         }
 
@@ -1223,13 +1329,7 @@ impl Dispatch<WlSurface, SurfaceData> for CompositorState {
                 }
             }
             wl_surface::Request::Destroy => {
-                let _ = state.surfaces.remove(&surface_id);
-                if state.pointer_focus == Some(surface_id) {
-                    state.pointer_focus = None;
-                }
-                if state.keyboard_focus == Some(surface_id) {
-                    state.keyboard_focus = None;
-                }
+                state.destroy_surface(surface_id);
             }
             _ => {}
         }
@@ -1510,6 +1610,22 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for CompositorState {
                     });
                 }
             }
+            xdg_surface::Request::Destroy => {
+                if let Some(surface) = state.surfaces.get_mut(&surface_id) {
+                    surface.popup = None;
+                    if let Some(window_id) = surface.toplevel_id.take() {
+                        state.remove_window(window_id);
+                    }
+                }
+                let matching: Vec<u64> = state
+                    .windows
+                    .iter()
+                    .filter_map(|(&wid, w)| (w.surface_id == surface_id).then_some(wid))
+                    .collect();
+                for wid in matching {
+                    state.remove_window(wid);
+                }
+            }
             _ => {}
         }
     }
@@ -1538,8 +1654,7 @@ impl Dispatch<XdgToplevel, ToplevelData> for CompositorState {
                 }
             }
             xdg_toplevel::Request::Destroy => {
-                let _ = state.windows.remove(&window_id);
-                state.window_order.retain(|&id| id != window_id);
+                state.remove_window(window_id);
             }
             _ => {}
         }

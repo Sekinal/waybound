@@ -49,6 +49,7 @@ _MAX_DISPLAY_SCAN = 10_000
 _XVFB_READY_TIMEOUT_S = 3.0
 _DBUS_READY_TIMEOUT_S = 3.0
 _XVFB_POLL_INTERVAL_S = 0.05
+_INITIAL_WINDOW_POLL_INTERVAL_S = 0.05
 _ATSPI_SETTLE_DELAY_S = 0.2
 _CHILD_STOP_TIMEOUT_S = 2.0
 _CHILD_KILL_TIMEOUT_S = 1.0
@@ -553,6 +554,187 @@ def _check_parallel_input_inner(
         raise ValueError(msg)
 
 
+def _consume_future_exception(future: asyncio.Future[None]) -> None:
+    """Prevent asyncio from logging 'Future exception was never retrieved' on abandoned futures."""
+    if not future.cancelled():
+        future.exception()
+
+
+def _validate_windows_per_browser(
+    windows_per_browser: object,
+    *,
+    options: LaunchOptions,
+    display_backend: DisplayBackend,
+    has_remotes: bool,
+) -> None:
+    if (
+        not isinstance(windows_per_browser, int)
+        or isinstance(windows_per_browser, bool)
+        or windows_per_browser < 1
+    ):
+        msg = f"windows_per_browser must be >= 1 (integer), got {windows_per_browser!r}"
+        raise ValueError(msg)
+    if windows_per_browser == 1:
+        return
+    if has_remotes:
+        msg = "windows_per_browser > 1 is not supported with remote_workers"
+        raise ValueError(msg)
+    if options.backend != "mock" and (display_backend != "wayland" or options.backend != "linux"):
+        msg = (
+            "windows_per_browser > 1 requires display_backend='wayland' on Linux "
+            "(or launch_options.backend='mock')"
+        )
+        raise ValueError(msg)
+    if options.backend == "linux" and not options.launch_chrome:
+        msg = "windows_per_browser > 1 with backend='linux' requires launch_chrome=True"
+        raise ValueError(msg)
+
+
+def _validate_pool_config(  # noqa: PLR0913
+    *,
+    resolved_size: int,
+    windows_per_browser: int,
+    options: LaunchOptions,
+    proxies: Sequence[str] | None,
+    display_backend: DisplayBackend,
+    isolated_displays: bool,
+    parsed_remotes: Sequence[tuple[str, tuple[str, int]]],
+    max_uses_per_slot: int | None,
+    acquire_timeout_s: float,
+    display_base: int,
+) -> None:
+    if resolved_size < 1:
+        msg = f"size must be >= 1, got {resolved_size}"
+        raise ValueError(msg)
+    if parsed_remotes and resolved_size > len(parsed_remotes):
+        msg = (
+            f"size ({resolved_size}) cannot exceed number of remote_workers ({len(parsed_remotes)})"
+        )
+        raise ValueError(msg)
+    _validate_windows_per_browser(
+        windows_per_browser,
+        options=options,
+        display_backend=display_backend,
+        has_remotes=bool(parsed_remotes),
+    )
+    max_hosts = (resolved_size + windows_per_browser - 1) // windows_per_browser
+    if not parsed_remotes and options.profile_dir is not None:
+        if max_hosts > 1:
+            msg = (
+                "launch_options.profile_dir cannot be set when size > windows_per_browser "
+                "(multiple Chrome slots cannot share one --user-data-dir)"
+            )
+            raise ValueError(msg)
+        if proxies is not None and len(set(proxies)) > 1:
+            msg = (
+                "launch_options.profile_dir cannot be combined with multiple distinct proxies "
+                "(multiple Chrome hosts cannot share one --user-data-dir)"
+            )
+            raise ValueError(msg)
+    if not parsed_remotes and resolved_size > 1:
+        _check_parallel_input(
+            options,
+            isolated_displays=isolated_displays,
+            display_backend=display_backend,
+        )
+    if max_uses_per_slot is not None and max_uses_per_slot < 1:
+        msg = f"max_uses_per_slot must be >= 1, got {max_uses_per_slot}"
+        raise ValueError(msg)
+    if acquire_timeout_s <= 0:
+        msg = f"acquire_timeout_s must be > 0, got {acquire_timeout_s}"
+        raise ValueError(msg)
+    if display_base < 0:
+        msg = f"display_base must be >= 0, got {display_base}"
+        raise ValueError(msg)
+
+
+class _BrowserHost:
+    """Shared local browser process (daemon + Chrome) hosting up to `max_windows` stacked pages."""
+
+    def __init__(
+        self,
+        *,
+        proxy: str | None,
+        override_proxy: bool,
+        max_windows: int,
+        ready_future: asyncio.Future[None],
+    ) -> None:
+        self.proxy = proxy
+        self.override_proxy = override_proxy
+        self.max_windows = max_windows
+        self.ready_future = ready_future
+        self.ready_future.add_done_callback(_consume_future_exception)
+        self.launch_task: asyncio.Task[None] | None = None
+        self.session: Session | None = None
+        self.root_page: Page | None = None
+        self.display_stack: _IsolatedDisplayStack | None = None
+        self.initial_window_id: int | None = None
+        self.initial_window_claimed = False
+        self.pending_opens = 0
+        self.closing_windows = 0
+        self.active_slots: set[_PoolSlot] = set()
+        self.idle_slots: deque[_PoolSlot] = deque()
+        self.retired = False
+        self.teardown: asyncio.Future[None] | None = None
+        self._close_lock = threading.Lock()
+        self._closed = False
+
+    @property
+    def open_window_count(self) -> int:
+        return len(self.active_slots) + len(self.idle_slots)
+
+    @property
+    def live_window_count(self) -> int:
+        return self.open_window_count + self.pending_opens
+
+    @property
+    def capacity_used(self) -> int:
+        return self.live_window_count + self.closing_windows
+
+    @property
+    def in_use_count(self) -> int:
+        return len(self.active_slots) + self.pending_opens + self.closing_windows
+
+    def is_retired(self) -> bool:
+        return self.retired
+
+    def has_root_page(self) -> bool:
+        return self.root_page is not None
+
+    def ping(self) -> None:
+        """Verify that this host's daemon and browser are healthy."""
+        if self.session is None:
+            msg = "browser host is not started or already closed"
+            raise RuntimeError(msg)
+        if not self.session.is_healthy(timeout_s=_HEALTH_CHECK_TIMEOUT_S):
+            msg = "browser host is unhealthy (daemon or browser gone, or ping timed out)"
+            raise RuntimeError(msg)
+
+    def close(self) -> None:
+        """Tear down this host's daemon and any isolated display stack (idempotent, thread-safe)."""
+        with self._close_lock:
+            if self._closed:
+                return
+            if not self.ready_future.done():
+                self.retired = True
+                return
+            self._closed = True
+            self._close_once()
+
+    def _close_once(self) -> None:
+        try:
+            if self.session is not None:
+                with contextlib.suppress(OSError, WayboundDaemonError, RuntimeError):
+                    self.session.close()
+                self.session = None
+            self.root_page = None
+        finally:
+            if self.display_stack is not None:
+                with contextlib.suppress(OSError, RuntimeError):
+                    self.display_stack.close()
+                self.display_stack = None
+
+
 class _PoolSlot:
     """Internal runtime state for a single local or remote browser worker slot."""
 
@@ -567,6 +749,8 @@ class _PoolSlot:
         remote_worker: str | None = None,
         display_stack: _IsolatedDisplayStack | None = None,
         display_num: int | None = None,
+        host: _BrowserHost | None = None,
+        window_id: int | None = None,
     ) -> None:
         self.page = page
         self.proxy = proxy
@@ -574,6 +758,8 @@ class _PoolSlot:
         self.uses = 0
         self.remote_worker = remote_worker
         self.display_num = display_num
+        self.host = host
+        self.window_id = window_id
         self._session = session
         self._remote_transport = remote_transport
         self._display_stack = display_stack
@@ -590,6 +776,9 @@ class _PoolSlot:
         `_HEALTH_CHECK_TIMEOUT_S` and, when it launched the browser, reports the browser still
         running (`browser_alive`); a local daemon must also still be running.
         """
+        if self.host is not None:
+            self.host.ping()
+            return
         if self._session is not None:
             if not self._session.is_healthy(timeout_s=_HEALTH_CHECK_TIMEOUT_S):
                 msg = "slot is unhealthy (daemon or browser gone, or ping timed out)"
@@ -676,6 +865,7 @@ class BrowserPool:
         remote_workers: Sequence[str] | None = None,
         max_uses_per_slot: int | None = None,
         acquire_timeout_s: float = 60.0,
+        windows_per_browser: int = 1,
     ) -> None:
         if display_backend not in _DISPLAY_BACKENDS:
             msg = f"display_backend must be 'xvfb' or 'wayland', got {display_backend!r}"
@@ -683,40 +873,22 @@ class BrowserPool:
         parsed_remotes = _parse_remote_workers(remote_workers)
 
         resolved_size = size if size is not None else (len(parsed_remotes) or 1)
-        if resolved_size < 1:
-            msg = f"size must be >= 1, got {resolved_size}"
-            raise ValueError(msg)
-        if parsed_remotes and resolved_size > len(parsed_remotes):
-            msg = (
-                f"size ({resolved_size}) cannot exceed number of remote_workers "
-                f"({len(parsed_remotes)})"
-            )
-            raise ValueError(msg)
-
         resolved_options = launch_options if launch_options is not None else LaunchOptions()
-        if not parsed_remotes and resolved_size > 1 and resolved_options.profile_dir is not None:
-            msg = (
-                "launch_options.profile_dir cannot be set when size > 1 "
-                "(multiple Chrome slots cannot share one --user-data-dir)"
-            )
-            raise ValueError(msg)
-        if not parsed_remotes and resolved_size > 1:
-            _check_parallel_input(
-                resolved_options,
-                isolated_displays=isolated_displays,
-                display_backend=display_backend,
-            )
-        if max_uses_per_slot is not None and max_uses_per_slot < 1:
-            msg = f"max_uses_per_slot must be >= 1, got {max_uses_per_slot}"
-            raise ValueError(msg)
-        if acquire_timeout_s <= 0:
-            msg = f"acquire_timeout_s must be > 0, got {acquire_timeout_s}"
-            raise ValueError(msg)
-        if display_base < 0:
-            msg = f"display_base must be >= 0, got {display_base}"
-            raise ValueError(msg)
+        _validate_pool_config(
+            resolved_size=resolved_size,
+            windows_per_browser=windows_per_browser,
+            options=resolved_options,
+            proxies=proxies,
+            display_backend=display_backend,
+            isolated_displays=isolated_displays,
+            parsed_remotes=parsed_remotes,
+            max_uses_per_slot=max_uses_per_slot,
+            acquire_timeout_s=acquire_timeout_s,
+            display_base=display_base,
+        )
 
         self._size = resolved_size
+        self._windows_per_browser = windows_per_browser
         self._launch_options = resolved_options
         self._proxies: tuple[str, ...] = tuple(proxies) if proxies is not None else ()
         self._isolated_displays = isolated_displays
@@ -731,12 +903,14 @@ class BrowserPool:
         self._waiters: deque[asyncio.Future[None]] = deque()
         self._idle: deque[_PoolSlot] = deque()
         self._active_slots: set[_PoolSlot] = set()
+        self._hosts: list[_BrowserHost] = []
+        self._retiring_hosts: set[_BrowserHost] = set()
         self._reserved_displays: set[int] = set()
         # Guards display reservations and the remote-worker queue, which slot teardowns update
         # from worker threads.
         self._resources_lock = threading.Lock()
-        # Slot teardowns still running in threads (started by cancelled tasks or callbacks);
-        # `close()` waits for them so nothing outlives the pool.
+        # Slot/host teardowns and launches still running in background; `close()` waits for them
+        # so nothing outlives the pool.
         self._background: set[asyncio.Future[None]] = set()
         self._proxy_cursor = 0
         self._slot_counter = 0
@@ -907,6 +1081,147 @@ class BrowserPool:
         # Shielded: cancelling the caller must not abandon a half-closed slot.
         await asyncio.shield(self._destroy_in_background(slot))
 
+    def _track_background(self, future: asyncio.Future[None]) -> None:
+        self._background = {f for f in self._background if not f.done()}
+        self._background.add(future)
+        future.add_done_callback(self._background_done)
+
+    def _live_window_count(self) -> int:
+        return len(self._idle) + len(self._active_slots) + sum(h.pending_opens for h in self._hosts)
+
+    def _destroy_host_in_background(self, host: _BrowserHost) -> asyncio.Future[None]:
+        """Start the host's single teardown in a thread (or join the one already started)."""
+        if not host.ready_future.done():
+            host.retired = True
+            self._retiring_hosts.add(host)
+            if host.launch_task is not None:
+                return host.launch_task
+            done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            done.set_result(None)
+            return done
+        if host.teardown is not None:
+            return host.teardown
+
+        def _teardown() -> None:
+            host.close()
+
+        loop = asyncio.get_running_loop()
+        try:
+            future = loop.run_in_executor(None, _teardown)
+        except RuntimeError:
+            threading.Thread(target=_teardown, name="waybound-host-teardown").start()
+            future = loop.create_future()
+            future.set_result(None)
+            host.teardown = future
+            self._retiring_hosts.discard(host)
+            return future
+        host.teardown = future
+        self._track_background(future)
+
+        def _on_teardown_done(_fut: asyncio.Future[None]) -> None:
+            self._retiring_hosts.discard(host)
+
+        future.add_done_callback(_on_teardown_done)
+        return future
+
+    async def _destroy_host(self, host: _BrowserHost) -> None:
+        await asyncio.shield(self._destroy_host_in_background(host))
+
+    def _close_page_in_background(self, page: Page) -> asyncio.Future[None]:
+        """Close a single scoped window on a shared host in a worker thread."""
+        loop = asyncio.get_running_loop()
+
+        def _close_win() -> None:
+            with contextlib.suppress(OSError, WayboundDaemonError, RuntimeError, ValueError):
+                page.close_window()
+
+        try:
+            future = loop.run_in_executor(None, _close_win)
+        except RuntimeError:
+            threading.Thread(target=_close_win, name="waybound-window-close").start()
+            future = loop.create_future()
+            future.set_result(None)
+            return future
+        self._track_background(future)
+        return future
+
+    def _close_window_in_background(self, slot: _PoolSlot) -> asyncio.Future[None]:
+        """Close a single window on a shared host in a worker thread."""
+        return self._close_page_in_background(slot.page._inner)
+
+    def _close_page_with_reservation(self, page: Page, host: _BrowserHost) -> None:
+        """Close a single window while keeping capacity reserved until close completes."""
+        host.closing_windows += 1
+        future = self._close_page_in_background(page)
+
+        def _on_close_done(_fut: asyncio.Future[None]) -> None:
+            host.closing_windows -= 1
+            if (
+                (self._is_closed() or host.retired)
+                and host.in_use_count == 0
+                and host.ready_future.done()
+            ):
+                self._destroy_host_in_background(host)
+
+        future.add_done_callback(_on_close_done)
+
+    def _retire_host(self, host: _BrowserHost) -> None:
+        """Mark `host` retired, drop its idle windows, and tear it down once no windows are live."""
+        host.retired = True
+        with contextlib.suppress(ValueError):
+            self._hosts.remove(host)
+        if host.idle_slots:
+            stale = set(host.idle_slots)
+            host.idle_slots.clear()
+            self._idle = deque(s for s in self._idle if s not in stale)
+        if host.teardown is None or not host.teardown.done():
+            self._retiring_hosts.add(host)
+        if host.in_use_count == 0 and host.ready_future.done():
+            self._destroy_host_in_background(host)
+
+    def _settle_unclaimed_host(self, host: _BrowserHost) -> bool:
+        """Decide the fate of a launched host after all waiting acquires have departed.
+
+        Returns `True` if `host` is retired and should be torn down.
+        """
+        if host.in_use_count != 0 or not host.ready_future.done():
+            return False
+        if self._is_closed() or host.retired:
+            self._retire_host(host)
+            return True
+        if host.ready_future.cancelled() or host.ready_future.exception() is not None:
+            return False
+        if (
+            not host.override_proxy
+            and not host.initial_window_claimed
+            and host.initial_window_id is not None
+            and host.root_page is not None
+            and self._live_window_count() < self._size
+        ):
+            host.initial_window_claimed = True
+            slot = self._make_window_slot(host, host.initial_window_id)
+            host.idle_slots.append(slot)
+            self._idle.append(slot)
+            return False
+        if host.override_proxy or not host.initial_window_claimed or host.open_window_count == 0:
+            self._retire_host(host)
+            return True
+        return False
+
+    @staticmethod
+    def _make_window_slot(host: _BrowserHost, window_id: int) -> _PoolSlot:
+        if host.root_page is None:
+            msg = "browser host has no active root page"
+            raise RuntimeError(msg)
+        scoped_page = Page(host.root_page._transport, window_id=window_id)
+        return _PoolSlot(
+            page=AsyncPage(scoped_page),
+            proxy=host.proxy,
+            override_proxy=host.override_proxy,
+            host=host,
+            window_id=window_id,
+        )
+
     def _health_check_abandoned(
         self, slot: _PoolSlot, permit: _Permit
     ) -> Callable[[asyncio.Future[None]], None]:
@@ -919,7 +1234,28 @@ class BrowserPool:
         def _settle(future: asyncio.Future[None]) -> None:
             try:
                 healthy = not future.cancelled() and future.exception() is None
-                live = len(self._idle) + len(self._active_slots)
+                host = slot.host
+                if host is not None:
+                    host.active_slots.discard(slot)
+                    live = self._live_window_count()
+                    if healthy and not self._is_closed() and not host.retired and live < self._size:
+                        host.idle_slots.append(slot)
+                        self._idle.append(slot)
+                        return
+                    if not healthy:
+                        self._failed += 1
+                        self._recycled += 1
+                        self._retire_host(host)
+                    elif self._is_closed() or host.retired:
+                        if host.in_use_count == 0 and host.ready_future.done():
+                            self._destroy_host_in_background(host)
+                    elif host.open_window_count == 0:
+                        self._retire_host(host)
+                    else:
+                        self._close_page_with_reservation(slot.page._inner, host)
+                    return
+
+                live = self._live_window_count()
                 if healthy and not self._is_closed() and live < self._size:
                     self._idle.append(slot)
                     return
@@ -933,6 +1269,9 @@ class BrowserPool:
         return _settle
 
     async def _pop_healthy_idle(self, proxy: str | None, permit: _Permit) -> _PoolSlot | None:
+        if self._windows_per_browser > 1:
+            return await self._pop_healthy_idle_stacked(proxy, permit)
+
         while self._idle:
             slot: _PoolSlot | None = None
             if proxy is not None:
@@ -968,6 +1307,347 @@ class BrowserPool:
                 return None
             return slot
         return None
+
+    def _take_matching_idle_stacked(self, proxy: str | None) -> _PoolSlot | None:
+        for idx, candidate in enumerate(self._idle):
+            host = candidate.host
+            if host is None or host.retired:
+                continue
+            matches = candidate.proxy == proxy if proxy is not None else not host.override_proxy
+            if matches:
+                del self._idle[idx]
+                with contextlib.suppress(ValueError):
+                    host.idle_slots.remove(candidate)
+                return candidate
+        return None
+
+    async def _pop_healthy_idle_stacked(
+        self, proxy: str | None, permit: _Permit
+    ) -> _PoolSlot | None:
+        while self._idle:
+            slot = self._take_matching_idle_stacked(proxy)
+            if slot is None:
+                return None
+
+            host = slot.host
+            if host is None:
+                continue
+            host.active_slots.add(slot)
+            try:
+                await _run_detached(slot.ping, self._health_check_abandoned(slot, permit))
+            except asyncio.CancelledError:
+                permit.transferred = True
+                raise
+            except (OSError, WayboundDaemonError, RuntimeError):
+                host.active_slots.discard(slot)
+                self._failed += 1
+                self._recycled += 1
+                self._retire_host(host)
+                continue
+
+            if self._is_closed() or host.retired:
+                host.active_slots.discard(slot)
+                if host.in_use_count == 0 and host.ready_future.done():
+                    await self._destroy_host(host)
+                if self._is_closed():
+                    return None
+                continue
+            return slot
+        return None
+
+    def _wait_for_initial_window(
+        self, session: Session, root_page: Page, host: _BrowserHost
+    ) -> int | None:
+        windows = root_page.list_windows()
+        if windows:
+            return windows[0].id
+
+        if self._launch_options.launch_chrome and self._launch_options.backend != "mock":
+            timeout_s = max(0.0, self._launch_options.startup_timeout_s)
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                if self._is_closed() or host.retired:
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if not session.is_healthy(timeout_s=_HEALTH_CHECK_TIMEOUT_S):
+                    msg = "browser host exited while waiting for initial window"
+                    raise RuntimeError(msg)
+                time.sleep(min(_INITIAL_WINDOW_POLL_INTERVAL_S, remaining))
+                if self._is_closed() or host.retired:
+                    return None
+                windows = root_page.list_windows()
+                if windows:
+                    return windows[0].id
+
+        if self._is_closed() or host.retired:
+            return None
+        opened = root_page.new_page()
+        if opened.window_id is None:
+            msg = "new_page() returned an unscoped Page"
+            raise RuntimeError(msg)
+        return opened.window_id
+
+    def _start_local_host_sync(
+        self, host: _BrowserHost
+    ) -> tuple[Session, Page, _IsolatedDisplayStack | None, int | None]:
+        use_wayland = self._display_backend == "wayland"
+        use_isolated = self._isolated_displays and sys.platform.startswith("linux")
+        display_stack: _IsolatedDisplayStack | None = None
+        session: Session | None = None
+        try:
+            slot_opts = dataclasses.replace(self._launch_options, proxy=host.proxy)
+            extra_env: dict[str, str] | None = None
+            reap_pgid: int | None = None
+            if use_wayland:
+                if use_isolated:
+                    display_stack = _IsolatedDisplayStack.start_wayland_dbus()
+                    if display_stack is not None:
+                        extra_env = display_stack.env
+                        reap_pgid = display_stack.pgid
+                slot_opts = dataclasses.replace(
+                    slot_opts,
+                    display=None,
+                    headless_xvfb=False,
+                    headless_wayland=True,
+                )
+
+            session = Session(slot_opts, extra_env=extra_env, _reap_pgid=reap_pgid)
+            root_page = session.__enter__()
+            initial_wid = self._wait_for_initial_window(session, root_page, host)
+            return session, root_page, display_stack, initial_wid
+        except BaseException:
+            if session is not None:
+                with contextlib.suppress(OSError, WayboundDaemonError, RuntimeError):
+                    session.close()
+            if display_stack is not None:
+                with contextlib.suppress(OSError, RuntimeError):
+                    display_stack.close()
+            raise
+
+    def _start_host_launch(self, host: _BrowserHost) -> None:
+        """Launch `host`'s daemon/Chrome process on a background thread and track its task."""
+        loop = asyncio.get_running_loop()
+
+        async def _run_launch() -> None:
+            try:
+                session, root_page, display_stack, initial_wid = await asyncio.shield(
+                    loop.run_in_executor(None, self._start_local_host_sync, host)
+                )
+            except BaseException as exc:
+                host.retired = True
+                with contextlib.suppress(ValueError):
+                    self._hosts.remove(host)
+                self._retiring_hosts.discard(host)
+                self._failed += 1
+                if not host.ready_future.done():
+                    host.ready_future.set_exception(exc)
+                return
+
+            host.session = session
+            host.root_page = root_page
+            host.display_stack = display_stack
+            host.initial_window_id = initial_wid
+            self._launched += 1
+
+            if self._is_closed() or host.retired or initial_wid is None:
+                host.retired = True
+                with contextlib.suppress(ValueError):
+                    self._hosts.remove(host)
+                self._retiring_hosts.add(host)
+                if not host.ready_future.done():
+                    host.ready_future.set_exception(RuntimeError("BrowserPool is closed"))
+                await self._destroy_host(host)
+                return
+
+            if not host.ready_future.done():
+                host.ready_future.set_result(None)
+
+            # If every waiter was cancelled before launch finished, decide the host's fate.
+            if host.in_use_count == 0 and self._settle_unclaimed_host(host):
+                await self._destroy_host(host)
+
+        task: asyncio.Task[None] = loop.create_task(_run_launch())
+        host.launch_task = task
+        self._track_background(task)
+
+    def _find_host_with_capacity(self, proxy: str | None) -> _BrowserHost | None:
+        for host in self._hosts:
+            if host.retired or host.override_proxy:
+                continue
+            if host.capacity_used >= host.max_windows:
+                continue
+            if proxy is not None and host.proxy != proxy:
+                continue
+            return host
+        return None
+
+    async def _acquire_stacked_window(  # noqa: PLR0912, PLR0915
+        self, proxy: str | None, permit: _Permit
+    ) -> _PoolSlot:
+        loop = asyncio.get_running_loop()
+        evicted_once = False
+        while True:
+            if self._is_closed():
+                msg = "BrowserPool is closed"
+                raise RuntimeError(msg)
+
+            host = self._find_host_with_capacity(proxy)
+            if host is None:
+                effective_proxy, is_override = self._next_proxy(proxy)
+                if proxy is not None and not evicted_once:
+                    # Evict one completely idle non-matching host so proxy overrides don't
+                    # accumulate idle browser processes without bound.
+                    evicted = False
+                    for candidate in list(self._hosts):
+                        if (
+                            candidate.ready_future.done()
+                            and candidate.in_use_count == 0
+                            and candidate.proxy != effective_proxy
+                        ):
+                            self._recycled += 1
+                            self._retire_host(candidate)
+                            await self._destroy_host(candidate)
+                            evicted = True
+                            evicted_once = True
+                            break
+                    if self._is_closed():
+                        msg = "BrowserPool is closed"
+                        raise RuntimeError(msg)
+                    if evicted:
+                        continue
+
+                host = _BrowserHost(
+                    proxy=effective_proxy,
+                    override_proxy=is_override,
+                    max_windows=1 if is_override else self._windows_per_browser,
+                    ready_future=loop.create_future(),
+                )
+                host.pending_opens = 1
+                self._hosts.append(host)
+                self._start_host_launch(host)
+            else:
+                host.pending_opens += 1
+
+            # Wait for the host's browser/daemon process to finish launching.
+            if not host.ready_future.done():
+                try:
+                    await asyncio.shield(host.ready_future)
+                except BaseException:
+                    host.pending_opens -= 1
+                    if host.in_use_count == 0 and host.ready_future.done():
+                        self._settle_unclaimed_host(host)
+                    raise
+
+            if self._is_closed():
+                host.pending_opens -= 1
+                if host.in_use_count == 0 and host.ready_future.done():
+                    self._retire_host(host)
+                    await self._destroy_host(host)
+                msg = "BrowserPool is closed"
+                raise RuntimeError(msg)
+
+            if host.retired or host.root_page is None:
+                host.pending_opens -= 1
+                if host.in_use_count == 0 and host.ready_future.done():
+                    self._retire_host(host)
+                continue
+
+            # First consumer of a newly launched host claims its initial window.
+            if not host.initial_window_claimed and host.initial_window_id is not None:
+                host.initial_window_claimed = True
+                wid = host.initial_window_id
+                host.pending_opens -= 1
+                return self._make_window_slot(host, wid)
+
+            # Subsequent windows on this host are opened via `new_page()`.
+            root_page = host.root_page
+
+            def _open_new_window(page: Page = root_page) -> Page:
+                return page.new_page()
+
+            def _abandoned_open(
+                future: asyncio.Future[Page],
+                bound_host: _BrowserHost = host,
+                bound_permit: _Permit = permit,
+            ) -> None:
+                try:
+                    bound_host.pending_opens -= 1
+                    if future.cancelled() or future.exception() is not None:
+                        if not future.cancelled():
+                            self._failed += 1
+                            self._retire_host(bound_host)
+                        elif (
+                            bound_host.retired
+                            and bound_host.in_use_count == 0
+                            and bound_host.ready_future.done()
+                        ):
+                            self._destroy_host_in_background(bound_host)
+                        return
+
+                    opened = future.result()
+                    if self._is_closed() or bound_host.retired or bound_host.root_page is None:
+                        if bound_host.in_use_count == 0 and bound_host.ready_future.done():
+                            self._destroy_host_in_background(bound_host)
+                        elif (
+                            not self._is_closed()
+                            and bound_host.root_page is not None
+                            and opened.window_id is not None
+                        ):
+                            self._close_page_with_reservation(opened, bound_host)
+                        return
+
+                    if opened.window_id is None:
+                        self._failed += 1
+                        self._retire_host(bound_host)
+                        return
+
+                    live = self._live_window_count()
+                    if not bound_host.override_proxy and live < self._size:
+                        slot = self._make_window_slot(bound_host, opened.window_id)
+                        bound_host.idle_slots.append(slot)
+                        self._idle.append(slot)
+                    elif bound_host.override_proxy or bound_host.open_window_count == 0:
+                        self._retire_host(bound_host)
+                    else:
+                        self._close_page_with_reservation(opened, bound_host)
+                finally:
+                    self._give_back(bound_permit)
+
+            try:
+                opened_page = await _run_detached(_open_new_window, _abandoned_open)
+            except asyncio.CancelledError:
+                permit.transferred = True
+                raise
+            except BaseException:
+                host.pending_opens -= 1
+                self._failed += 1
+                self._retire_host(host)
+                raise
+
+            host.pending_opens -= 1
+            if self._is_closed() or host.is_retired() or not host.has_root_page():
+                if host.in_use_count == 0 and host.ready_future.done():
+                    await self._destroy_host(host)
+                elif (
+                    not self._is_closed()
+                    and host.has_root_page()
+                    and opened_page.window_id is not None
+                ):
+                    self._close_page_with_reservation(opened_page, host)
+                if self._is_closed():
+                    msg = "BrowserPool is closed"
+                    raise RuntimeError(msg)
+                continue
+
+            if opened_page.window_id is None:
+                self._failed += 1
+                self._retire_host(host)
+                msg = "new_page() returned an unscoped Page"
+                raise RuntimeError(msg)
+
+            return self._make_window_slot(host, opened_page.window_id)
 
     async def _launch_slot(self, *, proxy: str | None) -> _PoolSlot:
         if self._remote_endpoints:
@@ -1107,6 +1787,19 @@ class BrowserPool:
             msg = "BrowserPool is closed"
             raise RuntimeError(msg)
 
+        if (
+            not self._remote_endpoints
+            and self._launch_options.profile_dir is not None
+            and proxy is not None
+        ):
+            default_proxy = self._proxies[0] if self._proxies else self._launch_options.proxy
+            if proxy != default_proxy:
+                msg = (
+                    "per-checkout proxy override cannot be used when launch_options.profile_dir "
+                    "is set (multiple Chrome hosts cannot share one --user-data-dir)"
+                )
+                raise ValueError(msg)
+
         effective_timeout = self._acquire_timeout_s if timeout_s is None else timeout_s
         if effective_timeout <= 0:
             msg = f"timeout_s must be > 0, got {effective_timeout}"
@@ -1123,22 +1816,33 @@ class BrowserPool:
             slot = await self._pop_healthy_idle(proxy, permit)
             if self._is_closed():
                 if slot is not None:
-                    await self._destroy_slot(slot)
+                    if slot.host is not None:
+                        slot.host.active_slots.discard(slot)
+                        self._retire_host(slot.host)
+                        if slot.host.in_use_count == 0 and slot.host.ready_future.done():
+                            await self._destroy_host(slot.host)
+                    else:
+                        await self._destroy_slot(slot)
                 msg = "BrowserPool is closed"
                 raise RuntimeError(msg)
 
             if slot is None:
-                try:
-                    slot = await self._launch_slot(proxy=proxy)
-                except BaseException:
-                    self._failed += 1
-                    raise
-                if self._is_closed():
-                    await self._destroy_slot(slot)
-                    msg = "BrowserPool is closed"
-                    raise RuntimeError(msg)
+                if self._windows_per_browser > 1:
+                    slot = await self._acquire_stacked_window(proxy, permit)
+                else:
+                    try:
+                        slot = await self._launch_slot(proxy=proxy)
+                    except BaseException:
+                        self._failed += 1
+                        raise
+                    if self._is_closed():
+                        await self._destroy_slot(slot)
+                        msg = "BrowserPool is closed"
+                        raise RuntimeError(msg)
 
             self._active_slots.add(slot)
+            if slot.host is not None:
+                slot.host.active_slots.add(slot)
             slot.uses += 1
         except BaseException:
             if not permit.transferred:
@@ -1162,6 +1866,10 @@ class BrowserPool:
     async def _return_or_recycle(
         self, slot: _PoolSlot, *, had_error: bool, permit: _Permit
     ) -> None:
+        if slot.host is not None:
+            await self._return_or_recycle_stacked(slot, had_error=had_error, permit=permit)
+            return
+
         if self._is_closed():
             await self._destroy_slot(slot)
             return
@@ -1191,6 +1899,149 @@ class BrowserPool:
 
         self._idle.append(slot)
 
+    async def _recycle_stacked_window(  # noqa: PLR0915
+        self, slot: _PoolSlot, host: _BrowserHost
+    ) -> None:
+        """Close only `slot`'s window, then verify `host` is still alive.
+
+        If recycling `slot` leaves `host` with zero other windows, retire and destroy `host`
+        directly instead of calling `close_window()` + `host.ping()`, since closing Chrome's
+        last window causes Chrome to exit asynchronously.
+        """
+        self._recycled += 1
+        if host.open_window_count == 0:
+            self._retire_host(host)
+            if host.in_use_count == 0 and host.ready_future.done():
+                await self._destroy_host(host)
+            return
+
+        host.closing_windows += 1
+        close_fut = self._close_window_in_background(slot)
+        released_closing = False
+
+        def _release_closing(_fut: asyncio.Future[None] | None = None) -> None:
+            nonlocal released_closing
+            if released_closing:
+                return
+            released_closing = True
+            host.closing_windows -= 1
+            if (
+                (self._is_closed() or host.retired)
+                and host.in_use_count == 0
+                and host.ready_future.done()
+            ):
+                self._destroy_host_in_background(host)
+
+        try:
+            await asyncio.shield(close_fut)
+        except asyncio.CancelledError:
+            close_fut.add_done_callback(_release_closing)
+            raise
+        except BaseException:
+            _release_closing()
+            raise
+
+        if self._is_closed() or host.retired or host.open_window_count == 0:
+            if host.open_window_count == 0 and not host.retired:
+                self._retire_host(host)
+            _release_closing()
+            if host.in_use_count == 0 and host.ready_future.done():
+                await self._destroy_host(host)
+            return
+
+        loop = asyncio.get_running_loop()
+        ping_fut = loop.run_in_executor(None, host.ping)
+        self._track_background(ping_fut)
+
+        def _ping_abandoned(fut: asyncio.Future[None]) -> None:
+            try:
+                if not fut.cancelled() and fut.exception() is not None:
+                    self._failed += 1
+                    self._retire_host(host)
+            finally:
+                _release_closing()
+
+        try:
+            await asyncio.shield(ping_fut)
+        except asyncio.CancelledError:
+            ping_fut.add_done_callback(_ping_abandoned)
+            raise
+        except (OSError, WayboundDaemonError, RuntimeError):
+            self._failed += 1
+            self._retire_host(host)
+            _release_closing()
+            if host.in_use_count == 0 and host.ready_future.done():
+                await self._destroy_host(host)
+            return
+        except BaseException:
+            _release_closing()
+            raise
+
+        _release_closing()
+        if (
+            (self._is_closed() or host.retired)
+            and host.in_use_count == 0
+            and host.ready_future.done()
+        ):
+            await self._destroy_host(host)
+
+    async def _return_or_recycle_stacked(  # noqa: PLR0912
+        self, slot: _PoolSlot, *, had_error: bool, permit: _Permit
+    ) -> None:
+        host = slot.host
+        if host is None:
+            return
+
+        if self._is_closed() or host.override_proxy:
+            host.active_slots.discard(slot)
+            if host.override_proxy and not self._is_closed():
+                self._recycled += 1
+            self._retire_host(host)
+            if host.in_use_count == 0 and host.ready_future.done():
+                await self._destroy_host(host)
+            return
+
+        if host.retired:
+            host.active_slots.discard(slot)
+            self._recycled += 1
+            if host.in_use_count == 0 and host.ready_future.done():
+                await self._destroy_host(host)
+            return
+
+        reached_max_uses = (
+            self._max_uses_per_slot is not None and slot.uses >= self._max_uses_per_slot
+        )
+        if had_error or reached_max_uses:
+            host.active_slots.discard(slot)
+            await self._recycle_stacked_window(slot, host)
+            return
+
+        try:
+            await _run_detached(slot.ping, self._health_check_abandoned(slot, permit))
+        except asyncio.CancelledError:
+            permit.transferred = True
+            raise
+        except (OSError, WayboundDaemonError, RuntimeError):
+            host.active_slots.discard(slot)
+            self._failed += 1
+            self._recycled += 1
+            self._retire_host(host)
+            if host.in_use_count == 0 and host.ready_future.done():
+                await self._destroy_host(host)
+            return
+        except BaseException:
+            host.active_slots.discard(slot)
+            raise
+
+        host.active_slots.discard(slot)
+        if self._is_closed() or host.retired:
+            if host.in_use_count == 0 and host.ready_future.done():
+                await self._destroy_host(host)
+            return
+
+        host.idle_slots.append(slot)
+        self._idle.append(slot)
+
     async def close(self) -> None:
         """Close all idle and active browser slots and terminate any isolated display stacks.
 
@@ -1207,14 +2058,31 @@ class BrowserPool:
             if not waiter.done():
                 waiter.set_exception(RuntimeError("BrowserPool is closed"))
 
-        slots_to_close: list[_PoolSlot] = list(self._idle)
+        slots_to_close: list[_PoolSlot] = [s for s in self._idle if s.host is None]
         self._idle.clear()
-        slots_to_close.extend(self._active_slots)
+        slots_to_close.extend(s for s in self._active_slots if s.host is None)
         self._active_slots.clear()
+
+        hosts_to_close = list(self._hosts)
+        self._hosts.clear()
+        hosts_to_close.extend(self._retiring_hosts)
+        seen_hosts: set[_BrowserHost] = set()
+        for host in hosts_to_close:
+            if host in seen_hosts:
+                continue
+            seen_hosts.add(host)
+            host.retired = True
+            host.idle_slots.clear()
+            host.active_slots.clear()
+            if host.ready_future.done():
+                if host.session is not None or host.display_stack is not None:
+                    self._destroy_host_in_background(host)
+                else:
+                    self._retiring_hosts.discard(host)
 
         # Each slot has exactly one teardown: a borrower still holding a slot taken here joins
         # this teardown on exit instead of starting a second one.
         for slot in slots_to_close:
             self._destroy_in_background(slot)
-        # Also waits for teardowns started by cancelled acquires.
+        # Also waits for teardowns and in-flight host launches started by acquires.
         await self._wait_for_teardowns()

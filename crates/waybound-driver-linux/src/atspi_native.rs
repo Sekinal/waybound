@@ -69,6 +69,79 @@ const CHROME_TOKENS: [&str; 4] = ["chrome", "chromium", "google-chrome", "brave"
 type AccessibleRef = (String, OwnedObjectPath);
 type ResolvedRoot = (Option<AccessibleRef>, Option<String>, Option<Bounds>);
 
+/// Optional AT-SPI2 top-level `frame` scope for multi-window browsers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowScope<'a> {
+    /// Expected window title (for example from `xdg_toplevel::set_title`).
+    pub title: Option<&'a str>,
+    /// 0-based fallback index among direct `frame` children of the browser application.
+    pub index: Option<usize>,
+}
+
+impl WindowScope<'_> {
+    const fn is_unscoped(self) -> bool {
+        self.title.is_none() && self.index.is_none()
+    }
+}
+
+/// Selects the index of the matching `frame` child for `scope`.
+///
+/// Matching priority:
+/// 1. Exact `Name == title` (when `title` is non-empty).
+/// 2. Case-insensitive prefix match on `title` (when `title` is non-empty).
+/// 3. Case-insensitive substring match (either `name` contains `title` or `title` contains
+///    non-empty `name`).
+/// 4. Fallback to `scope.index` when in bounds.
+///
+/// Within each title tier, `scope.index` is checked first so multiple windows sharing the
+/// exact same title (for example two `"New Tab - Google Chrome"` frames) still resolve to
+/// their respective frame instead of always collapsing onto index `0`.
+#[must_use]
+pub fn select_frame_index(frame_names: &[Option<String>], scope: WindowScope<'_>) -> Option<usize> {
+    fn pick_tier<F>(
+        frame_names: &[Option<String>],
+        index: Option<usize>,
+        predicate: F,
+    ) -> Option<usize>
+    where
+        F: Fn(&Option<String>) -> bool,
+    {
+        if let Some(idx) = index
+            && frame_names.get(idx).is_some_and(&predicate)
+        {
+            return Some(idx);
+        }
+        frame_names.iter().position(predicate)
+    }
+
+    if frame_names.is_empty() {
+        return None;
+    }
+    if let Some(title) = scope.title.map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some(pos) = pick_tier(frame_names, scope.index, |name| {
+            name.as_deref() == Some(title)
+        }) {
+            return Some(pos);
+        }
+        let needle = title.to_ascii_lowercase();
+        if let Some(pos) = pick_tier(frame_names, scope.index, |name| {
+            name.as_deref()
+                .is_some_and(|n| n.to_ascii_lowercase().starts_with(&needle))
+        }) {
+            return Some(pos);
+        }
+        if let Some(pos) = pick_tier(frame_names, scope.index, |name| {
+            name.as_deref().is_some_and(|n| {
+                let hay = n.trim().to_ascii_lowercase();
+                !hay.is_empty() && (hay.contains(&needle) || needle.contains(&hay))
+            })
+        }) {
+            return Some(pos);
+        }
+    }
+    scope.index.filter(|&idx| idx < frame_names.len())
+}
+
 /// Environment variable selecting the tree walk: `sequential` forces
 /// [`WalkStrategy::Sequential`]; anything else (or unset) uses the pipelined default.
 pub const WALK_STRATEGY_ENV: &str = "WAYBOUND_ATSPI_WALK";
@@ -402,18 +475,31 @@ impl AtspiClient {
     /// navigated-away documents alive in its `BFcache` answering D-Bus queries (`GetRoleName`,
     /// `GetState`, `GetExtents`, `GetChildren`) with frozen state even after detaching them
     /// from the active window hierarchy.
-    fn resolve_web_root(&self, target_pid: Option<i32>) -> Result<ResolvedRoot> {
+    fn resolve_web_root(
+        &self,
+        target_pid: Option<i32>,
+        scope: WindowScope<'_>,
+    ) -> Result<ResolvedRoot> {
         let apps = self.registry_apps()?;
         let Some(target_app) = self.find_target_app(&apps, target_pid) else {
             return Ok((None, None, None));
         };
-        Ok(self.locate_web_document(&target_app))
+        let scan_root = if scope.is_unscoped() {
+            target_app
+        } else {
+            let Some(frame) = self.resolve_window_frame(&target_app, scope) else {
+                return Ok((None, None, None));
+            };
+            frame
+        };
+        Ok(self.locate_web_document(&scan_root))
     }
 
     /// Pipelined [`Self::resolve_web_root`].
     fn resolve_web_root_pipelined(
         &self,
         target_pid: Option<i32>,
+        scope: WindowScope<'_>,
         window: usize,
     ) -> Result<ResolvedRoot> {
         let apps = self.registry_apps()?;
@@ -421,22 +507,31 @@ impl AtspiClient {
             return Ok((None, None, None));
         };
         let walker = PipelinedWalker::new(self.conn.inner(), &self.budget, window);
-        Ok(futures_lite::future::block_on(
-            walker.locate_web_document(&target_app),
-        ))
+        Ok(futures_lite::future::block_on(async {
+            let scan_root = if scope.is_unscoped() {
+                target_app
+            } else {
+                let Some(frame) = walker.resolve_window_frame(&target_app, scope).await else {
+                    return (None, None, None);
+                };
+                frame
+            };
+            walker.locate_web_document(&scan_root).await
+        }))
     }
 
     fn resolve_web_root_with(
         &mut self,
         target_pid: Option<i32>,
+        scope: WindowScope<'_>,
         strategy: WalkStrategy,
         what: &'static str,
     ) -> Result<ResolvedRoot> {
         self.run(
             strategy,
             what,
-            |client, window| client.resolve_web_root_pipelined(target_pid, window),
-            |client| client.resolve_web_root(target_pid),
+            |client, window| client.resolve_web_root_pipelined(target_pid, scope, window),
+            |client| client.resolve_web_root(target_pid, scope),
         )
     }
 
@@ -448,8 +543,27 @@ impl AtspiClient {
     /// queried or the connection is lost, or [`WayboundError::Timeout`] if the browser
     /// stops answering (see [`CALL_TIMEOUT`] and [`OPERATION_DEADLINE`]).
     pub fn current_url(&mut self, target_pid: Option<i32>) -> Result<Option<String>> {
+        self.current_url_for_window(target_pid, None, None)
+    }
+
+    /// Fast-path URL lookup scoped to a specific browser window `frame` (matched by
+    /// `window_title` and/or fallback `window_index`).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::current_url`].
+    pub fn current_url_for_window(
+        &mut self,
+        target_pid: Option<i32>,
+        window_title: Option<&str>,
+        window_index: Option<usize>,
+    ) -> Result<Option<String>> {
+        let scope = WindowScope {
+            title: window_title,
+            index: window_index,
+        };
         let (_, url, _) =
-            self.resolve_web_root_with(target_pid, WalkStrategy::from_env(), "URL lookup")?;
+            self.resolve_web_root_with(target_pid, scope, WalkStrategy::from_env(), "URL lookup")?;
         Ok(url.filter(|u| !u.trim().is_empty()))
     }
 
@@ -459,8 +573,12 @@ impl AtspiClient {
     ///
     /// Same as [`Self::current_url`].
     pub fn viewport_bounds(&mut self, target_pid: Option<i32>) -> Result<Option<Bounds>> {
-        let (_, _, bounds) =
-            self.resolve_web_root_with(target_pid, WalkStrategy::from_env(), "viewport lookup")?;
+        let (_, _, bounds) = self.resolve_web_root_with(
+            target_pid,
+            WindowScope::default(),
+            WalkStrategy::from_env(),
+            "viewport lookup",
+        )?;
         Ok(bounds)
     }
 
@@ -489,6 +607,26 @@ impl AtspiClient {
         self.snapshot_with_strategy(target_pid, max_nodes, WalkStrategy::from_env())
     }
 
+    /// Captures an accessibility snapshot scoped to a specific browser window `frame`
+    /// (matched by `window_title` and/or fallback `window_index`), capped at `max_nodes`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::current_url`].
+    pub fn snapshot_limited_for_window(
+        &mut self,
+        target_pid: Option<i32>,
+        max_nodes: usize,
+        window_title: Option<&str>,
+        window_index: Option<usize>,
+    ) -> Result<AtspiSnapshot> {
+        let scope = WindowScope {
+            title: window_title,
+            index: window_index,
+        };
+        self.snapshot_with_strategy_scoped(target_pid, max_nodes, scope, WalkStrategy::from_env())
+    }
+
     /// Captures an accessibility snapshot capped at `max_nodes` with an explicit tree walk
     /// `strategy`. Both strategies return identical snapshots for an unchanging page.
     ///
@@ -501,12 +639,22 @@ impl AtspiClient {
         max_nodes: usize,
         strategy: WalkStrategy,
     ) -> Result<AtspiSnapshot> {
+        self.snapshot_with_strategy_scoped(target_pid, max_nodes, WindowScope::default(), strategy)
+    }
+
+    fn snapshot_with_strategy_scoped(
+        &mut self,
+        target_pid: Option<i32>,
+        max_nodes: usize,
+        scope: WindowScope<'_>,
+        strategy: WalkStrategy,
+    ) -> Result<AtspiSnapshot> {
         let limit = max_nodes.clamp(waybound_core::MIN_MAX_NODES, waybound_core::MAX_MAX_NODES);
         let snapshot = self.run(
             strategy,
             "snapshot",
-            |client, window| client.snapshot_pipelined(target_pid, limit, window),
-            |client| client.snapshot_sequential(target_pid, limit),
+            |client, window| client.snapshot_pipelined(target_pid, scope, limit, window),
+            |client| client.snapshot_sequential(target_pid, scope, limit),
         )?;
         debug!(
             nodes = snapshot.nodes.len(),
@@ -517,8 +665,13 @@ impl AtspiClient {
     }
 
     /// The reference walk: one blocking D-Bus call at a time.
-    fn snapshot_sequential(&self, target_pid: Option<i32>, limit: usize) -> Result<AtspiSnapshot> {
-        let (web_root, current_url, viewport_bounds) = self.resolve_web_root(target_pid)?;
+    fn snapshot_sequential(
+        &self,
+        target_pid: Option<i32>,
+        scope: WindowScope<'_>,
+        limit: usize,
+    ) -> Result<AtspiSnapshot> {
+        let (web_root, current_url, viewport_bounds) = self.resolve_web_root(target_pid, scope)?;
         let Some(root) = web_root else {
             return Ok(AtspiSnapshot {
                 nodes: Vec::new(),
@@ -540,6 +693,7 @@ impl AtspiClient {
     fn snapshot_pipelined(
         &self,
         target_pid: Option<i32>,
+        scope: WindowScope<'_>,
         limit: usize,
         window: usize,
     ) -> Result<AtspiSnapshot> {
@@ -555,7 +709,15 @@ impl AtspiClient {
         let walker = PipelinedWalker::new(self.conn.inner(), &self.budget, window);
         let ((web_root, current_url, viewport_bounds), tree) =
             futures_lite::future::block_on(async {
-                let resolved = walker.locate_web_document(&target_app).await;
+                let scan_root = if scope.is_unscoped() {
+                    target_app
+                } else {
+                    let Some(frame) = walker.resolve_window_frame(&target_app, scope).await else {
+                        return ((None, None, None), None);
+                    };
+                    frame
+                };
+                let resolved = walker.locate_web_document(&scan_root).await;
                 let tree = match &resolved.0 {
                     Some(root) => Some(walker.walk_web_document(root, limit).await),
                     None => None,
@@ -573,6 +735,33 @@ impl AtspiClient {
                 viewport_bounds,
             },
         })
+    }
+
+    fn resolve_window_frame(
+        &self,
+        app: &AccessibleRef,
+        scope: WindowScope<'_>,
+    ) -> Option<AccessibleRef> {
+        let children = self.get_children(&app.0, app.1.as_str())?;
+        let mut frames: Vec<AccessibleRef> = Vec::new();
+        let mut names: Vec<Option<String>> = Vec::new();
+        for child in children {
+            if child.0.is_empty() || self.budget.abort().is_some() {
+                continue;
+            }
+            let role = self
+                .get_role_name(&child.0, child.1.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if role == "frame" {
+                let name = self.get_name(&child.0, child.1.as_str());
+                frames.push(child);
+                names.push(name);
+            }
+        }
+        let idx = select_frame_index(&names, scope)?;
+        frames.into_iter().nth(idx)
     }
 
     fn find_target_app(
@@ -1301,6 +1490,40 @@ impl<'a> PipelinedWalker<'a> {
         }
     }
 
+    /// Pipelined equivalent of [`AtspiClient::resolve_window_frame`].
+    async fn resolve_window_frame(
+        &self,
+        app: &AccessibleRef,
+        scope: WindowScope<'_>,
+    ) -> Option<AccessibleRef> {
+        let children = self.children(&app.0, app.1.as_str()).await?;
+        let mut in_flight = FuturesOrdered::new();
+        for child in children {
+            if child.0.is_empty() {
+                continue;
+            }
+            in_flight.push_back(async move {
+                let (role_raw, name) = join(
+                    self.role_name(&child.0, child.1.as_str()),
+                    self.name(&child.0, child.1.as_str()),
+                )
+                .await;
+                let role = role_raw.unwrap_or_default().trim().to_ascii_lowercase();
+                (child, role, name)
+            });
+        }
+        let mut frames: Vec<AccessibleRef> = Vec::new();
+        let mut names: Vec<Option<String>> = Vec::new();
+        while let Some((child, role, name)) = in_flight.next().await {
+            if role == "frame" {
+                frames.push(child);
+                names.push(name);
+            }
+        }
+        let idx = select_frame_index(&names, scope)?;
+        frames.into_iter().nth(idx)
+    }
+
     /// Pipelined equivalent of [`AtspiClient::locate_web_document`].
     async fn locate_web_document(&self, app: &AccessibleRef) -> ResolvedRoot {
         let mut current_url: Option<String> = None;
@@ -1709,5 +1932,167 @@ mod tests {
         assert_eq!(sequential_walk(&wide, &root, 10), expected);
         assert_eq!(pipelined_walk(&wide, &root, 10, 64), expected);
         Ok(())
+    }
+
+    #[test]
+    fn select_frame_index_prefers_exact_then_prefix_then_substring_then_index() {
+        let frames = vec![
+            Some("Waybound Window 1 - Google Chrome".to_owned()),
+            Some("Waybound Window 2 - Google Chrome".to_owned()),
+            Some("Dashboard - Waybound Window 2".to_owned()),
+            None,
+        ];
+
+        // Exact match wins over prefix/substring.
+        assert_eq!(
+            select_frame_index(
+                &frames,
+                WindowScope {
+                    title: Some("Waybound Window 2 - Google Chrome"),
+                    index: Some(0),
+                }
+            ),
+            Some(1)
+        );
+
+        // Case-insensitive prefix match wins over substring match.
+        assert_eq!(
+            select_frame_index(
+                &frames,
+                WindowScope {
+                    title: Some("waybound window 2"),
+                    index: Some(0),
+                }
+            ),
+            Some(1)
+        );
+
+        // Case-insensitive substring match when no exact or prefix match exists.
+        assert_eq!(
+            select_frame_index(
+                &frames,
+                WindowScope {
+                    title: Some("dashboard"),
+                    index: Some(0),
+                }
+            ),
+            Some(2)
+        );
+
+        // Fallback to index when title is absent or unmatched.
+        assert_eq!(
+            select_frame_index(
+                &frames,
+                WindowScope {
+                    title: Some("Nonexistent Title"),
+                    index: Some(3),
+                }
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            select_frame_index(
+                &frames,
+                WindowScope {
+                    title: None,
+                    index: Some(1),
+                }
+            ),
+            Some(1)
+        );
+
+        // Out-of-bounds index returns None.
+        assert_eq!(
+            select_frame_index(
+                &frames,
+                WindowScope {
+                    title: Some("Nonexistent"),
+                    index: Some(10),
+                }
+            ),
+            None
+        );
+
+        // Empty frame list returns None.
+        assert_eq!(
+            select_frame_index(
+                &[],
+                WindowScope {
+                    title: Some("Waybound"),
+                    index: Some(0),
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn select_frame_index_disambiguates_identical_titles_using_scope_index() {
+        let frames = vec![
+            Some("New Tab - Google Chrome".to_owned()),
+            Some("New Tab - Google Chrome".to_owned()),
+        ];
+
+        // Exact-title tie prefers scope.index (1 instead of 0).
+        assert_eq!(
+            select_frame_index(
+                &frames,
+                WindowScope {
+                    title: Some("New Tab - Google Chrome"),
+                    index: Some(1),
+                }
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            select_frame_index(
+                &frames,
+                WindowScope {
+                    title: Some("New Tab - Google Chrome"),
+                    index: Some(0),
+                }
+            ),
+            Some(0)
+        );
+
+        // Case-insensitive prefix tie prefers scope.index.
+        assert_eq!(
+            select_frame_index(
+                &frames,
+                WindowScope {
+                    title: Some("new tab"),
+                    index: Some(1),
+                }
+            ),
+            Some(1)
+        );
+
+        // Case-insensitive substring tie prefers scope.index.
+        assert_eq!(
+            select_frame_index(
+                &frames,
+                WindowScope {
+                    title: Some("google chrome"),
+                    index: Some(1),
+                }
+            ),
+            Some(1)
+        );
+
+        // Higher-priority tier still beats a lower-priority match at scope.index.
+        let mixed = vec![
+            Some("New Tab - Google Chrome".to_owned()),
+            Some("New Tab".to_owned()),
+        ];
+        assert_eq!(
+            select_frame_index(
+                &mixed,
+                WindowScope {
+                    title: Some("New Tab"),
+                    index: Some(0),
+                }
+            ),
+            Some(1)
+        );
     }
 }

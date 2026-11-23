@@ -6,9 +6,9 @@ import tempfile
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
-from waybound.transport import WayboundDaemonError
+from waybound.transport import WayboundDaemonError, _validate_window_id
 from waybound.types import (
     AccessibilityNode,
     CapturedResponse,
@@ -20,7 +20,9 @@ from waybound.types import (
     SessionFingerprint,
     SupportsTreeSnapshot,
     SupportsWebSocketFrames,
+    SupportsWindows,
     TreeSnapshot,
+    WindowSummary,
 )
 
 if TYPE_CHECKING:
@@ -29,6 +31,71 @@ if TYPE_CHECKING:
     from waybound.handoff import HandoffHttpClient
     from waybound.types import Transport
 
+    class _ScopedTransport(Protocol):
+        def snapshot_tree(
+            self, *, max_nodes: int | None = None, window_id: int | None = None
+        ) -> list[AccessibilityNode]: ...
+        def snapshot_tree_with_meta(
+            self, *, max_nodes: int | None = None, window_id: int | None = None
+        ) -> TreeSnapshot: ...
+        def locate_all(
+            self, query: LocatorQuery, *, window_id: int | None = None
+        ) -> list[AccessibilityNode]: ...
+        def current_url(self, *, window_id: int | None = None) -> str | None: ...
+        def wait_for(
+            self,
+            query: LocatorQuery,
+            *,
+            timeout_ms: int = 10_000,
+            window_id: int | None = None,
+        ) -> AccessibilityNode: ...
+        def hover(self, query: LocatorQuery, *, window_id: int | None = None) -> None: ...
+        def click(self, query: LocatorQuery, *, window_id: int | None = None) -> None: ...
+        def dblclick(self, query: LocatorQuery, *, window_id: int | None = None) -> None: ...
+        def select_option(
+            self,
+            query: LocatorQuery,
+            *,
+            label: str | None = None,
+            index: int | None = None,
+            window_id: int | None = None,
+        ) -> None: ...
+        def fill(self, query: LocatorQuery, text: str, *, window_id: int | None = None) -> None: ...
+        def set_checked(
+            self, query: LocatorQuery, *, checked: bool, window_id: int | None = None
+        ) -> AccessibilityNode: ...
+        def navigate(self, url: str, *, window_id: int | None = None) -> None: ...
+        def reload(self, *, window_id: int | None = None) -> None: ...
+        def go_back(self, *, window_id: int | None = None) -> None: ...
+        def go_forward(self, *, window_id: int | None = None) -> None: ...
+        def new_tab(self, url: str | None = None, *, window_id: int | None = None) -> None: ...
+        def close_tab(self, *, window_id: int | None = None) -> None: ...
+        def next_tab(self, *, window_id: int | None = None) -> None: ...
+        def prev_tab(self, *, window_id: int | None = None) -> None: ...
+        def scroll(
+            self, delta_x: float, delta_y: float, *, window_id: int | None = None
+        ) -> None: ...
+        def press(
+            self,
+            key: str,
+            *,
+            modifiers: tuple[KeyModifier, ...] = (),
+            window_id: int | None = None,
+        ) -> None: ...
+        def screenshot(self, path: str, *, window_id: int | None = None) -> None: ...
+        def drag_to(
+            self,
+            source: LocatorQuery,
+            target: LocatorQuery,
+            *,
+            timeout_ms: int = 5_000,
+            window_id: int | None = None,
+        ) -> None: ...
+
+
+def _as_scoped(transport: Transport) -> _ScopedTransport:
+    return cast("_ScopedTransport", transport)
+
 
 @dataclass(frozen=True, slots=True)
 class Locator:
@@ -36,6 +103,7 @@ class Locator:
 
     _transport: Transport
     query: LocatorQuery
+    _window_id: int | None = None
 
     @property
     def first(self) -> Locator:
@@ -48,7 +116,9 @@ class Locator:
             msg = f"nth index must be non-negative, got {index}"
             raise ValueError(msg)
         return Locator(
-            _transport=self._transport, query=replace(self.query, nth=index, strict=False)
+            _transport=self._transport,
+            query=replace(self.query, nth=index, strict=False),
+            _window_id=self._window_id,
         )
 
     def get_by_role(
@@ -69,6 +139,7 @@ class Locator:
                 within=self.query,
                 strict=strict,
             ),
+            _window_id=self._window_id,
         )
 
     def get_by_text(self, text: str, *, exact: bool = False, strict: bool = False) -> Locator:
@@ -82,11 +153,14 @@ class Locator:
                 within=self.query,
                 strict=strict,
             ),
+            _window_id=self._window_id,
         )
 
     def all(self) -> list[AccessibilityNode]:
         """Return all accessibility nodes matching this locator."""
-        return self._transport.locate_all(self.query)
+        if self._window_id is None:
+            return self._transport.locate_all(self.query)
+        return _as_scoped(self._transport).locate_all(self.query, window_id=self._window_id)
 
     def count(self) -> int:
         """Return the number of accessibility nodes matching this locator."""
@@ -102,11 +176,18 @@ class Locator:
 
     def hover(self) -> None:
         """Move the pointer over the resolved element using native OS input without clicking."""
-        self._transport.hover(self.query)
+        if self._window_id is None:
+            self._transport.hover(self.query)
+            return
+        _as_scoped(self._transport).hover(self.query, window_id=self._window_id)
 
     def wait_for(self, *, timeout_ms: int = 10_000) -> AccessibilityNode:
         """Wait until this element appears in the accessibility tree."""
-        return self._transport.wait_for(self.query, timeout_ms=timeout_ms)
+        if self._window_id is None:
+            return self._transport.wait_for(self.query, timeout_ms=timeout_ms)
+        return _as_scoped(self._transport).wait_for(
+            self.query, timeout_ms=timeout_ms, window_id=self._window_id
+        )
 
     def text_content(self, *, timeout_ms: int = 5_000) -> str | None:
         """Return the accessible name or value text of the resolved element."""
@@ -120,19 +201,33 @@ class Locator:
 
     def click(self) -> None:
         """Click the resolved element using native OS input."""
-        self._transport.click(self.query)
+        if self._window_id is None:
+            self._transport.click(self.query)
+            return
+        _as_scoped(self._transport).click(self.query, window_id=self._window_id)
 
     def dblclick(self) -> None:
         """Double-click the resolved element using native OS input."""
-        self._transport.dblclick(self.query)
+        if self._window_id is None:
+            self._transport.dblclick(self.query)
+            return
+        _as_scoped(self._transport).dblclick(self.query, window_id=self._window_id)
 
     def select_option(self, *, label: str | None = None, index: int | None = None) -> None:
         """Select an option from a `<select>` or combobox by label or 0-based index."""
-        self._transport.select_option(self.query, label=label, index=index)
+        if self._window_id is None:
+            self._transport.select_option(self.query, label=label, index=index)
+            return
+        _as_scoped(self._transport).select_option(
+            self.query, label=label, index=index, window_id=self._window_id
+        )
 
     def fill(self, text: str) -> None:
         """Fill the resolved input element using native keyboard events."""
-        self._transport.fill(self.query, text)
+        if self._window_id is None:
+            self._transport.fill(self.query, text)
+            return
+        _as_scoped(self._transport).fill(self.query, text, window_id=self._window_id)
 
     def drag_to(self, target: Locator, *, timeout_ms: int = 5_000) -> None:
         """Drag this element onto `target` with a native press, pointer path, and release.
@@ -140,7 +235,12 @@ class Locator:
         Waits up to `timeout_ms` for each of the two elements to appear. The mouse button
         is always released, even when the drag fails part-way.
         """
-        self._transport.drag_to(self.query, target.query, timeout_ms=timeout_ms)
+        if self._window_id is None:
+            self._transport.drag_to(self.query, target.query, timeout_ms=timeout_ms)
+            return
+        _as_scoped(self._transport).drag_to(
+            self.query, target.query, timeout_ms=timeout_ms, window_id=self._window_id
+        )
 
     def check(self) -> None:
         """Ensure the checkbox/radio/switch is checked, clicking only if it is not.
@@ -150,7 +250,10 @@ class Locator:
         `invalid_element_state` if the element has no checked state or the click did not
         check it.
         """
-        self._transport.set_checked(self.query, checked=True)
+        if self._window_id is None:
+            self._transport.set_checked(self.query, checked=True)
+            return
+        _as_scoped(self._transport).set_checked(self.query, checked=True, window_id=self._window_id)
 
     def uncheck(self) -> None:
         """Ensure the checkbox/switch is unchecked, clicking only if it is checked.
@@ -159,7 +262,12 @@ class Locator:
         click. Radio buttons cannot be unchecked (`invalid_element_state`); check another
         option instead. Errors are otherwise the same as for `check()`.
         """
-        self._transport.set_checked(self.query, checked=False)
+        if self._window_id is None:
+            self._transport.set_checked(self.query, checked=False)
+            return
+        _as_scoped(self._transport).set_checked(
+            self.query, checked=False, window_id=self._window_id
+        )
 
     def is_checked(self, *, timeout_ms: int = 5_000) -> bool:
         """Return whether the element is checked (a mixed checkbox is not checked).
@@ -181,18 +289,59 @@ class Locator:
 class Page:
     """High-level semantic interface to a controlled browser session."""
 
-    def __init__(self, transport: Transport) -> None:
+    def __init__(self, transport: Transport, *, window_id: int | None = None) -> None:
+        if window_id is not None:
+            _validate_window_id(window_id)
         self._transport = transport
+        self._window_id = window_id
         self._last_tree_truncated = False
+
+    @property
+    def window_id(self) -> int | None:
+        """Backend window identifier this page is scoped to, or `None` for the default window."""
+        return self._window_id
 
     @property
     def last_tree_truncated(self) -> bool:
         """Whether the most recent `snapshot_tree()` call was truncated at the node cap."""
         return self._last_tree_truncated
 
+    def list_windows(self) -> list[WindowSummary]:
+        """Return open browser windows tracked by the active backend."""
+        transport = self._transport
+        if not isinstance(transport, SupportsWindows):
+            msg = f"{type(transport).__name__} does not support list_windows"
+            raise NotImplementedError(msg)
+        return transport.list_windows()
+
+    def new_page(self, url: str | None = None, *, incognito: bool = False) -> Page:
+        """Open a new browser window on this transport and return a `Page` scoped to it."""
+        transport = self._transport
+        if not isinstance(transport, SupportsWindows):
+            msg = f"{type(transport).__name__} does not support new_window"
+            raise NotImplementedError(msg)
+        win = transport.new_window(url, incognito=incognito)
+        return Page(self._transport, window_id=win.id)
+
+    def close_window(self) -> None:
+        """Close the browser window this page is scoped to.
+
+        Raises `ValueError` when this page is unscoped (`window_id is None`).
+        """
+        if self._window_id is None:
+            msg = "cannot close_window() on an unscoped Page (window_id is None)"
+            raise ValueError(msg)
+        transport = self._transport
+        if not isinstance(transport, SupportsWindows):
+            msg = f"{type(transport).__name__} does not support close_window"
+            raise NotImplementedError(msg)
+        transport.close_window(self._window_id)
+
     def url(self) -> str | None:
         """Return the active tab URL from the browser's web area, if available."""
-        return self._transport.current_url()
+        if self._window_id is None:
+            return self._transport.current_url()
+        return _as_scoped(self._transport).current_url(window_id=self._window_id)
 
     def wait_for_url(self, url_contains: str, *, timeout_ms: int = 10_000) -> str:
         """Poll until the active tab URL contains `url_contains` or `timeout_ms` elapses.
@@ -206,7 +355,7 @@ class Page:
         last_transient: WayboundDaemonError | None = None
         while True:
             try:
-                current = self._transport.current_url()
+                current = self.url()
             except WayboundDaemonError as exc:
                 if exc.code != "transient":
                     raise
@@ -223,35 +372,59 @@ class Page:
 
     def goto(self, url: str) -> None:
         """Navigate the active browser tab to `url` via native OS shortcut."""
-        self._transport.navigate(url)
+        if self._window_id is None:
+            self._transport.navigate(url)
+            return
+        _as_scoped(self._transport).navigate(url, window_id=self._window_id)
 
     def reload(self) -> None:
         """Reload the active browser tab via native OS shortcut."""
-        self._transport.reload()
+        if self._window_id is None:
+            self._transport.reload()
+            return
+        _as_scoped(self._transport).reload(window_id=self._window_id)
 
     def go_back(self) -> None:
         """Navigate back in browser history via native OS shortcut."""
-        self._transport.go_back()
+        if self._window_id is None:
+            self._transport.go_back()
+            return
+        _as_scoped(self._transport).go_back(window_id=self._window_id)
 
     def go_forward(self) -> None:
         """Navigate forward in browser history via native OS shortcut."""
-        self._transport.go_forward()
+        if self._window_id is None:
+            self._transport.go_forward()
+            return
+        _as_scoped(self._transport).go_forward(window_id=self._window_id)
 
     def new_tab(self, url: str | None = None) -> None:
         """Open a new browser tab via native OS shortcut, optionally navigating to `url`."""
-        self._transport.new_tab(url)
+        if self._window_id is None:
+            self._transport.new_tab(url)
+            return
+        _as_scoped(self._transport).new_tab(url, window_id=self._window_id)
 
     def close_tab(self) -> None:
         """Close the active browser tab via native OS shortcut."""
-        self._transport.close_tab()
+        if self._window_id is None:
+            self._transport.close_tab()
+            return
+        _as_scoped(self._transport).close_tab(window_id=self._window_id)
 
     def next_tab(self) -> None:
         """Switch to the next browser tab (Ctrl+Tab)."""
-        self._transport.next_tab()
+        if self._window_id is None:
+            self._transport.next_tab()
+            return
+        _as_scoped(self._transport).next_tab(window_id=self._window_id)
 
     def prev_tab(self) -> None:
         """Switch to the previous browser tab (Ctrl+Shift+Tab)."""
-        self._transport.prev_tab()
+        if self._window_id is None:
+            self._transport.prev_tab()
+            return
+        _as_scoped(self._transport).prev_tab(window_id=self._window_id)
 
     def wait_for_text(
         self, text: str, *, exact: bool = False, timeout_ms: int = 10_000
@@ -261,11 +434,17 @@ class Page:
 
     def scroll(self, *, delta_x: float = 0.0, delta_y: float = -300.0) -> None:
         """Scroll the viewport by `(delta_x, delta_y)` pixels."""
-        self._transport.scroll(delta_x, delta_y)
+        if self._window_id is None:
+            self._transport.scroll(delta_x, delta_y)
+            return
+        _as_scoped(self._transport).scroll(delta_x, delta_y, window_id=self._window_id)
 
     def press(self, key: str, *, modifiers: tuple[KeyModifier, ...] = ()) -> None:
         """Emit a native key press (`enter`, `tab`, `escape`, `backspace`, or single char)."""
-        self._transport.press(key, modifiers=modifiers)
+        if self._window_id is None:
+            self._transport.press(key, modifiers=modifiers)
+            return
+        _as_scoped(self._transport).press(key, modifiers=modifiers, window_id=self._window_id)
 
     def snapshot_tree(self, *, max_nodes: int | None = None) -> list[AccessibilityNode]:
         """Return a snapshot of the live web-content accessibility tree."""
@@ -286,9 +465,18 @@ class Page:
             raise ValueError(msg)
         transport = self._transport
         if isinstance(transport, SupportsTreeSnapshot):
-            snap = transport.snapshot_tree_with_meta(max_nodes=max_nodes)
+            if self._window_id is None:
+                snap = transport.snapshot_tree_with_meta(max_nodes=max_nodes)
+            else:
+                snap = _as_scoped(transport).snapshot_tree_with_meta(
+                    max_nodes=max_nodes, window_id=self._window_id
+                )
         else:
-            nodes = transport.snapshot_tree()
+            nodes = (
+                transport.snapshot_tree()
+                if self._window_id is None
+                else _as_scoped(transport).snapshot_tree(window_id=self._window_id)
+            )
             truncated = max_nodes is not None and len(nodes) > max_nodes
             if truncated and max_nodes is not None:
                 nodes = nodes[:max_nodes]
@@ -370,12 +558,18 @@ class Page:
         """
         if path is not None:
             out_path = Path(path).resolve()
-            self._transport.screenshot(str(out_path))
+            if self._window_id is None:
+                self._transport.screenshot(str(out_path))
+            else:
+                _as_scoped(self._transport).screenshot(str(out_path), window_id=self._window_id)
             return out_path.read_bytes()
 
         with tempfile.TemporaryDirectory(prefix="wb-shot-") as tmp_dir:
             out_path = Path(tmp_dir) / "shot.png"
-            self._transport.screenshot(str(out_path))
+            if self._window_id is None:
+                self._transport.screenshot(str(out_path))
+            else:
+                _as_scoped(self._transport).screenshot(str(out_path), window_id=self._window_id)
             return out_path.read_bytes()
 
     def get_by_role(
@@ -390,6 +584,7 @@ class Page:
         return Locator(
             _transport=self._transport,
             query=LocatorQuery(role=role, name=name, exact=exact, strict=strict),
+            _window_id=self._window_id,
         )
 
     def get_by_text(self, text: str, *, exact: bool = False, strict: bool = False) -> Locator:
@@ -397,4 +592,5 @@ class Page:
         return Locator(
             _transport=self._transport,
             query=LocatorQuery(role=None, name=text, exact=exact, strict=strict),
+            _window_id=self._window_id,
         )

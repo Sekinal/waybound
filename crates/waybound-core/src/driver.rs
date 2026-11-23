@@ -233,4 +233,50 @@ pub trait Driver: Send + Sync {
     fn cancel_pointer_gesture(&self, button: MouseButton) -> Result<()> {
         self.dispatch_input(&InputEvent::MouseUp { button })
     }
+
+    /// Returns a view of this driver scoped to `window_id`, or `None` when this backend
+    /// does not support per-window targeting or the window does not exist.
+    fn for_window(&self, window_id: u64) -> Option<std::sync::Arc<dyn Driver>> {
+        let _ = window_id;
+        None
+    }
+
+    /// Lists open browser windows tracked by this backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend fails to enumerate open windows.
+    fn list_windows(&self) -> Result<Vec<crate::protocol::WindowSummary>> {
+        Ok(Vec::new())
+    }
+
+    /// Requests that the backend cleanly close `window_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::WayboundError::UnsupportedInput`] by default when window closing is not
+    /// supported by this backend, or [`crate::WayboundError::ElementNotFound`] if `window_id`
+    /// does not exist.
+    fn close_window(&self, window_id: u64) -> Result<()> {
+        Err(crate::WayboundError::UnsupportedInput {
+            backend: format!("{:?}", self.backend_kind()),
+            reason: format!("window {window_id} close is not supported by this backend"),
+        })
+    }
+
+    /// Opens a new window directly within the driver when supported without an external
+    /// launcher (for example in-memory mock drivers). Returns `Ok(None)` when window creation
+    /// is delegated to an external launcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if creating the window fails.
+    fn open_window(
+        &self,
+        url: Option<&str>,
+        incognito: bool,
+    ) -> Result<Option<crate::protocol::WindowSummary>> {
+        let _ = (url, incognito);
+        Ok(None)
+    }
 }

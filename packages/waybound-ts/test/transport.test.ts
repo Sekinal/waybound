@@ -666,4 +666,158 @@ describe("wire encoding helpers", () => {
       RangeError,
     );
   });
+
+  it("handles list_windows, new_window, close_window, and forwards window_id on scoped Page", async () => {
+    const d = await fakeDaemon((req, sock) => {
+      switch (req.method) {
+        case "list_windows":
+          reply(sock, {
+            status: "windows",
+            windows: [
+              {
+                id: 1,
+                title: "Main",
+                app_id: "google-chrome",
+                width: 1280,
+                height: 800,
+                has_buffer: true,
+              },
+            ],
+          });
+          break;
+        case "new_window":
+          reply(sock, {
+            status: "window",
+            window: {
+              id: 6,
+              title: "Second",
+              app_id: "google-chrome",
+              width: 1280,
+              height: 800,
+              has_buffer: true,
+            },
+          });
+          break;
+        case "snapshot_tree":
+        case "locate_all":
+          reply(sock, { status: "tree", nodes: [], truncated: false });
+          break;
+        case "current_url":
+          reply(sock, { status: "url", url: "https://scoped.example/" });
+          break;
+        default:
+          reply(sock, { status: "ok" });
+      }
+    });
+    const t = await Transport.connect(d.endpoint);
+    try {
+      const root = new Page(t);
+      assert.equal(root.windowId, undefined);
+      await assert.rejects(() => root.closeWindow(), /unscoped/);
+      assert.throws(() => new Page(t, -1), RangeError);
+
+      await root.goto("https://default.example/");
+      await root.getByRole(Role.BUTTON, { name: "Go" }).click();
+      assert.equal("window_id" in (d.requests[0] ?? {}), false);
+      assert.equal("window_id" in (d.requests[1] ?? {}), false);
+
+      const windows = await root.listWindows();
+      assert.deepEqual(windows, [
+        {
+          id: 1,
+          title: "Main",
+          appId: "google-chrome",
+          width: 1280,
+          height: 800,
+          hasBuffer: true,
+        },
+      ]);
+
+      const scoped = await root.newPage({ url: "https://second.example/", incognito: true });
+      assert.equal(scoped.windowId, 6);
+      assert.deepEqual(d.requests.at(-1), {
+        method: "new_window",
+        url: "https://second.example/",
+        incognito: true,
+      });
+
+      const startIdx = d.requests.length;
+      await scoped.url();
+      await scoped.goto("https://scoped.example/");
+      await scoped.reload();
+      await scoped.goBack();
+      await scoped.goForward();
+      await scoped.scroll({ deltaX: 1, deltaY: -2 });
+      await scoped.press("enter");
+      await scoped.snapshotTree();
+      await scoped
+        .getByRole(Role.GROUP, { name: "Card" })
+        .getByRole(Role.BUTTON, { name: "Buy" })
+        .first.click();
+      await scoped.getByText("Hello").hover();
+      await scoped.getByRole(Role.TEXTBOX, { name: "Q" }).fill("abc");
+
+      const scopedRequests = d.requests.slice(startIdx);
+      assert.ok(scopedRequests.length >= 11);
+      for (const req of scopedRequests) {
+        assert.equal(req.window_id, 6, `missing window_id on ${String(req.method)}`);
+      }
+
+      await scoped.closeWindow();
+      assert.deepEqual(d.requests.at(-1), { method: "close_window", window_id: 6 });
+    } finally {
+      t.close();
+      await d.close();
+    }
+  });
+
+  it("reports browserAlive from pingHealth() and preserves ping() string return", async () => {
+    const d = await fakeDaemon((_req, sock) => {
+      reply(sock, { status: "pong", version: "0.6.0", browser_alive: false });
+    });
+    const t = await Transport.connect(d.endpoint);
+    try {
+      assert.deepEqual(await t.pingHealth(), { version: "0.6.0", browserAlive: false });
+      assert.equal(await t.ping(), "0.6.0");
+    } finally {
+      t.close();
+      await d.close();
+    }
+  });
+
+  it("omits trailing undefined windowId args on unscoped Page/Locator and prevents windowId override on snapshotTree", async () => {
+    const argLengths: Record<string, number> = {};
+    const snapshotOpts: unknown[] = [];
+    const stubTransport = {
+      currentUrl(...args: unknown[]) {
+        argLengths.currentUrl = args.length;
+        return Promise.resolve(null);
+      },
+      navigate(...args: unknown[]) {
+        argLengths.navigate = args.length;
+        return Promise.resolve();
+      },
+      click(...args: unknown[]) {
+        argLengths.click = args.length;
+        return Promise.resolve();
+      },
+      snapshotTreeWithMeta(opts: unknown) {
+        snapshotOpts.push(opts);
+        return Promise.resolve({ nodes: [], truncated: false });
+      },
+    } as unknown as Transport;
+
+    const unscoped = new Page(stubTransport);
+    await unscoped.url();
+    await unscoped.goto("https://example.com/");
+    await unscoped.getByRole(Role.BUTTON, { name: "Go" }).click();
+    assert.deepEqual(argLengths, { currentUrl: 0, navigate: 1, click: 1 });
+
+    const scoped = new Page(stubTransport, 7);
+    await scoped.snapshotTree({
+      maxNodes: 50,
+      ...({ windowId: 99 } as Record<string, unknown>),
+    });
+    assert.deepEqual(snapshotOpts, [{ maxNodes: 50, windowId: 7 }]);
+  });
 });

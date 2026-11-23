@@ -172,6 +172,92 @@ describe("BrowserPool pure helpers", () => {
         }),
       RangeError,
     );
+    assert.throws(
+      () => new BrowserPool({ size: 2, windowsPerBrowser: 0, launchOptions: { backend: "mock" } }),
+      RangeError,
+    );
+    assert.throws(
+      () =>
+        new BrowserPool({ size: 2, windowsPerBrowser: 1.5, launchOptions: { backend: "mock" } }),
+      RangeError,
+    );
+    assert.throws(
+      () =>
+        new BrowserPool({
+          size: 4,
+          windowsPerBrowser: 2,
+          displayBackend: "xvfb",
+          launchOptions: { backend: "linux", launchChrome: true },
+        }),
+      RangeError,
+    );
+    assert.throws(
+      () =>
+        new BrowserPool({
+          size: 2,
+          windowsPerBrowser: 2,
+          displayBackend: "wayland",
+          launchOptions: { backend: "macos", launchChrome: true },
+        }),
+      RangeError,
+    );
+    assert.throws(
+      () =>
+        new BrowserPool({
+          size: 4,
+          windowsPerBrowser: 2,
+          displayBackend: "wayland",
+          launchOptions: { backend: "linux", launchChrome: false },
+        }),
+      RangeError,
+    );
+    assert.throws(
+      () =>
+        new BrowserPool({
+          size: 2,
+          windowsPerBrowser: 2,
+          remoteWorkers: ["127.0.0.1:49222", "127.0.0.1:49223"],
+        }),
+      RangeError,
+    );
+    // Valid Linux Wayland + launchChrome and mock configs succeed.
+    assert.doesNotThrow(
+      () =>
+        new BrowserPool({
+          size: 4,
+          windowsPerBrowser: 2,
+          displayBackend: "wayland",
+          launchOptions: { backend: "linux", launchChrome: true },
+        }),
+    );
+    // Multiple hosts still reject shared profileDir, single host allows it.
+    assert.doesNotThrow(
+      () =>
+        new BrowserPool({
+          size: 2,
+          windowsPerBrowser: 2,
+          launchOptions: { backend: "mock", profileDir: "/tmp/single-host" },
+        }),
+    );
+    assert.throws(
+      () =>
+        new BrowserPool({
+          size: 3,
+          windowsPerBrowser: 2,
+          launchOptions: { backend: "mock", profileDir: "/tmp/shared-host" },
+        }),
+      RangeError,
+    );
+    assert.throws(
+      () =>
+        new BrowserPool({
+          size: 2,
+          windowsPerBrowser: 2,
+          proxies: ["http://127.0.0.1:18081", "http://127.0.0.1:18082"],
+          launchOptions: { backend: "mock", profileDir: "/tmp/multi-proxy" },
+        }),
+      RangeError,
+    );
   });
 
   it("forwards --headless-wayland and rejects combining with --headless-xvfb", () => {
@@ -494,6 +580,392 @@ describe("BrowserPool live daemon integration", { skip }, () => {
       const recorded = readFileSync(argsLog, "utf8").trim().split("\n");
       assert.ok(recorded.includes("--headless-wayland"), `missing --headless-wayland: ${recorded}`);
       assert.ok(!recorded.includes("--headless-xvfb"), `unexpected --headless-xvfb: ${recorded}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("multiplexes 4 concurrent pages across only 2 daemons when windowsPerBrowser=2", async () => {
+    await using pool = new BrowserPool({
+      size: 4,
+      windowsPerBrowser: 2,
+      launchOptions: { backend: "mock", daemonBinary: DAEMON_BIN },
+    });
+
+    let active = 0;
+    let maxActive = 0;
+    let releaseBarrier!: () => void;
+    const allFourEntered = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    const transports = new Set<Transport>();
+    const windowKeys = new Set<string>();
+    const transportIds = new Map<Transport, number>();
+
+    const results = await Promise.all(
+      [0, 1, 2, 3].map((idx) =>
+        pool.withPage(async (page) => {
+          assert.ok(page.windowId !== undefined);
+          transports.add(page.transport);
+          let tid = transportIds.get(page.transport);
+          if (tid === undefined) {
+            tid = transportIds.size + 1;
+            transportIds.set(page.transport, tid);
+          }
+          windowKeys.add(`${tid}:${page.windowId}`);
+          active += 1;
+          maxActive = Math.max(maxActive, active);
+          if (active === 4) {
+            releaseBarrier();
+          }
+          await allFourEntered;
+          assert.equal((await page.snapshotTree()).length, 5);
+          await page.getByRole(Role.BUTTON, { name: "Search" }).click();
+          active -= 1;
+          return idx;
+        }),
+      ),
+    );
+
+    assert.deepEqual(results, [0, 1, 2, 3]);
+    assert.equal(maxActive, 4);
+    assert.equal(transports.size, 2);
+    assert.equal(windowKeys.size, 4);
+    assert.deepEqual(pool.stats(), {
+      size: 4,
+      active: 0,
+      idle: 4,
+      launched: 2,
+      recycled: 0,
+      failed: 0,
+    });
+  });
+
+  it("recycles only the failed window on a stacked host without disrupting sibling windows", async () => {
+    await using pool = new BrowserPool({
+      size: 2,
+      windowsPerBrowser: 2,
+      launchOptions: { backend: "mock", daemonBinary: DAEMON_BIN },
+    });
+
+    let entered = 0;
+    let openBarrier!: () => void;
+    const bothEntered = new Promise<void>((resolve) => {
+      openBarrier = resolve;
+    });
+    let markFaultyDone!: () => void;
+    const faultyDone = new Promise<void>((resolve) => {
+      markFaultyDone = resolve;
+    });
+
+    const healthyPromise = pool.withPage(async (page) => {
+      entered += 1;
+      if (entered === 2) {
+        openBarrier();
+      }
+      await bothEntered;
+      await faultyDone;
+      assert.equal((await page.snapshotTree()).length, 5);
+      assert.equal(await page.url(), "https://mock.waybound.local/");
+      assert.ok(page.windowId !== undefined);
+      return page.windowId;
+    });
+
+    const faultyPromise = pool
+      .withPage(async (page) => {
+        entered += 1;
+        if (entered === 2) {
+          openBarrier();
+        }
+        await bothEntered;
+        assert.ok(page.windowId !== undefined);
+        throw new Error("simulated window failure");
+      })
+      .finally(() => {
+        markFaultyDone();
+      });
+
+    await assert.rejects(faultyPromise, /simulated window failure/);
+    const healthyWid = await healthyPromise;
+
+    assert.deepEqual(pool.stats(), {
+      size: 2,
+      active: 0,
+      idle: 1,
+      launched: 1,
+      recycled: 1,
+      failed: 0,
+    });
+
+    let again = 0;
+    let releaseAgain!: () => void;
+    const bothAgain = new Promise<void>((resolve) => {
+      releaseAgain = resolve;
+    });
+    const seenWids: number[] = [];
+    await Promise.all([
+      pool.withPage(async (page) => {
+        assert.ok(page.windowId !== undefined);
+        seenWids.push(page.windowId);
+        again += 1;
+        if (again === 2) {
+          releaseAgain();
+        }
+        await bothAgain;
+      }),
+      pool.withPage(async (page) => {
+        assert.ok(page.windowId !== undefined);
+        seenWids.push(page.windowId);
+        again += 1;
+        if (again === 2) {
+          releaseAgain();
+        }
+        await bothAgain;
+      }),
+    ]);
+
+    assert.ok(seenWids.includes(healthyWid));
+    assert.equal(new Set(seenWids).size, 2);
+    assert.equal(pool.stats().launched, 1);
+  });
+
+  it("isolates per-checkout proxy overrides on a dedicated host in stacked mode", async () => {
+    await using pool = new BrowserPool({
+      size: 2,
+      windowsPerBrowser: 2,
+      proxies: ["http://127.0.0.1:18081"],
+      launchOptions: { backend: "mock", daemonBinary: DAEMON_BIN },
+    });
+
+    await pool.withPage(async (defaultPage) => {
+      await pool.withPage(
+        async (overridePage) => {
+          assert.notEqual(overridePage.transport, defaultPage.transport);
+          assert.equal((await overridePage.snapshotTree()).length, 5);
+        },
+        { proxy: "http://127.0.0.1:18082" },
+      );
+      assert.equal(pool.stats().recycled, 1);
+      assert.equal((await defaultPage.snapshotTree()).length, 5);
+    });
+
+    assert.equal(pool.stats().launched, 2);
+    assert.equal(pool.stats().idle, 1);
+  });
+
+  it("retires and destroys a stacked host directly when recycling its sole window", async () => {
+    await using pool = new BrowserPool({
+      size: 2,
+      windowsPerBrowser: 2,
+      launchOptions: { backend: "mock", daemonBinary: DAEMON_BIN },
+    });
+
+    await assert.rejects(
+      pool.withPage(async (page) => {
+        assert.ok(page.windowId !== undefined);
+        assert.equal((await page.snapshotTree()).length, 5);
+        throw new Error("sole window boom");
+      }),
+      /sole window boom/,
+    );
+
+    // Must retire and destroy the host directly without falsely incrementing `failed`.
+    assert.deepEqual(pool.stats(), {
+      size: 2,
+      active: 0,
+      idle: 0,
+      launched: 1,
+      recycled: 1,
+      failed: 0,
+    });
+
+    await pool.withPage(async (page) => {
+      assert.equal((await page.snapshotTree()).length, 5);
+    });
+    assert.deepEqual(pool.stats(), {
+      size: 2,
+      active: 0,
+      idle: 1,
+      launched: 2,
+      recycled: 1,
+      failed: 0,
+    });
+  });
+
+  it("rejects per-checkout proxy overrides when profileDir is configured", async () => {
+    await using pool = new BrowserPool({
+      size: 2,
+      windowsPerBrowser: 2,
+      launchOptions: {
+        backend: "mock",
+        profileDir: "/tmp/single-profile",
+        daemonBinary: DAEMON_BIN,
+      },
+    });
+
+    await assert.rejects(pool.acquire({ proxy: "http://127.0.0.1:18089" }), RangeError);
+  });
+});
+
+describe("BrowserPool stacked host liveness & retired teardown regressions", () => {
+  function writeFakeDaemonScript(
+    dir: string,
+    options: { readonly failPingAfter: number },
+  ): {
+    readonly wrapperPath: string;
+    readonly stateFile: string;
+  } {
+    const stateFile = path.join(dir, "state.json");
+    const jsPath = path.join(dir, "fake-daemon.mjs");
+    const wrapperPath = path.join(dir, "fake-daemon.sh");
+    const script = `
+import { writeFileSync } from "node:fs";
+import net from "node:net";
+
+const args = process.argv.slice(2);
+const sockIdx = args.indexOf("--socket");
+const tcpIdx = args.indexOf("--tcp");
+const stateFile = ${JSON.stringify(stateFile)};
+const failPingAfter = ${JSON.stringify(options.failPingAfter)};
+let pingCount = 0;
+let nextWid = 1;
+let shutdowns = 0;
+
+function record(extra = {}) {
+  writeFileSync(stateFile, JSON.stringify({ pid: process.pid, pingCount, shutdowns, ...extra }));
+}
+
+const server = net.createServer((socket) => {
+  let buf = "";
+  socket.on("data", (chunk) => {
+    buf += chunk.toString("utf8");
+    for (;;) {
+      const nl = buf.indexOf("\\n");
+      if (nl === -1) break;
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      if (!line.trim()) continue;
+      const req = JSON.parse(line);
+      if (req.method === "ping") {
+        pingCount += 1;
+        const alive = pingCount <= failPingAfter;
+        record({ alive });
+        socket.write(JSON.stringify({ status: "pong", version: "0.6.0", browser_alive: alive }) + "\\n");
+      } else if (req.method === "list_windows") {
+        socket.write(JSON.stringify({
+          status: "windows",
+          windows: [{ id: 1, title: "Main", app_id: "chrome", width: 1280, height: 800, has_buffer: true }],
+        }) + "\\n");
+      } else if (req.method === "new_window") {
+        nextWid += 1;
+        socket.write(JSON.stringify({
+          status: "window",
+          window: { id: nextWid, title: "Extra", app_id: "chrome", width: 1280, height: 800, has_buffer: true },
+        }) + "\\n");
+      } else if (req.method === "snapshot_tree") {
+        socket.write(JSON.stringify({ status: "tree", nodes: [], truncated: false }) + "\\n");
+      } else if (req.method === "shutdown") {
+        shutdowns += 1;
+        record({ exited: true });
+        socket.write(JSON.stringify({ status: "ok" }) + "\\n");
+        server.close(() => process.exit(0));
+      } else {
+        socket.write(JSON.stringify({ status: "ok" }) + "\\n");
+      }
+    }
+  });
+});
+
+if (sockIdx !== -1) {
+  server.listen(args[sockIdx + 1], () => record({ listening: true }));
+} else if (tcpIdx !== -1) {
+  const [host, portStr] = args[tcpIdx + 1].split(":");
+  server.listen(Number(portStr), host, () => record({ listening: true }));
+}
+process.on("SIGTERM", () => {
+  record({ exited: true });
+  process.exit(0);
+});
+`;
+    writeFileSync(jsPath, script);
+    writeFileSync(
+      wrapperPath,
+      `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(jsPath)} "$@"\n`,
+    );
+    chmodSync(wrapperPath, 0o755);
+    return { wrapperPath, stateFile };
+  }
+
+  it("rejects browser_alive: false on BrowserHost.ping() and recycles the dead host", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const dir = mkdtempSync(path.join(tmpdir(), "wb-dead-browser-"));
+    try {
+      // Ping #1 is launch() verifyDaemon -> browser_alive: true.
+      // Ping #2 is release health check -> browser_alive: false.
+      const { wrapperPath } = writeFakeDaemonScript(dir, { failPingAfter: 1 });
+      await using pool = new BrowserPool({
+        size: 2,
+        windowsPerBrowser: 2,
+        launchOptions: { backend: "mock", daemonBinary: wrapperPath },
+      });
+
+      await pool.withPage(async (page) => {
+        assert.deepEqual(await page.snapshotTree(), []);
+      });
+
+      assert.deepEqual(pool.stats(), {
+        size: 2,
+        active: 0,
+        idle: 0,
+        launched: 1,
+        recycled: 1,
+        failed: 1,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("tears down retired hosts that still have active windows during pool.close()", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const dir = mkdtempSync(path.join(tmpdir(), "wb-retiring-close-"));
+    try {
+      // Ping #1 (launch) succeeds; ping #2 (when w2 releases) returns browser_alive: false,
+      // retiring the host while w1 is still checked out.
+      const { wrapperPath, stateFile } = writeFakeDaemonScript(dir, { failPingAfter: 1 });
+      const pool = new BrowserPool({
+        size: 2,
+        windowsPerBrowser: 2,
+        launchOptions: { backend: "mock", daemonBinary: wrapperPath },
+      });
+
+      const w1 = await pool.acquire();
+      const w2 = await pool.acquire();
+      assert.equal(w1.page.transport, w2.page.transport);
+
+      // Releasing w2 fails the health check, retiring the host while w1 keeps it alive.
+      await w2.release();
+      const beforeClose = JSON.parse(readFileSync(stateFile, "utf8")) as {
+        pid: number;
+        shutdowns: number;
+      };
+      assert.equal(beforeClose.shutdowns, 0);
+
+      // pool.close() must tear down the retired host even though w1 is still active.
+      await pool.close();
+      const afterClose = JSON.parse(readFileSync(stateFile, "utf8")) as {
+        pid: number;
+        shutdowns: number;
+        exited?: boolean;
+      };
+      assert.equal(afterClose.shutdowns, 1);
+      assert.equal(afterClose.exited, true);
+
+      await w1.release();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

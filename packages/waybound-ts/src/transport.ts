@@ -15,6 +15,7 @@ import {
   type NetworkStats,
   parseRole,
   type TreeSnapshot,
+  type WindowSummary,
 } from "./types.js";
 
 /** Where the daemon listens: a Unix socket path, or a loopback TCP host/port. */
@@ -32,6 +33,21 @@ export type JsonObject = Record<string, unknown>;
 export interface SnapshotTreeOptions {
   /** Optional maximum number of nodes to return (clamped to `1..=20_000` by the daemon). */
   readonly maxNodes?: number | null;
+  /** Optional target window ID to scope the snapshot to. */
+  readonly windowId?: number;
+}
+
+export interface NewWindowOptions {
+  /** Optional destination URL (`http://`, `https://`, or `about:blank`). */
+  readonly url?: string | null;
+  /** Whether to open the new window in incognito mode. */
+  readonly incognito?: boolean;
+}
+
+/** Health-check response returned by `Transport.pingHealth()`. */
+export interface PingHealth {
+  readonly version: string;
+  readonly browserAlive?: boolean;
 }
 
 /** An armed `wait_for_response`; see `Transport.expectResponse()`. */
@@ -297,8 +313,8 @@ export class Transport {
     }
   }
 
-  /** Health check; returns the daemon version. */
-  async ping(timeoutMs?: number): Promise<string> {
+  /** Health check returning daemon version and optional browser liveness status. */
+  async pingHealth(timeoutMs?: number): Promise<PingHealth> {
     const response = await this.request(
       { method: "ping" },
       timeoutMs === undefined ? undefined : Math.max(1, checkMs(timeoutMs, "timeoutMs")),
@@ -309,7 +325,15 @@ export class Transport {
         `unexpected ping response: ${describe(response)}`,
       );
     }
-    return response.version;
+    if (typeof response.browser_alive === "boolean") {
+      return { version: response.version, browserAlive: response.browser_alive };
+    }
+    return { version: response.version };
+  }
+
+  /** Health check; returns the daemon version. */
+  async ping(timeoutMs?: number): Promise<string> {
+    return (await this.pingHealth(timeoutMs)).version;
   }
 
   /** Fetch the current accessibility tree. */
@@ -326,7 +350,7 @@ export class Transport {
       }
       payload.max_nodes = options.maxNodes;
     }
-    const response = await this.request(payload);
+    const response = await this.request(withWindowId(payload, options.windowId));
     return {
       nodes: parseNodes(response, "tree"),
       truncated: response.truncated === true,
@@ -334,14 +358,16 @@ export class Transport {
   }
 
   /** Return every node matching `query` (`nth` is ignored by the daemon). */
-  async locateAll(query: LocatorQuery): Promise<AccessibilityNode[]> {
-    const response = await this.request({ method: "locate_all", query: encodeQuery(query) });
+  async locateAll(query: LocatorQuery, windowId?: number): Promise<AccessibilityNode[]> {
+    const response = await this.request(
+      withWindowId({ method: "locate_all", query: encodeQuery(query) }, windowId),
+    );
     return parseNodes(response, "locate_all");
   }
 
   /** Return the active tab URL, if known. */
-  async currentUrl(): Promise<string | null> {
-    const response = await this.request({ method: "current_url" });
+  async currentUrl(windowId?: number): Promise<string | null> {
+    const response = await this.request(withWindowId({ method: "current_url" }, windowId));
     const url = response.url;
     if (url === null || url === undefined) {
       return null;
@@ -356,10 +382,17 @@ export class Transport {
   }
 
   /** Poll on the daemon until `query` matches or `timeoutMs` elapses. */
-  async waitFor(query: LocatorQuery, timeoutMs = 10_000): Promise<AccessibilityNode> {
+  async waitFor(
+    query: LocatorQuery,
+    timeoutMs = 10_000,
+    windowId?: number,
+  ): Promise<AccessibilityNode> {
     const clamped = checkMs(timeoutMs, "timeoutMs", MAX_WAIT_MS);
     const response = await this.request(
-      { method: "wait_for", query: encodeQuery(query), timeout_ms: clamped },
+      withWindowId(
+        { method: "wait_for", query: encodeQuery(query), timeout_ms: clamped },
+        windowId,
+      ),
       waitTimeoutMs(this.baseTimeoutMs, clamped),
     );
     if (!isObject(response.node)) {
@@ -369,6 +402,40 @@ export class Transport {
       );
     }
     return parseNode(response.node);
+  }
+
+  /** Return open browser windows tracked by the active backend. */
+  async listWindows(): Promise<WindowSummary[]> {
+    const response = await this.request({ method: "list_windows" });
+    if (response.status !== "windows" || !Array.isArray(response.windows)) {
+      throw new WayboundDaemonError(
+        "protocol_error",
+        `unexpected list_windows response: ${describe(response)}`,
+      );
+    }
+    return response.windows.filter(isObject).map(parseWindowSummary);
+  }
+
+  /** Open a new browser window in the active session, optionally navigating to `url`. */
+  async newWindow(options: NewWindowOptions = {}): Promise<WindowSummary> {
+    const response = await this.request({
+      method: "new_window",
+      url: options.url ?? null,
+      incognito: options.incognito ?? false,
+    });
+    if (response.status !== "window" || !isObject(response.window)) {
+      throw new WayboundDaemonError(
+        "protocol_error",
+        `unexpected new_window response: ${describe(response)}`,
+      );
+    }
+    return parseWindowSummary(response.window);
+  }
+
+  /** Request that the browser cleanly close the window identified by `windowId`. */
+  async closeWindow(windowId: number): Promise<void> {
+    checkWindowId(windowId);
+    await this.#expectOk({ method: "close_window", window_id: windowId }, "close_window");
   }
 
   /** Ask the daemon to shut down gracefully (optionally with a shorter reply timeout). */
@@ -462,37 +529,53 @@ export class Transport {
   }
 
   /** Move the pointer over the element without clicking. */
-  async hover(query: LocatorQuery): Promise<void> {
-    await this.#expectOk({ method: "hover", query: encodeQuery(query) }, "hover");
+  async hover(query: LocatorQuery, windowId?: number): Promise<void> {
+    await this.#expectOk(
+      withWindowId({ method: "hover", query: encodeQuery(query) }, windowId),
+      "hover",
+    );
   }
 
   /** Native click on the element. */
-  async click(query: LocatorQuery): Promise<void> {
-    await this.#expectOk({ method: "click", query: encodeQuery(query) }, "click");
+  async click(query: LocatorQuery, windowId?: number): Promise<void> {
+    await this.#expectOk(
+      withWindowId({ method: "click", query: encodeQuery(query) }, windowId),
+      "click",
+    );
   }
 
   /** Native double-click on the element. */
-  async dblclick(query: LocatorQuery): Promise<void> {
+  async dblclick(query: LocatorQuery, windowId?: number): Promise<void> {
     // serde renames `Request::DblClick` to `dbl_click` (the Python SDK's `dblclick` is rejected).
-    await this.#expectOk({ method: "dbl_click", query: encodeQuery(query) }, "dbl_click");
+    await this.#expectOk(
+      withWindowId({ method: "dbl_click", query: encodeQuery(query) }, windowId),
+      "dbl_click",
+    );
   }
 
   /** Select an option of a `<select>`/combobox by label or 0-based index. */
   async selectOption(
     query: LocatorQuery,
-    options: { readonly label?: string | null; readonly index?: number | null } = {},
+    options: {
+      readonly label?: string | null;
+      readonly index?: number | null;
+      readonly windowId?: number;
+    } = {},
   ): Promise<void> {
     const index = options.index ?? null;
     if (index !== null && !(Number.isSafeInteger(index) && index >= 0)) {
       throw new RangeError(`index must be a non-negative integer, got ${index}`);
     }
     await this.#expectOk(
-      {
-        method: "select_option",
-        query: encodeQuery(query),
-        label: options.label ?? null,
-        index,
-      },
+      withWindowId(
+        {
+          method: "select_option",
+          query: encodeQuery(query),
+          label: options.label ?? null,
+          index,
+        },
+        options.windowId,
+      ),
       "select_option",
     );
   }
@@ -524,70 +607,91 @@ export class Transport {
   }
 
   /** Focus the element and type `text` with native key events. */
-  async fill(query: LocatorQuery, text: string): Promise<void> {
+  async fill(query: LocatorQuery, text: string, windowId?: number): Promise<void> {
     await this.#expectOk(
-      { method: "fill", query: encodeQuery(query), text },
+      withWindowId({ method: "fill", query: encodeQuery(query), text }, windowId),
       "fill",
       fillTimeoutMs(this.baseTimeoutMs, text),
     );
   }
 
   /** Navigate the active tab to `url`. */
-  async navigate(url: string): Promise<void> {
-    await this.#expectOk({ method: "navigate", url }, "navigate");
+  async navigate(url: string, windowId?: number): Promise<void> {
+    await this.#expectOk(withWindowId({ method: "navigate", url }, windowId), "navigate");
   }
 
-  async reload(): Promise<void> {
-    await this.#expectOk({ method: "reload" }, "reload");
+  async reload(windowId?: number): Promise<void> {
+    await this.#expectOk(withWindowId({ method: "reload" }, windowId), "reload");
   }
 
-  async goBack(): Promise<void> {
-    await this.#expectOk({ method: "go_back" }, "go_back");
+  async goBack(windowId?: number): Promise<void> {
+    await this.#expectOk(withWindowId({ method: "go_back" }, windowId), "go_back");
   }
 
-  async goForward(): Promise<void> {
-    await this.#expectOk({ method: "go_forward" }, "go_forward");
+  async goForward(windowId?: number): Promise<void> {
+    await this.#expectOk(withWindowId({ method: "go_forward" }, windowId), "go_forward");
   }
 
-  async newTab(url?: string | null): Promise<void> {
-    await this.#expectOk({ method: "new_tab", url: url ?? null }, "new_tab");
+  async newTab(url?: string | null, windowId?: number): Promise<void> {
+    await this.#expectOk(
+      withWindowId({ method: "new_tab", url: url ?? null }, windowId),
+      "new_tab",
+    );
   }
 
-  async closeTab(): Promise<void> {
-    await this.#expectOk({ method: "close_tab" }, "close_tab");
+  async closeTab(windowId?: number): Promise<void> {
+    await this.#expectOk(withWindowId({ method: "close_tab" }, windowId), "close_tab");
   }
 
-  async nextTab(): Promise<void> {
-    await this.#expectOk({ method: "next_tab" }, "next_tab");
+  async nextTab(windowId?: number): Promise<void> {
+    await this.#expectOk(withWindowId({ method: "next_tab" }, windowId), "next_tab");
   }
 
-  async prevTab(): Promise<void> {
-    await this.#expectOk({ method: "prev_tab" }, "prev_tab");
+  async prevTab(windowId?: number): Promise<void> {
+    await this.#expectOk(withWindowId({ method: "prev_tab" }, windowId), "prev_tab");
   }
 
   /** Capture a PNG screenshot of the browser window to `path` (on the daemon's host). */
-  async screenshot(path: string): Promise<void> {
-    await this.#expectOk({ method: "screenshot", path }, "screenshot");
+  async screenshot(path: string, windowId?: number): Promise<void> {
+    await this.#expectOk(withWindowId({ method: "screenshot", path }, windowId), "screenshot");
   }
 
   /** Emit a native scroll event. */
-  async scroll(deltaX: number, deltaY: number): Promise<void> {
+  async scroll(deltaX: number, deltaY: number, windowId?: number): Promise<void> {
     if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) {
       throw new RangeError("scroll deltas must be finite numbers");
     }
-    await this.#expectOk({ method: "scroll", delta_x: deltaX, delta_y: deltaY }, "scroll");
+    await this.#expectOk(
+      withWindowId({ method: "scroll", delta_x: deltaX, delta_y: deltaY }, windowId),
+      "scroll",
+    );
   }
 
   /** Emit a key press: a named key (`enter`, `arrow_left`, ...) or a single character. */
   async press(
     key: NamedKey | (string & {}),
     modifiers: readonly KeyModifier[] = [],
+    windowId?: number,
   ): Promise<void> {
     await this.#expectOk(
-      { method: "press", key: encodeKey(key), modifiers: [...modifiers] },
+      withWindowId({ method: "press", key: encodeKey(key), modifiers: [...modifiers] }, windowId),
       "press",
     );
   }
+}
+
+function checkWindowId(windowId: number): void {
+  if (!Number.isSafeInteger(windowId) || windowId < 0) {
+    throw new RangeError(`windowId must be a non-negative integer, got ${windowId}`);
+  }
+}
+
+function withWindowId(payload: JsonObject, windowId?: number): JsonObject {
+  if (windowId !== undefined) {
+    checkWindowId(windowId);
+    payload.window_id = windowId;
+  }
+  return payload;
 }
 
 /** Encode a key for the wire: named keys by snake_case name, anything else as `{char}`. */
@@ -707,5 +811,24 @@ export function parseNetworkStats(item: JsonObject): NetworkStats {
     bytesReceived: parseCounter(item.bytes_received),
     connectionsTotal: parseCounter(item.connections_total),
     connectionsBlocked: parseCounter(item.connections_blocked),
+  };
+}
+
+/** Parse a `WindowSummary` payload from the daemon. */
+export function parseWindowSummary(item: JsonObject): WindowSummary {
+  const id = item.id;
+  if (typeof id !== "number" || !Number.isSafeInteger(id) || id < 0) {
+    throw new WayboundDaemonError(
+      "protocol_error",
+      `expected non-negative integer window id, got ${describe(id)}`,
+    );
+  }
+  return {
+    id,
+    title: typeof item.title === "string" ? item.title : "",
+    appId: typeof item.app_id === "string" ? item.app_id : "",
+    width: parseCounter(item.width),
+    height: parseCounter(item.height),
+    hasBuffer: item.has_buffer === true,
   };
 }
