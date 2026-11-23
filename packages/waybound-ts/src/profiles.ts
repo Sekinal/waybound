@@ -578,6 +578,9 @@ async function extractTarGzToStaging(
     const skip = parts === null || parts.some((p) => isExcludedName(p));
 
     if (type === "5") {
+      if (size > 0) {
+        throw new Error(`archive directory member has non-zero size: ${JSON.stringify(name)}`);
+      }
       if (!skip && parts !== null) {
         const destPath = path.resolve(stagingResolved, ...parts);
         if (!destPath.startsWith(stagingPrefix)) {
@@ -585,9 +588,9 @@ async function extractTarGzToStaging(
         }
         await mkdir(destPath, { recursive: true });
       }
-      state.remainingPad = (TAR_BLOCK_SIZE - (size % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
-      state.remainingData = size;
-      state.phase = size > 0 ? "file" : state.remainingPad > 0 ? "pad" : "header";
+      state.remainingPad = 0;
+      state.remainingData = 0;
+      state.phase = "header";
       return;
     }
 
@@ -617,6 +620,9 @@ async function extractTarGzToStaging(
 
   const fileStream = createReadStream(archivePath);
   const gunzip = createGunzip();
+  fileStream.on("error", (err) => {
+    gunzip.destroy(err);
+  });
   fileStream.pipe(gunzip);
 
   try {
@@ -659,11 +665,11 @@ async function extractTarGzToStaging(
         } else if (state.phase === "file") {
           const take = Math.min(state.remainingData, chunk.length - pos);
           const slice = chunk.subarray(pos, pos + take);
+          state.totalBytes += take;
+          if (state.totalBytes > maxBytes) {
+            throw new Error(`snapshot exceeds maxBytes limit (${maxBytes} bytes)`);
+          }
           if (state.activeHandle !== null) {
-            state.totalBytes += take;
-            if (state.totalBytes > maxBytes) {
-              throw new Error(`snapshot exceeds maxBytes limit (${maxBytes} bytes)`);
-            }
             await state.activeHandle.write(slice);
           }
           state.remainingData -= take;
@@ -680,6 +686,9 @@ async function extractTarGzToStaging(
             state.phase = "header";
           }
         }
+      }
+      if (state.phase === "done") {
+        break;
       }
     }
 
@@ -830,16 +839,17 @@ export class ProfileStore {
     await mkdir(parentDir, { recursive: true });
     const tmpPath = path.join(parentDir, `.waybound-snapshot-${randomUUID()}.tar.gz.tmp`);
 
-    try {
-      const gzip = createGzip();
-      const fileOut = createWriteStream(tmpPath, { flags: "wx" });
-      const finished = new Promise<void>((resolve, reject) => {
-        fileOut.once("finish", resolve);
-        fileOut.once("error", reject);
-        gzip.once("error", reject);
-      });
-      gzip.pipe(fileOut);
+    const gzip = createGzip();
+    const fileOut = createWriteStream(tmpPath, { flags: "wx" });
+    const finished = new Promise<void>((resolve, reject) => {
+      fileOut.once("finish", resolve);
+      fileOut.once("error", reject);
+      gzip.once("error", reject);
+    });
+    finished.catch(() => undefined);
+    gzip.pipe(fileOut);
 
+    try {
       await writeDirectoryToTar(gzip, src, src);
       // Two 512-byte zero blocks terminate a POSIX tar archive.
       await writeToStream(gzip, Buffer.alloc(TAR_BLOCK_SIZE * 2));
@@ -847,6 +857,15 @@ export class ProfileStore {
       await finished;
       await rename(tmpPath, archivePath);
     } catch (err) {
+      gzip.destroy();
+      if (!fileOut.closed) {
+        const closed = new Promise<void>((resolve) => {
+          fileOut.once("close", resolve);
+          fileOut.once("error", () => resolve());
+        });
+        fileOut.destroy();
+        await closed;
+      }
       await unlink(tmpPath).catch(() => undefined);
       throw err;
     }

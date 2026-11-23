@@ -215,9 +215,19 @@ def _extract_member_to_staging(
         msg = f"archive member has disallowed type ({member.type!r}): {member.name!r}"
         raise ValueError(msg)
 
+    if member.size < 0:
+        msg = f"archive member has negative size: {member.name!r}"
+        raise ValueError(msg)
+    if member.isdir() and member.size > 0:
+        msg = f"archive directory member has non-zero size: {member.name!r}"
+        raise ValueError(msg)
+    if total_bytes + member.size > max_bytes:
+        msg = f"snapshot exceeds max_bytes limit ({max_bytes} bytes)"
+        raise ValueError(msg)
+
     rel = _validate_archive_member_path(member.name)
     if rel is None or any(_is_excluded_name(part) for part in rel.parts):
-        return total_bytes
+        return total_bytes + member.size
 
     dest_path = staging_resolved / Path(*rel.parts)
     if not dest_path.resolve().is_relative_to(staging_resolved):
@@ -227,13 +237,6 @@ def _extract_member_to_staging(
     if member.isdir():
         dest_path.mkdir(parents=True, exist_ok=True)
         return total_bytes
-
-    if member.size < 0:
-        msg = f"archive member has negative size: {member.name!r}"
-        raise ValueError(msg)
-    if total_bytes + member.size > max_bytes:
-        msg = f"snapshot exceeds max_bytes limit ({max_bytes} bytes)"
-        raise ValueError(msg)
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     extracted = archive.extractfile(member)
@@ -449,7 +452,7 @@ class ProfileStore:
             raise FileNotFoundError(msg)
 
         target = self._root_dir / valid_name
-        if target.exists() and not overwrite:
+        if (target.exists() or target.is_symlink()) and not overwrite:
             msg = f"profile already exists: {valid_name}"
             raise FileExistsError(msg)
 

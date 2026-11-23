@@ -305,3 +305,19 @@ def test_import_snapshot_enforces_max_bytes(tmp_path: Path) -> None:
     # Succeeds when within cap.
     restored = store.import_snapshot(archive, "fits", max_bytes=2048)
     assert (restored / "chunk_2.bin").read_bytes() == b"a" * 512
+
+
+def test_import_snapshot_counts_excluded_entries_toward_max_bytes(tmp_path: Path) -> None:
+    store = ProfileStore(tmp_path / "store")
+    archive = tmp_path / "excluded-bomb.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        for idx in range(3):
+            payload = b"z" * 512
+            info = tarfile.TarInfo(name=f"Default/Cache/huge_{idx}.bin")
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+
+    with pytest.raises(ValueError, match="exceeds max_bytes"):
+        store.import_snapshot(archive, "excluded-too-big", max_bytes=1024)
+    assert not store.exists("excluded-too-big")
+    assert list(store.root_dir.iterdir()) == []

@@ -432,4 +432,37 @@ describe("ProfileStore", () => {
       assert.deepEqual(await readFile(path.join(restored, "chunk_2.bin")), Buffer.alloc(512, 0x63));
     });
   });
+
+  it("counts excluded entries toward maxBytes and rejects non-zero directory entries", async () => {
+    await withTempDir(async (dir) => {
+      const store = new ProfileStore(path.join(dir, "store"));
+      const excludedArchive = path.join(dir, "excluded-bomb.tar.gz");
+      await writeFile(
+        excludedArchive,
+        buildRawTarGz([
+          { name: "Default/Cache/huge_0.bin", content: Buffer.alloc(512, 0x7a) },
+          { name: "Default/Cache/huge_1.bin", content: Buffer.alloc(512, 0x7a) },
+          { name: "Default/Cache/huge_2.bin", content: Buffer.alloc(512, 0x7a) },
+        ]),
+      );
+
+      await assert.rejects(
+        () => store.importSnapshot(excludedArchive, "excluded-too-big", { maxBytes: 1024 }),
+        /exceeds maxBytes/,
+      );
+      assert.equal(await store.exists("excluded-too-big"), false);
+      assert.deepEqual(await readdir(store.rootDir), []);
+
+      const dirPayloadArchive = path.join(dir, "dir-payload.tar.gz");
+      await writeFile(
+        dirPayloadArchive,
+        buildRawTarGz([{ name: "Default/", typeFlag: "5", content: Buffer.alloc(64, 0x41) }]),
+      );
+      await assert.rejects(
+        () => store.importSnapshot(dirPayloadArchive, "bad-dir"),
+        /non-zero size/,
+      );
+      assert.equal(await store.exists("bad-dir"), false);
+    });
+  });
 });
