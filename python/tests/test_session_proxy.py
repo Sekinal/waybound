@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from waybound.session import LaunchOptions, Session, _daemon_env
@@ -69,3 +71,18 @@ def test_headless_wayland_emits_cli_flag_and_rejects_xvfb_combination() -> None:
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         LaunchOptions(backend="linux", headless_xvfb=True, headless_wayland=True)
+
+
+def test_attach_with_keylog_and_proxy_is_rejected() -> None:
+    attach = LaunchOptions(
+        backend="macos",
+        pid=4242,
+        ssl_keylog="/nonexistent/keys.log",
+        proxy=UPSTREAM_URL,
+        daemon_binary="/nonexistent/waybound-daemon",
+    )
+    with pytest.raises(ValueError, match="launch_chrome"):
+        Session(attach)
+    # Launching (in-process tap) or attaching without a proxy is fine.
+    Session(replace(attach, launch_chrome=True, pid=None))
+    Session(replace(attach, proxy=None))

@@ -16,7 +16,7 @@ use std::env;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -58,6 +58,8 @@ struct CliArgs {
     proxy: Option<String>,
     /// Whether `proxy` came from `--proxy` (world-readable argv) rather than `WAYBOUND_PROXY`.
     proxy_from_argv: bool,
+    /// Capture interface for the attach-mode `tshark` tap (`--net-iface` / `WAYBOUND_NET_IFACE`).
+    net_iface: Option<String>,
     block_hosts: Vec<String>,
     block_presets: Vec<String>,
     timezone: Option<String>,
@@ -95,6 +97,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, St
         initial_url: None,
         proxy: env::var("WAYBOUND_PROXY").ok(),
         proxy_from_argv: false,
+        net_iface: env::var("WAYBOUND_NET_IFACE").ok(),
         block_hosts: Vec::new(),
         block_presets: Vec::new(),
         timezone: None,
@@ -145,6 +148,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, St
                 cli.proxy = Some(next_arg(&mut args, "--proxy")?);
                 cli.proxy_from_argv = true;
             }
+            "--net-iface" => cli.net_iface = Some(next_arg(&mut args, "--net-iface")?),
             "--block-host" => cli.block_hosts.push(next_arg(&mut args, "--block-host")?),
             "--block-hosts" => {
                 let csv = next_arg(&mut args, "--block-hosts")?;
@@ -246,6 +250,97 @@ fn setup_proxy(
     let fwd =
         ProxyForwarder::start_with_options(upstream, blocker, tap).map_err(|e| e.to_string())?;
     Ok((Some(fwd.chrome_proxy_arg()), Some(fwd)))
+}
+
+/// Whether the daemon launches the browser itself and so routes it through the loopback
+/// forwarder, whose in-process tap decrypts `--ssl-keylog` traffic (and applies `--proxy`).
+fn launches_browser(cli: &CliArgs) -> bool {
+    match cli.backend.as_str() {
+        "macos" | "linux" | "windows" => cli.launch_chrome,
+        "android" => cli.launch_waydroid,
+        _ => false,
+    }
+}
+
+/// What to do with `--ssl-keylog` when the daemon does not launch the browser itself.
+#[derive(Debug, PartialEq, Eq)]
+enum KeylogCapture<'a> {
+    /// No keylog, or the in-process tap of a launched browser handles it.
+    NotNeeded,
+    /// A host `tshark` capture cannot see this backend's traffic; the keylog is ignored.
+    Ignored(&'static str),
+    /// Attaching to a desktop browser: run the `tshark` fallback with this keylog.
+    Tshark(&'a Path),
+}
+
+/// Decides how `--ssl-keylog` is captured.
+///
+/// # Errors
+///
+/// Rejects `--ssl-keylog` with an explicit `--proxy` when attaching: the daemon cannot route an
+/// already-running browser through the proxy and `tshark` only sees direct HTTPS on port 443,
+/// so the capture would silently stay empty. An inherited `WAYBOUND_PROXY` is not rejected (it
+/// is environment-wide configuration that is simply not applied when attaching).
+fn keylog_capture(cli: &CliArgs) -> Result<KeylogCapture<'_>, String> {
+    let Some(keylog) = cli.ssl_keylog_file.as_deref() else {
+        return Ok(KeylogCapture::NotNeeded);
+    };
+    if launches_browser(cli) {
+        return Ok(KeylogCapture::NotNeeded);
+    }
+    match cli.backend.as_str() {
+        "android" => {
+            return Ok(KeylogCapture::Ignored(
+                "an attached Android device's traffic does not cross this host's capture \
+                 interface; use --launch-waydroid for in-process capture",
+            ));
+        }
+        "macos" | "linux" | "windows" => {}
+        _ => {
+            return Ok(KeylogCapture::Ignored(
+                "this backend has no browser to capture",
+            ));
+        }
+    }
+    if cli.proxy_from_argv && cli.proxy.is_some() {
+        return Err(
+            "--ssl-keylog with --proxy requires the daemon to launch the browser \
+                    (--launch-chrome): when attaching, the proxy is not applied and the tshark \
+                    fallback cannot see proxied traffic"
+                .to_owned(),
+        );
+    }
+    Ok(KeylogCapture::Tshark(keylog))
+}
+
+/// Starts the `tshark` fallback when [`keylog_capture`] asks for it. Errors are logged; the
+/// caller exits, since a session whose capture calls can never succeed is worse than none.
+fn start_keylog_capture(
+    cli: &CliArgs,
+    responses: &Arc<ResponseStore>,
+) -> Result<Option<net_tap::PassiveTap>, ()> {
+    let attaches_desktop = matches!(cli.backend.as_str(), "macos" | "linux" | "windows");
+    if cli.proxy.is_some() && attaches_desktop && !launches_browser(cli) {
+        tracing::warn!("the proxy setting is not applied when attaching to a running browser");
+    }
+    match keylog_capture(cli) {
+        Ok(KeylogCapture::NotNeeded) => Ok(None),
+        Ok(KeylogCapture::Ignored(why)) => {
+            tracing::warn!("--ssl-keylog is ignored: {why}");
+            Ok(None)
+        }
+        Ok(KeylogCapture::Tshark(keylog)) => {
+            start_passive_tap(keylog, cli.net_iface.as_deref(), Arc::clone(responses))
+                .map(Some)
+                .map_err(|err| {
+                    tracing::error!(error = %err, "passive network tap (tshark) failed to start");
+                })
+        }
+        Err(msg) => {
+            tracing::error!(error = %msg, "unusable passive capture configuration");
+            Err(())
+        }
+    }
 }
 
 struct BackendBundle {
@@ -542,21 +637,13 @@ fn main() -> ExitCode {
     let responses = Arc::new(ResponseStore::default());
     let inflight = InflightCounter::default();
     let fingerprint = FingerprintRecorder::new();
-    // When `--launch-chrome` is set, the built-in zero-MITM local pass-through proxy handles
-    // passive TLS 1.3 + HTTP/1.1–2 decryption in-process (zero tshark, zero CAP_NET_RAW).
-    // Only fall back to external `tshark` when attaching to an already-running browser PID.
-    let _net_tap = if cli.launch_chrome {
-        None
-    } else {
-        cli.ssl_keylog_file.as_ref().and_then(|keylog| {
-            match start_passive_tap(keylog, Arc::clone(&responses)) {
-                Ok(tap) => Some(tap),
-                Err(err) => {
-                    tracing::warn!(error = %err, "passive network tap unavailable; continuing without capture");
-                    None
-                }
-            }
-        })
+    // When the daemon launches the browser, the built-in zero-MITM local pass-through proxy
+    // handles passive decryption in-process (zero tshark, zero CAP_NET_RAW). Only fall back to
+    // external `tshark` when attaching to a running desktop browser; running both would feed
+    // the same store from two sequence counters. If that fallback cannot start, exit rather
+    // than serve a session whose capture calls could never succeed.
+    let Ok(_net_tap) = start_keylog_capture(&cli, &responses) else {
+        return ExitCode::FAILURE;
     };
 
     let bundle = match build_backend(cli, &responses, &inflight, &fingerprint) {
@@ -675,5 +762,75 @@ mod tests {
             "--headless-wayland".to_owned(),
         ]);
         assert!(matches!(conflict, Err(msg) if msg.contains("mutually exclusive")));
+    }
+
+    /// Attach-mode arguments with a keylog, independent of the caller's environment.
+    fn attach_cli(backend: &str) -> CliArgs {
+        let parsed = parse_args_from(
+            [
+                "--backend",
+                backend,
+                "--pid",
+                "42",
+                "--ssl-keylog",
+                "/tmp/keys.log",
+            ]
+            .map(str::to_owned),
+        );
+        assert!(parsed.is_ok());
+        let mut cli = parsed.unwrap_or_else(|_| unreachable!());
+        cli.proxy = None;
+        cli.proxy_from_argv = false;
+        cli.net_iface = None;
+        cli
+    }
+
+    #[test]
+    fn tshark_only_when_attaching_to_a_desktop_browser_with_a_keylog() {
+        let keylog = Path::new("/tmp/keys.log");
+        assert_eq!(
+            keylog_capture(&attach_cli("macos")),
+            Ok(KeylogCapture::Tshark(keylog))
+        );
+
+        let mut no_keylog = attach_cli("macos");
+        no_keylog.ssl_keylog_file = None;
+        assert_eq!(keylog_capture(&no_keylog), Ok(KeylogCapture::NotNeeded));
+
+        let mut launched = attach_cli("linux");
+        launched.launch_chrome = true;
+        launched.proxy = Some("socks5://proxy.test:1080".to_owned());
+        launched.proxy_from_argv = true;
+        assert_eq!(keylog_capture(&launched), Ok(KeylogCapture::NotNeeded));
+
+        let mut waydroid = attach_cli("android");
+        waydroid.launch_waydroid = true;
+        assert_eq!(keylog_capture(&waydroid), Ok(KeylogCapture::NotNeeded));
+    }
+
+    #[test]
+    fn keylog_is_ignored_for_android_attach_and_mock() {
+        assert!(matches!(
+            keylog_capture(&attach_cli("android")),
+            Ok(KeylogCapture::Ignored(_))
+        ));
+        assert!(matches!(
+            keylog_capture(&attach_cli("mock")),
+            Ok(KeylogCapture::Ignored(_))
+        ));
+    }
+
+    #[test]
+    fn only_an_explicit_proxy_rejects_attach_with_keylog() {
+        let mut inherited = attach_cli("macos");
+        inherited.proxy = Some("http://proxy.test:8080".to_owned());
+        assert!(matches!(
+            keylog_capture(&inherited),
+            Ok(KeylogCapture::Tshark(_))
+        ));
+
+        let mut explicit = inherited;
+        explicit.proxy_from_argv = true;
+        assert!(keylog_capture(&explicit).is_err());
     }
 }

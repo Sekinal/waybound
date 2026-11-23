@@ -331,7 +331,20 @@ async function stopChild(child: ChildProcess, shutdownSent: boolean): Promise<vo
 }
 
 /** Start `waybound-daemon`, connect to it, and return a `Session` whose `page` drives it. */
+const DESKTOP_BACKENDS: ReadonlySet<string> = new Set(["macos", "linux", "windows"]);
+
+function rejectUnobservableCapture(options: LaunchOptions): void {
+  const backend = options.backend ?? "mock";
+  const attaching = DESKTOP_BACKENDS.has(backend) && options.launchChrome !== true;
+  if (attaching && options.proxy !== undefined && options.sslKeylog !== undefined) {
+    throw new Error(
+      "sslKeylog with proxy requires launchChrome: true: when attaching to a running browser the proxy is not applied and the tshark fallback cannot see proxied traffic",
+    );
+  }
+}
+
 export async function launch(options: LaunchOptions = {}): Promise<Session> {
+  rejectUnobservableCapture(options);
   const binary = resolveDaemonBinary(options.daemonBinary ?? null);
   const useTcp = options.useTcp === true || process.platform === "win32";
   const startupTimeoutMs = checkMs(options.startupTimeoutMs ?? 5_000, "startupTimeoutMs");
