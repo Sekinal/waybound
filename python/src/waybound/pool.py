@@ -24,7 +24,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Literal, Self
 
 from waybound.async_client import AsyncPage
 from waybound.client import Page
@@ -35,6 +35,9 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
     from collections.abc import Set as AbstractSet
     from types import TracebackType
+
+DisplayBackend = Literal["xvfb", "wayland"]
+_DISPLAY_BACKENDS: frozenset[str] = frozenset({"xvfb", "wayland"})
 
 _DEFAULT_DISPLAY_WIDTH = 1280
 _DEFAULT_DISPLAY_HEIGHT = 800
@@ -140,18 +143,19 @@ def build_dbus_command() -> list[str]:
 
 def build_slot_env(
     *,
-    display: str,
+    display: str | None = None,
     dbus_address: str,
     atspi_address: str | None = None,
 ) -> dict[str, str]:
-    """Build the isolated Linux X11 + D-Bus/AT-SPI2 environment variables for a slot."""
+    """Build the isolated Linux display + D-Bus/AT-SPI2 environment variables for a slot."""
     env: dict[str, str] = {
-        "DISPLAY": display,
         "DBUS_SESSION_BUS_ADDRESS": dbus_address,
         "ACCESSIBILITY_ENABLED": "1",
         "GTK_MODULES": "gail:atk-bridge",
         "QT_ACCESSIBILITY": "1",
     }
+    if display is not None:
+        env["DISPLAY"] = display
     if atspi_address is not None:
         env["AT_SPI_BUS_ADDRESS"] = atspi_address
     return env
@@ -207,12 +211,12 @@ class _IsolatedDisplayStack:
     def __init__(
         self,
         *,
-        display_num: int,
+        display_num: int | None,
         env: dict[str, str],
         processes: list[subprocess.Popen[bytes]],
     ) -> None:
         self.display_num = display_num
-        self.display = f":{display_num}"
+        self.display = f":{display_num}" if display_num is not None else None
         self.env = env
         self._processes = processes
 
@@ -266,6 +270,43 @@ class _IsolatedDisplayStack:
                 time.sleep(_ATSPI_SETTLE_DELAY_S)
 
             return cls(display_num=display_num, env=slot_env, processes=processes)
+        except BaseException:
+            for proc in reversed(processes):
+                _terminate_process(proc)
+            raise
+
+    @classmethod
+    def start_wayland_dbus(cls) -> _IsolatedDisplayStack | None:
+        """Spawn isolated `dbus-daemon` + `at-spi-bus-launcher` without `Xvfb`/`openbox`."""
+        if shutil.which("dbus-daemon") is None:
+            return None
+        processes: list[subprocess.Popen[bytes]] = []
+        try:
+            dbus = subprocess.Popen(  # noqa: S603
+                build_dbus_command(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            processes.append(dbus)
+            dbus_address = cls._read_dbus_address(dbus)
+
+            slot_env = build_slot_env(dbus_address=dbus_address)
+            child_env = {**os.environ, **slot_env}
+
+            atspi_bin = find_atspi_launcher()
+            if atspi_bin is not None:
+                atspi = subprocess.Popen(  # noqa: S603
+                    [str(atspi_bin), "--launch-immediately"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=child_env,
+                )
+                processes.append(atspi)
+                time.sleep(_ATSPI_SETTLE_DELAY_S)
+
+            return cls(display_num=None, env=slot_env, processes=processes)
         except BaseException:
             for proc in reversed(processes):
                 _terminate_process(proc)
@@ -387,6 +428,22 @@ class _PoolSlot:
                 self._display_stack = None
 
 
+def _parse_remote_workers(
+    remote_workers: Sequence[str] | None,
+) -> list[tuple[str, tuple[str, int]]]:
+    parsed_remotes: list[tuple[str, tuple[str, int]]] = []
+    seen_remotes: set[tuple[str, int]] = set()
+    if remote_workers is not None:
+        for raw in remote_workers:
+            parsed = parse_remote_worker(raw)
+            if parsed in seen_remotes:
+                msg = f"duplicate remote worker endpoint: {raw!r}"
+                raise ValueError(msg)
+            seen_remotes.add(parsed)
+            parsed_remotes.append((raw, parsed))
+    return parsed_remotes
+
+
 class BrowserPool:
     """Async pool of isolated local or remote `waybound` browser sessions."""
 
@@ -397,21 +454,16 @@ class BrowserPool:
         launch_options: LaunchOptions | None = None,
         proxies: Sequence[str] | None = None,
         isolated_displays: bool = False,
+        display_backend: DisplayBackend = "xvfb",
         display_base: int = 100,
         remote_workers: Sequence[str] | None = None,
         max_uses_per_slot: int | None = None,
         acquire_timeout_s: float = 60.0,
     ) -> None:
-        parsed_remotes: list[tuple[str, tuple[str, int]]] = []
-        seen_remotes: set[tuple[str, int]] = set()
-        if remote_workers is not None:
-            for raw in remote_workers:
-                parsed = parse_remote_worker(raw)
-                if parsed in seen_remotes:
-                    msg = f"duplicate remote worker endpoint: {raw!r}"
-                    raise ValueError(msg)
-                seen_remotes.add(parsed)
-                parsed_remotes.append((raw, parsed))
+        if display_backend not in _DISPLAY_BACKENDS:
+            msg = f"display_backend must be 'xvfb' or 'wayland', got {display_backend!r}"
+            raise ValueError(msg)
+        parsed_remotes = _parse_remote_workers(remote_workers)
 
         resolved_size = size if size is not None else (len(parsed_remotes) or 1)
         if resolved_size < 1:
@@ -445,6 +497,7 @@ class BrowserPool:
         self._launch_options = resolved_options
         self._proxies: tuple[str, ...] = tuple(proxies) if proxies is not None else ()
         self._isolated_displays = isolated_displays
+        self._display_backend: DisplayBackend = display_backend
         self._display_base = display_base
         self._remote_endpoints: dict[str, tuple[str, int]] = dict(parsed_remotes)
         self._available_remotes: deque[str] = deque(raw for raw, _ in parsed_remotes)
@@ -624,10 +677,11 @@ class BrowserPool:
     async def _launch_local_slot(self, *, proxy: str | None) -> _PoolSlot:
         effective_proxy, is_override = self._next_proxy(proxy)
         self._slot_counter += 1
+        use_wayland = self._display_backend == "wayland"
         use_isolated = self._isolated_displays and sys.platform.startswith("linux")
 
         display_num: int | None = None
-        if use_isolated:
+        if use_isolated and not use_wayland:
             display_num = find_free_display_num(
                 self._display_base,
                 reserved=self._reserved_displays,
@@ -640,7 +694,18 @@ class BrowserPool:
             try:
                 slot_opts = dataclasses.replace(self._launch_options, proxy=effective_proxy)
                 extra_env: dict[str, str] | None = None
-                if display_num is not None:
+                if use_wayland:
+                    if use_isolated:
+                        display_stack = _IsolatedDisplayStack.start_wayland_dbus()
+                        if display_stack is not None:
+                            extra_env = display_stack.env
+                    slot_opts = dataclasses.replace(
+                        slot_opts,
+                        display=None,
+                        headless_xvfb=False,
+                        headless_wayland=True,
+                    )
+                elif display_num is not None:
                     display_stack = _IsolatedDisplayStack.start(display_num)
                     slot_opts = dataclasses.replace(
                         slot_opts,

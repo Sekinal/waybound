@@ -54,3 +54,18 @@ def test_block_presets_emit_repeatable_cli_flags_and_reject_unknown() -> None:
 
     with pytest.raises(ValueError, match="unknown block preset"):
         LaunchOptions(block_presets=("analytics", "bogus"))
+
+
+def test_headless_wayland_emits_cli_flag_and_rejects_xvfb_combination() -> None:
+    opts = LaunchOptions(
+        backend="linux",
+        headless_wayland=True,
+        daemon_binary="/nonexistent/waybound-daemon",
+    )
+    session = Session(opts)
+    cmd = session._build_daemon_cmd(socket_path=None, tcp_addr=("127.0.0.1", 1))
+    assert "--headless-wayland" in cmd
+    assert "--headless-xvfb" not in cmd
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        LaunchOptions(backend="linux", headless_xvfb=True, headless_wayland=True)

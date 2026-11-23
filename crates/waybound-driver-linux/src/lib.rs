@@ -21,17 +21,20 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use tracing::debug;
+use waybound_compositor::HeadlessCompositor;
 use waybound_core::{AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, Result};
 
 /// Native Linux browser driver targeting unmodified Chrome/Chromium.
 ///
-/// Uses pure-Rust AT-SPI2 D-Bus (`zbus`) and X11 `XTEST`/`GetImage` (`x11rb`),
+/// Uses pure-Rust AT-SPI2 D-Bus (`zbus`) and either an in-process
+/// [`HeadlessCompositor`] (pure-Rust Wayland) or X11 `XTEST`/`GetImage` (`x11rb`),
 /// with automatic fallback to `pyatspi`/`xdotool`/`ydotool`/`scrot`/`grim`.
 #[derive(Debug, Clone)]
 pub struct LinuxDriver {
     pid: Option<i32>,
     display: Option<String>,
     display_server: Option<DisplayServer>,
+    compositor: Option<Arc<HeadlessCompositor>>,
     x11: Arc<Mutex<Option<x11_native::X11Client>>>,
     atspi: Arc<Mutex<Option<atspi_native::AtspiClient>>>,
     /// Pointer position left by the last `ydotool` move (Wayland fallback only).
@@ -46,6 +49,7 @@ impl LinuxDriver {
             pid,
             display: None,
             display_server: None,
+            compositor: None,
             x11: Arc::new(Mutex::new(None)),
             atspi: Arc::new(Mutex::new(None)),
             ydotool_cursor: Arc::new(Mutex::new(None)),
@@ -60,6 +64,23 @@ impl LinuxDriver {
             pid,
             display,
             display_server: None,
+            compositor: None,
+            x11: Arc::new(Mutex::new(None)),
+            atspi: Arc::new(Mutex::new(None)),
+            ydotool_cursor: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Creates a new [`LinuxDriver`] backed directly by an in-process pure-Rust
+    /// [`HeadlessCompositor`], routing pointer/keyboard input and screenshots straight
+    /// through the Wayland server with zero X11 or external CLI dependencies.
+    #[must_use]
+    pub fn with_compositor(pid: Option<i32>, compositor: Arc<HeadlessCompositor>) -> Self {
+        Self {
+            pid,
+            display: None,
+            display_server: Some(DisplayServer::Wayland),
+            compositor: Some(compositor),
             x11: Arc::new(Mutex::new(None)),
             atspi: Arc::new(Mutex::new(None)),
             ydotool_cursor: Arc::new(Mutex::new(None)),
@@ -178,6 +199,19 @@ impl Driver for LinuxDriver {
     }
 
     fn viewport_bounds(&self) -> Result<Option<Bounds>> {
+        if let Some(ref comp) = self.compositor
+            && let Ok(windows) = comp.windows()
+            && let Some(win) = windows.last()
+            && win.width > 0
+            && win.height > 0
+        {
+            return Ok(Some(Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: f64::from(win.width),
+                height: f64::from(win.height),
+            }));
+        }
         if let Some(Ok(bounds)) = self.with_atspi(|client| client.viewport_bounds(self.pid)) {
             return Ok(bounds);
         }
@@ -186,6 +220,9 @@ impl Driver for LinuxDriver {
     }
 
     fn screenshot(&self, output_path: &Path) -> Result<()> {
+        if let Some(ref comp) = self.compositor {
+            return comp.screenshot_window(None, output_path);
+        }
         if self
             .with_x11(|client| client.capture_png(output_path))
             .is_some_and(|r| r.is_ok())
@@ -200,6 +237,9 @@ impl Driver for LinuxDriver {
     }
 
     fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
+        if let Some(ref comp) = self.compositor {
+            return comp.dispatch_input(None, event);
+        }
         if self
             .with_x11(|client| client.dispatch_input(event))
             .is_some_and(|r| r.is_ok())
@@ -249,5 +289,49 @@ mod tests {
             wayland_driver.resolved_display_server(),
             DisplayServer::Wayland
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_compositor_resolves_wayland_and_routes_screenshot_and_input_errors() {
+        use waybound_compositor::CompositorConfig;
+        use waybound_core::{Point, WayboundError};
+
+        let runtime_dir =
+            std::env::temp_dir().join(format!("wb-driver-wl-test-{}", std::process::id()));
+        let config = CompositorConfig {
+            runtime_dir: Some(runtime_dir.clone()),
+            socket_name: Some("wl-driver-test-0".to_owned()),
+            ..CompositorConfig::default()
+        };
+        let compositor = HeadlessCompositor::start(config);
+        assert!(compositor.is_ok());
+        let Ok(compositor) = compositor else {
+            return;
+        };
+
+        let driver = LinuxDriver::with_compositor(Some(9001), Arc::new(compositor));
+        assert_eq!(driver.pid(), Some(9001));
+        assert_eq!(driver.display(), None);
+        assert_eq!(driver.resolved_display_server(), DisplayServer::Wayland);
+        assert_eq!(driver.backend_kind(), BackendKind::LinuxWayland);
+
+        let out_png = runtime_dir.join("out.png");
+        let shot_err = driver.screenshot(&out_png);
+        assert!(matches!(
+            shot_err,
+            Err(WayboundError::ElementNotFound { .. })
+        ));
+
+        let input_err = driver.dispatch_input(&InputEvent::PointerMove {
+            to: Point { x: 10.0, y: 20.0 },
+        });
+        assert!(matches!(
+            input_err,
+            Err(WayboundError::ElementNotFound { .. })
+        ));
+
+        drop(driver);
+        let _ = std::fs::remove_dir_all(&runtime_dir);
     }
 }

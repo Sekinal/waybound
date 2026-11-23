@@ -38,6 +38,11 @@ const ATSPI_LAUNCHER_CANDIDATES: readonly string[] = [
   "/usr/lib/at-spi2-core/at-spi-bus-launcher",
 ];
 
+/** Display backend used by `BrowserPool` on Linux. */
+export type DisplayBackend = "xvfb" | "wayland";
+
+const DISPLAY_BACKENDS: ReadonlySet<string> = new Set(["xvfb", "wayland"]);
+
 /** Configuration for `BrowserPool`. */
 export interface BrowserPoolOptions {
   /** Maximum concurrent browser slots. Defaults to `remoteWorkers.length` or `1`. */
@@ -48,9 +53,11 @@ export interface BrowserPoolOptions {
   readonly proxies?: readonly string[];
   /** Optional remote `host:port` TCP daemon endpoints instead of spawning local daemons. */
   readonly remoteWorkers?: readonly string[];
-  /** On Linux, spawn isolated `Xvfb` + `openbox` + `dbus-daemon` + `at-spi-bus-launcher` per slot. */
+  /** On Linux, spawn isolated display/D-Bus/AT-SPI2 per slot. */
   readonly isolatedDisplays?: boolean;
-  /** Starting X11 display number when `isolatedDisplays` is enabled. Default `100`. */
+  /** Linux display backend: `"xvfb"` (default) or `"wayland"` (pure-Rust headless compositor). */
+  readonly displayBackend?: DisplayBackend;
+  /** Starting X11 display number when `isolatedDisplays` is enabled with `"xvfb"`. Default `100`. */
   readonly displayBase?: number;
   /** Optional proactive slot recycle threshold (recycle after N checkouts). */
   readonly maxUsesPerSlot?: number;
@@ -161,19 +168,21 @@ export function buildDbusArgs(): string[] {
   return ["--session", "--print-address=1", "--nofork"];
 }
 
-/** Build the isolated Linux X11 + D-Bus/AT-SPI2 environment variables for a slot. */
+/** Build the isolated Linux display + D-Bus/AT-SPI2 environment variables for a slot. */
 export function buildSlotEnv(options: {
-  readonly display: string;
+  readonly display?: string;
   readonly dbusAddress: string;
   readonly atspiAddress?: string;
 }): Record<string, string> {
   const env: Record<string, string> = {
-    DISPLAY: options.display,
     DBUS_SESSION_BUS_ADDRESS: options.dbusAddress,
     ACCESSIBILITY_ENABLED: "1",
     GTK_MODULES: "gail:atk-bridge",
     QT_ACCESSIBILITY: "1",
   };
+  if (options.display !== undefined) {
+    env.DISPLAY = options.display;
+  }
   if (options.atspiAddress !== undefined) {
     env.AT_SPI_BUS_ADDRESS = options.atspiAddress;
   }
@@ -251,7 +260,6 @@ function waitForExit(child: ChildProcess, ms: number): Promise<boolean> {
       child.off("exit", onExit);
       resolve(hasExited(child));
     }, ms);
-    timer.unref();
     child.once("exit", onExit);
   });
 }
@@ -277,16 +285,65 @@ async function terminateProcess(child: ChildProcess): Promise<void> {
 }
 
 class IsolatedDisplayStack {
-  readonly displayNum: number;
-  readonly display: string;
+  readonly displayNum: number | undefined;
+  readonly display: string | undefined;
   readonly env: Record<string, string>;
   readonly #children: ChildProcess[];
 
-  private constructor(displayNum: number, env: Record<string, string>, children: ChildProcess[]) {
+  private constructor(
+    displayNum: number | undefined,
+    env: Record<string, string>,
+    children: ChildProcess[],
+  ) {
     this.displayNum = displayNum;
-    this.display = `:${displayNum}`;
+    this.display = displayNum !== undefined ? `:${displayNum}` : undefined;
     this.env = env;
     this.#children = children;
+  }
+
+  static async startWaylandDbus(): Promise<IsolatedDisplayStack | null> {
+    if (findOnPath("dbus-daemon") === null) {
+      return null;
+    }
+    const children: ChildProcess[] = [];
+    try {
+      const dbus = spawn("dbus-daemon", buildDbusArgs(), {
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      let dbusError: Error | null = null;
+      dbus.on("error", (err) => {
+        dbusError = err;
+      });
+      dbus.unref();
+      children.push(dbus);
+      const dbusAddress = await IsolatedDisplayStack.#readDbusAddress(
+        dbus,
+        () => dbusError,
+        DBUS_READY_TIMEOUT_MS,
+      );
+
+      const slotEnv = buildSlotEnv({ dbusAddress });
+      const childEnv: NodeJS.ProcessEnv = { ...process.env, ...slotEnv };
+
+      const atspiBin = findAtspiLauncher();
+      if (atspiBin !== null) {
+        const atspi = spawn(atspiBin, ["--launch-immediately"], {
+          stdio: ["ignore", "ignore", "ignore"],
+          env: childEnv,
+        });
+        atspi.on("error", () => undefined);
+        atspi.unref();
+        children.push(atspi);
+        await sleep(ATSPI_SETTLE_DELAY_MS);
+      }
+
+      return new IsolatedDisplayStack(undefined, slotEnv, children);
+    } catch (err) {
+      for (const child of [...children].reverse()) {
+        await terminateProcess(child);
+      }
+      throw err;
+    }
   }
 
   static async start(displayNum: number): Promise<IsolatedDisplayStack> {
@@ -574,6 +631,7 @@ export class BrowserPool implements AsyncDisposable {
   readonly #launchOptions: LaunchOptions;
   readonly #proxies: readonly string[];
   readonly #isolatedDisplays: boolean;
+  readonly #displayBackend: DisplayBackend;
   readonly #displayBase: number;
   readonly #remoteEndpoints = new Map<string, RemoteWorkerEndpoint>();
   readonly #availableRemotes: string[] = [];
@@ -642,6 +700,12 @@ export class BrowserPool implements AsyncDisposable {
     if (acquireTimeoutMs <= 0) {
       throw new RangeError(`acquireTimeoutMs must be > 0, got ${acquireTimeoutMs}`);
     }
+    const displayBackend = options.displayBackend ?? "xvfb";
+    if (!DISPLAY_BACKENDS.has(displayBackend)) {
+      throw new RangeError(
+        `displayBackend must be 'xvfb' or 'wayland', got ${JSON.stringify(displayBackend)}`,
+      );
+    }
     const displayBase = options.displayBase ?? DEFAULT_DISPLAY_BASE;
     if (!Number.isInteger(displayBase) || displayBase < 0) {
       throw new RangeError(`displayBase must be a non-negative integer, got ${displayBase}`);
@@ -652,6 +716,7 @@ export class BrowserPool implements AsyncDisposable {
     this.#launchOptions = resolvedLaunchOptions;
     this.#proxies = options.proxies !== undefined ? [...options.proxies] : [];
     this.#isolatedDisplays = options.isolatedDisplays ?? false;
+    this.#displayBackend = displayBackend;
     this.#displayBase = displayBase;
     this.#maxUsesPerSlot = options.maxUsesPerSlot;
     this.#acquireTimeoutMs = acquireTimeoutMs;
@@ -959,10 +1024,11 @@ export class BrowserPool implements AsyncDisposable {
 
   async #launchLocalSlot(proxy: string | undefined): Promise<PoolSlot> {
     const { proxy: effectiveProxy, overrideProxy } = this.#nextProxy(proxy);
+    const useWayland = this.#displayBackend === "wayland";
     const useIsolated = this.#isolatedDisplays && process.platform === "linux";
 
     let displayNum: number | undefined;
-    if (useIsolated) {
+    if (useIsolated && !useWayland) {
       displayNum = findFreeDisplayNum(this.#displayBase, this.#reservedDisplays);
       this.#reservedDisplays.add(displayNum);
     }
@@ -974,11 +1040,24 @@ export class BrowserPool implements AsyncDisposable {
           ? { ...this.#launchOptions, proxy: effectiveProxy }
           : { ...this.#launchOptions };
 
-      if (displayNum !== undefined) {
+      if (useWayland) {
+        if (useIsolated) {
+          displayStack = await IsolatedDisplayStack.startWaylandDbus();
+        }
+        const { display: _omitDisplay, ...withoutDisplay } = slotOptions;
+        slotOptions = {
+          ...withoutDisplay,
+          headlessXvfb: false,
+          headlessWayland: true,
+          ...(displayStack !== null
+            ? { extraEnv: { ...slotOptions.extraEnv, ...displayStack.env } }
+            : {}),
+        };
+      } else if (displayNum !== undefined) {
         displayStack = await IsolatedDisplayStack.start(displayNum);
         slotOptions = {
           ...slotOptions,
-          display: displayStack.display,
+          ...(displayStack.display !== undefined ? { display: displayStack.display } : {}),
           headlessXvfb: false,
           extraEnv: { ...slotOptions.extraEnv, ...displayStack.env },
         };

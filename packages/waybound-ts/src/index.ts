@@ -34,6 +34,7 @@ export {
   buildDbusArgs,
   buildSlotEnv,
   buildXvfbArgs,
+  type DisplayBackend,
   findFreeDisplayNum,
   type PooledPage,
   type PoolStats,

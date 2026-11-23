@@ -17,6 +17,7 @@ signal-hook.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+waybound-compositor.workspace = true
 waybound-core.workspace = true
 waybound-driver-android.workspace = true
 waybound-driver-linux.workspace = true

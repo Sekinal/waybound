@@ -6,12 +6,14 @@ import asyncio
 import contextlib
 import socket
 import subprocess
+import sys
 import time
 from typing import TYPE_CHECKING
 
 import pytest
 
-from waybound import BrowserPool, LaunchOptions, PoolStats, Role
+from waybound import BrowserPool, LaunchOptions, PoolStats, Role, Session
+from waybound import pool as pool_mod
 from waybound.pool import (
     build_dbus_command,
     build_slot_env,
@@ -116,6 +118,86 @@ def test_pool_config_validation(tmp_path: Path) -> None:
             size=2,
             launch_options=LaunchOptions(backend="mock", profile_dir=tmp_path / "shared"),
         )
+    with pytest.raises(ValueError, match="display_backend"):
+        BrowserPool(size=1, display_backend="invalid")  # type: ignore[arg-type]
+
+
+async def test_pool_wayland_backend_skips_xvfb_and_passes_headless_wayland(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_opts: list[LaunchOptions] = []
+    captured_cmds: list[list[str]] = []
+    xvfb_called = False
+    wayland_dbus_called = False
+
+    def _fail_xvfb(*_args: object, **_kwargs: object) -> object:
+        nonlocal xvfb_called
+        xvfb_called = True
+        msg = "Xvfb stack must not be started in wayland mode"
+        raise AssertionError(msg)
+
+    def _fake_wayland_dbus() -> None:
+        nonlocal wayland_dbus_called
+        wayland_dbus_called = True
+
+    real_session_cls = Session
+
+    class _FakeSession:
+        def __init__(
+            self,
+            options: LaunchOptions,
+            *,
+            extra_env: dict[str, str] | None = None,
+        ) -> None:
+            _ = extra_env
+            captured_opts.append(options)
+            real = real_session_cls(options)
+            captured_cmds.append(
+                real._build_daemon_cmd(socket_path=None, tcp_addr=("127.0.0.1", 1))
+            )
+
+        def __enter__(self) -> object:
+            return object()
+
+        def ping(self) -> str:
+            return "0.5.0"
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(pool_mod, "find_free_display_num", _fail_xvfb)
+    monkeypatch.setattr(pool_mod._IsolatedDisplayStack, "start", classmethod(_fail_xvfb))
+    monkeypatch.setattr(
+        pool_mod._IsolatedDisplayStack,
+        "start_wayland_dbus",
+        classmethod(lambda _cls: _fake_wayland_dbus()),
+    )
+    monkeypatch.setattr(pool_mod, "Session", _FakeSession)
+
+    async with (
+        BrowserPool(
+            size=1,
+            isolated_displays=True,
+            display_backend="wayland",
+            launch_options=LaunchOptions(
+                backend="linux",
+                headless_xvfb=True,
+                daemon_binary="/nonexistent/waybound-daemon",
+            ),
+        ) as pool,
+        pool.acquire(),
+    ):
+        pass
+
+    assert not xvfb_called
+    assert wayland_dbus_called
+    assert len(captured_opts) == 1
+    assert captured_opts[0].headless_wayland is True
+    assert captured_opts[0].headless_xvfb is False
+    assert captured_opts[0].display is None
+    assert "--headless-wayland" in captured_cmds[0]
+    assert "--headless-xvfb" not in captured_cmds[0]
 
 
 # ---------------------------------------------------------------------------
