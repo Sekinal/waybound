@@ -3,6 +3,7 @@
 from waybound.async_client import AsyncLocator, AsyncPage, AsyncSession, launch_async
 from waybound.client import Locator, Page
 from waybound.handoff import AsyncHandoffHttpClient, HandoffHttpClient, HandoffResponse
+from waybound.pool import BrowserPool, PoolSlotConfig, PoolStats
 from waybound.session import LaunchOptions, Session, launch
 from waybound.transport import UnixSocketTransport, WayboundDaemonError
 from waybound.types import (
@@ -38,6 +39,7 @@ __all__ = [
     "AsyncSession",
     "BackendKind",
     "Bounds",
+    "BrowserPool",
     "CapturedCookie",
     "CapturedResponse",
     "CapturedWebSocketFrame",
@@ -53,6 +55,8 @@ __all__ = [
     "Locator",
     "LocatorQuery",
     "Page",
+    "PoolSlotConfig",
+    "PoolStats",
     "Role",
     "Session",
     "SessionFingerprint",
