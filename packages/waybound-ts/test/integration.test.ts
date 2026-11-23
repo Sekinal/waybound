@@ -146,6 +146,12 @@ describe("integration: waybound-daemon --backend mock", { skip }, () => {
 
       assert.deepEqual(await page.capturedResponses(), []);
       assert.deepEqual(await page.capturedResponses({ urlContains: "api" }), []);
+      assert.deepEqual(await page.networkStats(), {
+        bytesSent: 0,
+        bytesReceived: 0,
+        connectionsTotal: 0,
+        connectionsBlocked: 0,
+      });
       await page.waitForNetworkIdle({ idleMs: 50, timeoutMs: 2_000 });
 
       // Daemon-side errors map to codes and leave the session usable.

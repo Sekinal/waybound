@@ -25,6 +25,7 @@ use waybound_core::{
 use waybound_net::{FingerprintRecorder, InflightCounter, wait_for_network_idle};
 
 use crate::net_tap::ResponseStore;
+use crate::proxy::ProxyStats;
 
 #[cfg(unix)]
 const MAX_UNIX_PATH_BYTES: usize = 100;
@@ -70,6 +71,8 @@ pub struct ServerOptions {
     pub inflight: InflightCounter,
     /// Shared session-wide TLS/HTTP2/header/cookie fingerprint recorder.
     pub fingerprint: FingerprintRecorder,
+    /// Shared per-session proxy bandwidth & connection counters (`None` when proxy is inactive).
+    pub proxy_stats: Option<Arc<ProxyStats>>,
 }
 
 struct SessionState {
@@ -253,6 +256,14 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
         }
         Request::ExportSessionFingerprint => Response::SessionFingerprint {
             fingerprint: Box::new(state.options.fingerprint.snapshot()),
+        },
+        Request::NetworkStats => Response::NetworkStats {
+            stats: state
+                .options
+                .proxy_stats
+                .as_deref()
+                .map(ProxyStats::snapshot)
+                .unwrap_or_default(),
         },
         Request::Screenshot { path } => match driver.screenshot(Path::new(&path)) {
             Ok(()) => Response::Ok,
@@ -1560,6 +1571,7 @@ mod tests {
                 use_motion: false,
                 inflight: InflightCounter::default(),
                 fingerprint: FingerprintRecorder::new(),
+                proxy_stats: None,
             },
             Arc::new(ResponseStore::default()),
             Arc::new(AtomicBool::new(false)),
@@ -1572,6 +1584,7 @@ mod tests {
                 use_motion,
                 inflight: InflightCounter::default(),
                 fingerprint: FingerprintRecorder::new(),
+                proxy_stats: None,
             },
             Arc::new(ResponseStore::default()),
             shutdown,
@@ -2678,5 +2691,109 @@ mod tests {
             ok_resp,
             Response::Node { ref node } if node.id == "btn-unique"
         ));
+    }
+
+    #[test]
+    fn network_stats_returns_zeros_without_proxy_and_live_counters_with_proxy() {
+        let driver = MockDriver::sample_page();
+        let zero_resp = handle_request(&driver, &state(), Request::NetworkStats);
+        assert_eq!(
+            zero_resp,
+            Response::NetworkStats {
+                stats: waybound_core::NetworkStats::default(),
+            }
+        );
+
+        let Ok(echo_listener) = TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let Ok(echo_addr) = echo_listener.local_addr() else {
+            return;
+        };
+        let payload = b"waybound-stats-test";
+        let echo_thread = thread::spawn(move || {
+            if let Ok((mut s, _)) = echo_listener.accept() {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buf = [0u8; 64];
+                if let Ok(n) = s.read(&mut buf) {
+                    let _ = s.write_all(&buf[..n]);
+                    let _ = s.flush();
+                }
+            }
+        });
+
+        let blocker = waybound_net::HostBlocker::new(["doubleclick.net"]);
+        let Ok(forwarder) = crate::proxy::ProxyForwarder::start_with_options(None, blocker, None)
+        else {
+            return;
+        };
+
+        // 1) Allowed CONNECT tunnel echoing `payload`.
+        if let Ok(mut client) = TcpStream::connect(forwarder.local_addr()) {
+            let _ = client.set_read_timeout(Some(Duration::from_secs(5)));
+            let req = format!("CONNECT {echo_addr} HTTP/1.1\r\nHost: {echo_addr}\r\n\r\n");
+            let _ = client.write_all(req.as_bytes());
+            let mut est = [0u8; 39];
+            let _ = client.read_exact(&mut est);
+            let _ = client.write_all(payload);
+            let _ = client.flush();
+            let mut echoed = vec![0u8; payload.len()];
+            let _ = client.read_exact(&mut echoed);
+            assert_eq!(echoed, payload);
+        }
+
+        // 2) Blocked host request.
+        if let Ok(mut blocked) = TcpStream::connect(forwarder.local_addr()) {
+            let _ = blocked.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = blocked.write_all(
+                b"CONNECT ad.doubleclick.net:443 HTTP/1.1\r\nHost: ad.doubleclick.net:443\r\n\r\n",
+            );
+            let mut reply_buf = [0u8; 128];
+            let n = blocked.read(&mut reply_buf).unwrap_or(0);
+            assert!(String::from_utf8_lossy(&reply_buf[..n]).starts_with("HTTP/1.1 403 Forbidden"));
+        }
+
+        let _ = echo_thread.join();
+
+        let live_state = SessionState::new(
+            ServerOptions {
+                use_motion: false,
+                inflight: InflightCounter::default(),
+                fingerprint: FingerprintRecorder::new(),
+                proxy_stats: Some(forwarder.stats_handle()),
+            },
+            Arc::new(ResponseStore::default()),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let expected_bytes = payload.len() as u64;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let resp = loop {
+            let r = handle_request(&driver, &live_state, Request::NetworkStats);
+            if matches!(
+                r,
+                Response::NetworkStats { stats }
+                    if stats.connections_total == 2
+                        && stats.connections_blocked == 1
+                        && stats.bytes_sent == expected_bytes
+                        && stats.bytes_received == expected_bytes
+            ) || Instant::now() >= deadline
+            {
+                break r;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        assert_eq!(
+            resp,
+            Response::NetworkStats {
+                stats: waybound_core::NetworkStats {
+                    bytes_sent: expected_bytes,
+                    bytes_received: expected_bytes,
+                    connections_total: 2,
+                    connections_blocked: 1,
+                },
+            }
+        );
     }
 }

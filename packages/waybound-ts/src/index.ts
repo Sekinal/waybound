@@ -53,12 +53,15 @@ export {
 export {
   type AccessibilityNode,
   BackendKind,
+  BLOCK_PRESETS,
+  type BlockPreset,
   Bounds,
   CapturedResponse,
   KeyModifier,
   type LocatorQuery,
   NAMED_KEYS,
   type NamedKey,
+  type NetworkStats,
   Role,
   type TreeSnapshot,
 } from "./types.js";

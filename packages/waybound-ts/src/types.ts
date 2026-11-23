@@ -115,6 +115,18 @@ export class CapturedResponse {
   }
 }
 
+/** Curated opt-in L4 host blocklist preset names accepted by `LaunchOptions.blockPresets`. */
+export const BLOCK_PRESETS = ["analytics", "ads", "media"] as const;
+export type BlockPreset = (typeof BLOCK_PRESETS)[number];
+
+/** Per-session bandwidth and connection counters tracked by the daemon proxy. */
+export interface NetworkStats {
+  readonly bytesSent: number;
+  readonly bytesReceived: number;
+  readonly connectionsTotal: number;
+  readonly connectionsBlocked: number;
+}
+
 /** Accessibility tree snapshot along with truncation metadata. */
 export interface TreeSnapshot {
   readonly nodes: AccessibilityNode[];

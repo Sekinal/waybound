@@ -6,7 +6,7 @@ use crate::error::WayboundError;
 use crate::fingerprint::SessionFingerprint;
 use crate::input::{KeyCode, KeyModifier};
 use crate::locator::{AccessibilityNode, LocatorQuery};
-use crate::network::{CapturedResponse, CapturedWebSocketFrame};
+use crate::network::{CapturedResponse, CapturedWebSocketFrame, NetworkStats};
 
 /// Wire-level request sent from a client SDK to `waybound-daemon`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,6 +139,8 @@ pub enum Request {
     },
     /// Export the live TLS, HTTP/2, header, and cookie fingerprint captured from the browser session.
     ExportSessionFingerprint,
+    /// Return per-session bandwidth and connection counters from the local proxy forwarder.
+    NetworkStats,
     /// Capture a native OS PNG screenshot to `path` (the browser window on macOS, the whole
     /// display on Linux, the primary screen on Windows, the device screen on Android).
     Screenshot {
@@ -223,6 +225,11 @@ pub enum Response {
     WebsocketFrames {
         /// Captured WebSocket messages matching the filter, oldest first.
         frames: Vec<CapturedWebSocketFrame>,
+    },
+    /// Response to [`Request::NetworkStats`].
+    NetworkStats {
+        /// Per-session bandwidth and connection counters.
+        stats: NetworkStats,
     },
     /// Structured error returned when a request fails.
     Error {
@@ -449,5 +456,29 @@ mod tests {
             serde_json::to_string(&truncated_resp).unwrap_or_default(),
             r#"{"status":"tree","nodes":[],"truncated":true}"#
         );
+    }
+
+    #[test]
+    fn network_stats_request_and_response_json() {
+        let req = Request::NetworkStats;
+        let encoded_req = serde_json::to_string(&req).unwrap_or_default();
+        assert_eq!(encoded_req, r#"{"method":"network_stats"}"#);
+        let decoded_req: Result<Request, _> = serde_json::from_str(&encoded_req);
+        assert_eq!(decoded_req.ok(), Some(Request::NetworkStats));
+
+        let stats = NetworkStats {
+            bytes_sent: 1_024,
+            bytes_received: 8_192,
+            connections_total: 12,
+            connections_blocked: 3,
+        };
+        let resp = Response::NetworkStats { stats };
+        let encoded_resp = serde_json::to_string(&resp).unwrap_or_default();
+        assert_eq!(
+            encoded_resp,
+            r#"{"status":"network_stats","stats":{"bytes_sent":1024,"bytes_received":8192,"connections_total":12,"connections_blocked":3}}"#
+        );
+        let decoded_resp: Result<Response, _> = serde_json::from_str(&encoded_resp);
+        assert_eq!(decoded_resp.ok(), Some(resp));
     }
 }

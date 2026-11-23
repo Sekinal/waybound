@@ -10,7 +10,15 @@ from pathlib import Path
 
 import pytest
 
-from waybound import KeyModifier, LaunchOptions, Role, WayboundDaemonError, launch, launch_async
+from waybound import (
+    KeyModifier,
+    LaunchOptions,
+    NetworkStats,
+    Role,
+    WayboundDaemonError,
+    launch,
+    launch_async,
+)
 from waybound.transport import UnixSocketTransport
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -47,6 +55,12 @@ def test_ergonomic_launch_full_workflow() -> None:
         assert page.captured_responses() == []
         assert page.captured_websocket_frames(url_contains="wss://") == []
         assert page.captured_websocket_frames(limit=5) == []
+        assert page.network_stats() == NetworkStats(
+            bytes_sent=0,
+            bytes_received=0,
+            connections_total=0,
+            connections_blocked=0,
+        )
 
         png_bytes = page.screenshot()
         assert png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
@@ -64,8 +78,20 @@ async def test_async_launch_workflow() -> None:
     if not DAEMON_BIN.exists():
         pytest.skip("waybound-daemon binary not built yet (run cargo build)")
 
-    async with launch_async(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
+    async with launch_async(
+        LaunchOptions(
+            backend="mock",
+            block_presets=("analytics", "ads"),
+            daemon_binary=DAEMON_BIN,
+        )
+    ) as page:
         assert await page.url() == "https://mock.waybound.local/"
+        assert await page.network_stats() == NetworkStats(
+            bytes_sent=0,
+            bytes_received=0,
+            connections_total=0,
+            connections_blocked=0,
+        )
         assert await page.get_by_role(Role.BUTTON).nth(0).text_content() == "Search Flights"
         await page.get_by_role(Role.TEXTBOX, name="Origin").fill("HND")
         await page.get_by_role(Role.BUTTON, name="Search").click()

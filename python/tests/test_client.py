@@ -15,6 +15,7 @@ from waybound import (
     HttpHeader,
     KeyModifier,
     LocatorQuery,
+    NetworkStats,
     Page,
     Role,
     SessionFingerprint,
@@ -133,6 +134,15 @@ class FakeTransport:
     def export_fingerprint(self) -> SessionFingerprint:
         self.events.append(("export_fingerprint", None))
         return SessionFingerprint(tls=None, http2=None, default_headers=(), cookies=())
+
+    def network_stats(self) -> NetworkStats:
+        self.events.append(("network_stats", None))
+        return NetworkStats(
+            bytes_sent=128,
+            bytes_received=512,
+            connections_total=4,
+            connections_blocked=1,
+        )
 
     def screenshot(self, path: str) -> None:
         self.events.append(("screenshot", path))

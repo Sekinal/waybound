@@ -22,6 +22,7 @@ from waybound.types import (
     HttpHeader,
     KeyModifier,
     LocatorQuery,
+    NetworkStats,
     Role,
     SessionFingerprint,
     TlsFingerprint,
@@ -386,6 +387,20 @@ class UnixSocketTransport:
             msg = f"unexpected export_session_fingerprint response: {response!r}"
             raise WayboundDaemonError("protocol_error", msg)
         return parse_session_fingerprint(raw_fp)
+
+    def network_stats(self) -> NetworkStats:
+        """Return per-session bandwidth and connection counters from the daemon proxy."""
+        response = self._request({"method": "network_stats"})
+        raw_stats = response.get("stats")
+        if response.get("status") != "network_stats" or not isinstance(raw_stats, dict):
+            msg = f"unexpected network_stats response: {response!r}"
+            raise WayboundDaemonError("protocol_error", msg)
+        return NetworkStats(
+            bytes_sent=_parse_int(raw_stats.get("bytes_sent")),
+            bytes_received=_parse_int(raw_stats.get("bytes_received")),
+            connections_total=_parse_int(raw_stats.get("connections_total")),
+            connections_blocked=_parse_int(raw_stats.get("connections_blocked")),
+        )
 
     def scroll(self, delta_x: float, delta_y: float) -> None:
         """Emit a native scroll event."""

@@ -11,6 +11,7 @@ import {
   type LocatorQuery,
   NAMED_KEYS,
   type NamedKey,
+  type NetworkStats,
   parseRole,
   type TreeSnapshot,
 } from "./types.js";
@@ -509,6 +510,18 @@ export class Transport {
     );
   }
 
+  /** Return per-session bandwidth and connection counters from the daemon proxy. */
+  async networkStats(): Promise<NetworkStats> {
+    const response = await this.request({ method: "network_stats" });
+    if (response.status !== "network_stats" || !isObject(response.stats)) {
+      throw new WayboundDaemonError(
+        "protocol_error",
+        `unexpected network_stats response: ${describe(response)}`,
+      );
+    }
+    return parseNetworkStats(response.stats);
+  }
+
   /** Focus the element and type `text` with native key events. */
   async fill(query: LocatorQuery, text: string): Promise<void> {
     await this.#expectOk(
@@ -658,4 +671,18 @@ export function parseHttpResponse(item: JsonObject): CapturedResponse {
     typeof item.content_type === "string" ? item.content_type : null,
     typeof item.body === "string" ? item.body : null,
   );
+}
+
+function parseCounter(raw: unknown): number {
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? Math.trunc(raw) : 0;
+}
+
+/** Parse a `NetworkStats` payload from the daemon. */
+export function parseNetworkStats(item: JsonObject): NetworkStats {
+  return {
+    bytesSent: parseCounter(item.bytes_sent),
+    bytesReceived: parseCounter(item.bytes_received),
+    connectionsTotal: parseCounter(item.connections_total),
+    connectionsBlocked: parseCounter(item.connections_blocked),
+  };
 }

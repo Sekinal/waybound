@@ -34,7 +34,9 @@ use crate::mock_driver::MockDriver;
 use crate::net_tap::{ResponseStore, start_passive_tap};
 use crate::proxy::{PassiveTapConfig, ProxyForwarder, UpstreamProxy};
 use crate::server::ServerOptions;
-use waybound_net::{FingerprintRecorder, HostBlocker, InflightCounter, KeyLogStore};
+use waybound_net::{
+    FingerprintRecorder, HostBlocker, InflightCounter, KeyLogStore, expand_block_presets,
+};
 
 #[allow(clippy::struct_excessive_bools)]
 struct CliArgs {
@@ -56,6 +58,7 @@ struct CliArgs {
     /// Whether `proxy` came from `--proxy` (world-readable argv) rather than `WAYBOUND_PROXY`.
     proxy_from_argv: bool,
     block_hosts: Vec<String>,
+    block_presets: Vec<String>,
     timezone: Option<String>,
     locale: Option<String>,
     focus: bool,
@@ -69,6 +72,10 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 }
 
 fn parse_args() -> Result<CliArgs, String> {
+    parse_args_from(env::args().skip(1))
+}
+
+fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> {
     let mut cli = CliArgs {
         socket_path: env::var("WAYBOUND_SOCKET").ok().map(PathBuf::from),
         tcp_addr: env::var("WAYBOUND_TCP_ADDR").ok(),
@@ -87,6 +94,7 @@ fn parse_args() -> Result<CliArgs, String> {
         proxy: env::var("WAYBOUND_PROXY").ok(),
         proxy_from_argv: false,
         block_hosts: Vec::new(),
+        block_presets: Vec::new(),
         timezone: None,
         locale: None,
         focus: false,
@@ -94,7 +102,7 @@ fn parse_args() -> Result<CliArgs, String> {
         replay: false,
     };
 
-    let mut args = env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => cli.socket_path = Some(PathBuf::from(next_arg(&mut args, "--socket")?)),
@@ -141,6 +149,9 @@ fn parse_args() -> Result<CliArgs, String> {
                     cli.block_hosts.push(host.to_owned());
                 }
             }
+            "--block-preset" => cli
+                .block_presets
+                .push(next_arg(&mut args, "--block-preset")?),
             "--timezone" => cli.timezone = Some(next_arg(&mut args, "--timezone")?),
             "--locale" => cli.locale = Some(next_arg(&mut args, "--locale")?),
             "--focus" => cli.focus = true,
@@ -148,6 +159,11 @@ fn parse_args() -> Result<CliArgs, String> {
             "--replay" => cli.replay = true,
             unknown => return Err(format!("unknown argument: {unknown}")),
         }
+    }
+
+    if !cli.block_presets.is_empty() {
+        let expanded = expand_block_presets(&cli.block_presets)?;
+        cli.block_hosts.extend(expanded);
     }
 
     Ok(cli)
@@ -206,7 +222,7 @@ struct BackendBundle {
     driver: Arc<dyn Driver>,
     use_motion: bool,
     _launched: Option<launcher::LaunchedChrome>,
-    _proxy_forwarder: Option<ProxyForwarder>,
+    proxy_forwarder: Option<ProxyForwarder>,
     _waydroid: Option<WaydroidSession>,
     _xvfb: Option<HeadlessDisplaySession>,
 }
@@ -254,7 +270,7 @@ fn build_backend(
             driver: Arc::new(MockDriver::sample_page()),
             use_motion: false,
             _launched: None,
-            _proxy_forwarder: None,
+            proxy_forwarder: None,
             _waydroid: None,
             _xvfb: None,
         }),
@@ -302,7 +318,7 @@ fn build_backend(
                 driver: Arc::new(android),
                 use_motion: !cli.no_motion,
                 _launched: None,
-                _proxy_forwarder: proxy_fwd,
+                proxy_forwarder: proxy_fwd,
                 _waydroid: waydroid_session,
                 _xvfb: None,
             })
@@ -324,7 +340,7 @@ fn build_backend(
                 driver: Arc::new(MacOsDriver::new(target_pid)),
                 use_motion: !cli.no_motion,
                 _launched: launched,
-                _proxy_forwarder: fwd,
+                proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: None,
             })
@@ -357,7 +373,7 @@ fn build_backend(
                 driver: Arc::new(LinuxDriver::with_display(target_pid, display_env)),
                 use_motion: !cli.no_motion,
                 _launched: launched,
-                _proxy_forwarder: fwd,
+                proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: xvfb_session,
             })
@@ -376,7 +392,7 @@ fn build_backend(
                 driver: Arc::new(WindowsDriver::new(target_pid)),
                 use_motion: !cli.no_motion,
                 _launched: launched,
-                _proxy_forwarder: fwd,
+                proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: None,
             })
@@ -410,6 +426,7 @@ fn run_replay_mode() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -479,10 +496,15 @@ fn main() -> ExitCode {
         }
     };
 
+    let proxy_stats = bundle
+        .proxy_forwarder
+        .as_ref()
+        .map(ProxyForwarder::stats_handle);
     let options = ServerOptions {
         use_motion: bundle.use_motion,
         inflight,
         fingerprint,
+        proxy_stats,
     };
 
     if let Some(addr) = tcp_addr {
@@ -528,5 +550,38 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_expands_repeatable_block_presets_and_merges_with_hosts() {
+        let parsed = parse_args_from([
+            "--block-preset".to_owned(),
+            "analytics".to_owned(),
+            "--block-preset".to_owned(),
+            "ads".to_owned(),
+            "--block-host".to_owned(),
+            "custom.tracker.test".to_owned(),
+        ]);
+        assert!(parsed.is_ok());
+        if let Ok(cli) = parsed {
+            let blocker = HostBlocker::new(&cli.block_hosts);
+            assert!(blocker.is_blocked("www.google-analytics.com"));
+            assert!(blocker.is_blocked("pagead2.googlesyndication.com"));
+            assert!(blocker.is_blocked("custom.tracker.test"));
+            assert!(!blocker.is_blocked("example.com"));
+        }
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_block_preset() {
+        let err = parse_args_from(["--block-preset".to_owned(), "nonexistent".to_owned()]);
+        assert!(
+            matches!(err, Err(msg) if msg.contains("nonexistent") && msg.contains("analytics"))
+        );
     }
 }

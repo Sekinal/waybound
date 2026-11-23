@@ -31,6 +31,7 @@ pub use motion::{
     plan_scroll_burst,
 };
 pub use network::{
-    CapturedResponse, CapturedWebSocketFrame, HttpHeader, WebSocketDirection, WebSocketOpcode,
+    CapturedResponse, CapturedWebSocketFrame, HttpHeader, NetworkStats, WebSocketDirection,
+    WebSocketOpcode,
 };
 pub use protocol::{Request, Response};
