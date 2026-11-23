@@ -39,14 +39,17 @@ def _check_daemon() -> str:
 
 # Same lookup as the daemon (`find_executable` in `net_tap.rs`), in the same order: the
 # absolute entries of `PATH`, then these well-known install locations.
-_TSHARK_FALLBACK_PATHS = (
-    "/opt/homebrew/bin/tshark",
-    "/usr/local/bin/tshark",
-    "/usr/bin/tshark",
-    "/opt/local/bin/tshark",
-    "/Applications/Wireshark.app/Contents/MacOS/tshark",
-    "/run/current-system/sw/bin/tshark",
-    r"C:\Program Files\Wireshark\tshark.exe",
+_TSHARK_FALLBACK_PATHS: tuple[str, ...] = (
+    (r"C:\Program Files\Wireshark\tshark.exe",)
+    if sys.platform == "win32"
+    else (
+        "/opt/homebrew/bin/tshark",
+        "/usr/local/bin/tshark",
+        "/usr/bin/tshark",
+        "/opt/local/bin/tshark",
+        "/Applications/Wireshark.app/Contents/MacOS/tshark",
+        "/run/current-system/sw/bin/tshark",
+    )
 )
 _TSHARK_SCOPE = "only needed to capture when attaching to a desktop browser with pid + ssl_keylog"
 

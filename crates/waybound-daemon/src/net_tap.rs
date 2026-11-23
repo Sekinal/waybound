@@ -355,11 +355,11 @@ impl StreamCorrelator {
             }
             Some(H1Message::Response { request_in }) => {
                 // Each HTTP/1.x response is a new exchange on the keep-alive connection.
+                // Never recycle `entry.url` from the previous exchange if this response's
+                // request was missed and tshark did not supply `http.request.full_uri`.
                 let fresh_seq = self.alloc_seq();
                 if let Some(entry) = self.streams.get_mut(key) {
-                    let uri = pair_h1_response(&mut entry.h1_requests, request_in)
-                        .or(url)
-                        .or_else(|| entry.url.take());
+                    let uri = pair_h1_response(&mut entry.h1_requests, request_in).or(url);
                     *entry = PendingStream {
                         seq: fresh_seq,
                         url: uri,
@@ -758,7 +758,11 @@ fn read_capped_line(
     }
     buf.clear();
     loop {
-        let available = reader.fill_buf()?;
+        let available = match reader.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
         if available.is_empty() {
             break;
         }
@@ -774,6 +778,7 @@ fn read_capped_line(
 
 /// Well-known install locations checked after `PATH`, for daemons started with a minimal
 /// environment (launchd, IDEs, GUI apps). Keep in sync with `waybound doctor` (`cli.py`).
+#[cfg(not(windows))]
 const TSHARK_FALLBACK_PATHS: &[&str] = &[
     "/opt/homebrew/bin/tshark",
     "/usr/local/bin/tshark",
@@ -781,8 +786,9 @@ const TSHARK_FALLBACK_PATHS: &[&str] = &[
     "/opt/local/bin/tshark",
     "/Applications/Wireshark.app/Contents/MacOS/tshark",
     "/run/current-system/sw/bin/tshark",
-    r"C:\Program Files\Wireshark\tshark.exe",
 ];
+#[cfg(windows)]
+const TSHARK_FALLBACK_PATHS: &[&str] = &[r"C:\Program Files\Wireshark\tshark.exe"];
 
 /// Longest `tshark` output line accepted. Bodies are colon-separated hex (3 bytes per body
 /// byte), and the `END_STREAM` frame carries both `http2.data.data` and the reassembled body,
@@ -831,7 +837,12 @@ fn find_executable(name: &str, path_var: Option<&OsStr>, fallbacks: &[&str]) -> 
     absolute_path_dirs(path_var)
         .into_iter()
         .map(|dir| dir.join(&file_name))
-        .chain(fallbacks.iter().map(PathBuf::from))
+        .chain(
+            fallbacks
+                .iter()
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute()),
+        )
         .find(|candidate| is_executable_file(candidate))
 }
 
@@ -1072,13 +1083,13 @@ pub fn start_passive_tap(
             deadline = Instant::now() + STARTUP_GRACE;
         }
         if let Some(status) = tap.child.try_wait().map_err(WayboundError::Io)? {
+            tap.stopping.store(true, Ordering::SeqCst);
             let drain_deadline = Instant::now() + STDERR_DRAIN_TIMEOUT;
             while stderr_handle.as_ref().is_some_and(|h| !h.is_finished())
                 && Instant::now() < drain_deadline
             {
                 thread::sleep(POLL_INTERVAL);
             }
-            tap.stopping.store(true, Ordering::SeqCst);
             return Err(capture_unavailable(format!(
                 "{} exited during startup on interface {iface} with {status}: {}",
                 tshark.display(),
