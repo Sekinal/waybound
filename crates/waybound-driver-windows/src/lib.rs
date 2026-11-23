@@ -1,9 +1,13 @@
 //! Native Windows backend driver implementing [`waybound_core::Driver`] via
-//! `UIAutomation` (`UIAutomationClient`) and Win32 `SendInput` (`user32.dll`).
+//! `UIAutomation` (in-process COM `IUIAutomation`, with a PowerShell fallback selected by
+//! `WAYBOUND_WINDOWS_UIA=powershell`) and Win32 `SendInput` (`user32.dll`).
 
 pub mod input;
 pub mod screenshot;
 pub mod uia;
+#[cfg(target_os = "windows")]
+mod uia_com;
+pub mod uia_model;
 
 use std::path::Path;
 
