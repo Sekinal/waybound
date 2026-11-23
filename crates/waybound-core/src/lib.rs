@@ -22,5 +22,7 @@ pub use motion::{
     key_hold_ms, mouse_hold_ms, pick_click_point, plan_human_pointer_path, plan_pointer_path,
     plan_scroll_burst,
 };
-pub use network::CapturedResponse;
+pub use network::{
+    CapturedResponse, CapturedWebSocketFrame, HttpHeader, WebSocketDirection, WebSocketOpcode,
+};
 pub use protocol::{Request, Response};

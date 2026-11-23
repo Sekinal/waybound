@@ -166,12 +166,16 @@ fn setup_proxy(
     let blocker = HostBlocker::new(block_hosts);
     let tap = ssl_keylog.map(|path| {
         let store = Arc::clone(responses);
+        let ws_store = Arc::clone(responses);
         PassiveTapConfig {
             keylog: KeyLogStore::new(path),
             inflight: inflight.clone(),
             on_response: Arc::new(move |seq, resp| {
                 store.upsert(seq, resp);
             }),
+            on_websocket: Some(Arc::new(move |frame| {
+                ws_store.push_websocket_frame(frame);
+            })),
         }
     });
 

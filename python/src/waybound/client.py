@@ -9,7 +9,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from waybound.transport import WayboundDaemonError
-from waybound.types import AccessibilityNode, CapturedResponse, KeyModifier, LocatorQuery, Role
+from waybound.types import (
+    AccessibilityNode,
+    CapturedResponse,
+    CapturedWebSocketFrame,
+    KeyModifier,
+    LocatorQuery,
+    Role,
+    SupportsWebSocketFrames,
+)
 
 if TYPE_CHECKING:
     from waybound.types import Transport
@@ -236,6 +244,24 @@ class Page:
     def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
         """Wait until a passively decrypted HTTP response matches `url_contains`."""
         return self._transport.wait_for_response(url_contains, timeout_ms=timeout_ms)
+
+    def captured_websocket_frames(
+        self, *, url_contains: str | None = None, limit: int | None = None
+    ) -> list[CapturedWebSocketFrame]:
+        """Return passively decrypted WebSocket messages (oldest first).
+
+        Covers HTTP/1.1 `101 Switching Protocols` upgrades; fragmented messages are
+        reassembled and `permessage-deflate` payloads are inflated. `limit` keeps only
+        the newest messages.
+
+        Raises:
+            NotImplementedError: if the page's transport does not support WebSocket capture.
+        """
+        transport = self._transport
+        if not isinstance(transport, SupportsWebSocketFrames):
+            msg = f"{type(transport).__name__} does not support captured_websocket_frames"
+            raise NotImplementedError(msg)
+        return transport.captured_websocket_frames(url_contains=url_contains, limit=limit)
 
     def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
         """Wait until zero HTTP/1.1 or HTTP/2 requests remain inflight for `idle_ms`."""

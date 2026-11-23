@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 
 class BackendKind(StrEnum):
@@ -88,13 +88,37 @@ class AccessibilityNode:
 
 
 @dataclass(frozen=True, slots=True)
+class HttpHeader:
+    """Single HTTP header field as seen on the wire (repeated names are kept separately)."""
+
+    name: str
+    # Values can be credentials (cookie, authorization); keep them out of reprs and logs.
+    value: str = field(repr=False)
+
+
+def _header_values(headers: tuple[HttpHeader, ...], name: str) -> list[str]:
+    wanted = name.lower()
+    return [h.value for h in headers if h.name.lower() == wanted]
+
+
+@dataclass(frozen=True, slots=True)
 class CapturedResponse:
-    """Passively decrypted HTTP/1.1, HTTP/2, or HTTP/3 response."""
+    """Passively decrypted HTTP/1.1, HTTP/2, or HTTP/3 response.
+
+    `headers`, `request_method`, `request_headers`, and `request_body` are empty when the
+    daemon did not observe them (for example with the legacy `tshark` capture path or an
+    older daemon).
+    """
 
     url: str
     status: int
     content_type: str | None
-    body: str | None
+    # Bodies and header values may hold credentials or personal data: kept out of reprs.
+    body: str | None = field(repr=False)
+    headers: tuple[HttpHeader, ...] = field(default=(), repr=False)
+    request_method: str | None = None
+    request_headers: tuple[HttpHeader, ...] = field(default=(), repr=False)
+    request_body: str | None = field(default=None, repr=False)
 
     def json(self) -> object:
         """Parse and return the captured response body as JSON."""
@@ -102,6 +126,69 @@ class CapturedResponse:
             msg = f"captured response for {self.url!r} has no body"
             raise ValueError(msg)
         return json.loads(self.body)
+
+    def header(self, name: str) -> str | None:
+        """Return the first response header named `name` (case-insensitive), if present."""
+        values = _header_values(self.headers, name)
+        return values[0] if values else None
+
+    def header_values(self, name: str) -> list[str]:
+        """Return every response header value named `name` (e.g. all `set-cookie` lines)."""
+        return _header_values(self.headers, name)
+
+    def request_header(self, name: str) -> str | None:
+        """Return the first request header named `name` (case-insensitive), if present."""
+        values = _header_values(self.request_headers, name)
+        return values[0] if values else None
+
+    def request_header_values(self, name: str) -> list[str]:
+        """Return every request header value named `name`."""
+        return _header_values(self.request_headers, name)
+
+    def request_json(self) -> object:
+        """Parse and return the captured request body (e.g. a POST payload) as JSON."""
+        if self.request_body is None:
+            msg = f"captured request for {self.url!r} has no body"
+            raise ValueError(msg)
+        return json.loads(self.request_body)
+
+
+class WebSocketDirection(StrEnum):
+    """Direction of a captured WebSocket message."""
+
+    SENT = "sent"
+    RECEIVED = "received"
+
+
+class WebSocketOpcode(StrEnum):
+    """Opcode of a captured WebSocket message (RFC 6455)."""
+
+    TEXT = "text"
+    BINARY = "binary"
+    CLOSE = "close"
+    PING = "ping"
+    PONG = "pong"
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedWebSocketFrame:
+    """Passively decrypted WebSocket message (fragments reassembled) or control frame."""
+
+    url: str
+    direction: WebSocketDirection
+    opcode: WebSocketOpcode
+    payload: str | None = field(default=None, repr=False)
+    payload_len: int = 0
+    compressed: bool = False
+    truncated: bool = False
+    close_code: int | None = None
+
+    def json(self) -> object:
+        """Parse and return the message payload as JSON."""
+        if self.payload is None:
+            msg = f"captured WebSocket message for {self.url!r} has no decoded payload"
+            raise ValueError(msg)
+        return json.loads(self.payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,4 +311,19 @@ class Transport(Protocol):
         self, source: LocatorQuery, target: LocatorQuery, *, timeout_ms: int = 5_000
     ) -> None:
         """Press on `source`, drag along a native pointer path to `target`, and release."""
+        ...
+
+
+@runtime_checkable
+class SupportsWebSocketFrames(Protocol):
+    """Optional transport capability: listing passively captured WebSocket messages.
+
+    Kept separate from `Transport` so custom transports written before WebSocket
+    capture existed remain valid `Transport` implementations.
+    """
+
+    def captured_websocket_frames(
+        self, *, url_contains: str | None = None, limit: int | None = None
+    ) -> list[CapturedWebSocketFrame]:
+        """Return captured WebSocket messages (oldest first), at most the newest `limit`."""
         ...

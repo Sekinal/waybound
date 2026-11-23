@@ -13,10 +13,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use waybound_core::{CapturedResponse, Result, WayboundError};
+use waybound_core::{CapturedResponse, CapturedWebSocketFrame, Result, WayboundError};
 use waybound_net::decode_body_bytes;
 
 const MAX_CAPTURED_RESPONSES: usize = 500;
+/// Maximum retained WebSocket messages across all connections (oldest dropped first).
+const MAX_CAPTURED_WS_FRAMES: usize = 1_000;
 const MAX_PENDING_STREAMS: usize = 1_000;
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -37,11 +39,13 @@ struct StoredResponse {
 #[derive(Default)]
 struct StoreInner {
     entries: VecDeque<StoredResponse>,
+    websocket_frames: VecDeque<CapturedWebSocketFrame>,
     /// Highest stream sequence ID ever stored; the baseline for [`ResponseStore::wait_for`].
     last_seq: u64,
 }
 
-/// Thread-safe store of passively decrypted HTTP responses keyed by stream sequence ID.
+/// Thread-safe store of passively decrypted HTTP responses keyed by stream sequence ID,
+/// plus a bounded log of decrypted WebSocket messages.
 #[derive(Default)]
 pub struct ResponseStore {
     inner: Mutex<StoreInner>,
@@ -60,8 +64,22 @@ impl ResponseStore {
                 existing.response.body = resp.body;
                 existing.updated = now;
             }
+            // A final status replaces an earlier one for the same stream.
+            existing.response.status = resp.status;
             if existing.response.content_type.is_none() {
                 existing.response.content_type = resp.content_type;
+            }
+            if !resp.headers.is_empty() {
+                existing.response.headers = resp.headers;
+            }
+            if resp.request_method.is_some() {
+                existing.response.request_method = resp.request_method;
+            }
+            if !resp.request_headers.is_empty() {
+                existing.response.request_headers = resp.request_headers;
+            }
+            if resp.request_body.is_some() {
+                existing.response.request_body = resp.request_body;
             }
             return;
         }
@@ -75,6 +93,46 @@ impl ResponseStore {
             first_seen: now,
             updated: now,
         });
+    }
+
+    /// Appends a decrypted WebSocket message, dropping the oldest once
+    /// [`MAX_CAPTURED_WS_FRAMES`] are retained.
+    pub fn push_websocket_frame(&self, frame: CapturedWebSocketFrame) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        if guard.websocket_frames.len() >= MAX_CAPTURED_WS_FRAMES {
+            let _ = guard.websocket_frames.pop_front();
+        }
+        guard.websocket_frames.push_back(frame);
+    }
+
+    /// Returns captured WebSocket messages (oldest first), optionally filtered by
+    /// case-insensitive URL substring and limited to the most recent `limit` matches.
+    #[must_use]
+    pub fn list_websocket_frames(
+        &self,
+        url_contains: Option<&str>,
+        limit: Option<usize>,
+    ) -> Vec<CapturedWebSocketFrame> {
+        let needle = url_contains.map(str::to_lowercase);
+        let Ok(guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut newest_first: Vec<CapturedWebSocketFrame> = guard
+            .websocket_frames
+            .iter()
+            .rev()
+            .filter(|f| {
+                needle
+                    .as_ref()
+                    .is_none_or(|n| f.url.to_lowercase().contains(n))
+            })
+            .take(limit.unwrap_or(usize::MAX))
+            .cloned()
+            .collect();
+        newest_first.reverse();
+        newest_first
     }
 
     /// Returns all captured responses, optionally filtered by case-insensitive URL substring.
@@ -303,6 +361,7 @@ impl StreamCorrelator {
                     status,
                     content_type: entry.content_type.clone(),
                     body,
+                    ..CapturedResponse::default()
                 },
             );
             entry.emitted = true;
@@ -642,6 +701,7 @@ mod tests {
             status: 200,
             content_type: None,
             body: body.map(str::to_owned),
+            ..CapturedResponse::default()
         }
     }
 
@@ -692,6 +752,144 @@ mod tests {
         let got = store.wait_for("/empty", 3_000);
         assert!(handle.join().is_ok());
         assert!(matches!(got, Ok(ref r) if r.body.is_none()));
+    }
+
+    #[test]
+    fn upsert_merges_headers_and_request_metadata_into_existing_entry() {
+        use waybound_core::HttpHeader;
+
+        let store = ResponseStore::default();
+        store.upsert(7, sample("https://a.test/form", None));
+        store.upsert(
+            7,
+            CapturedResponse {
+                headers: vec![HttpHeader::new("set-cookie", "a=1")].into(),
+                request_method: Some("POST".to_owned()),
+                request_headers: vec![HttpHeader::new("content-type", "text/plain")].into(),
+                request_body: Some("x=1".into()),
+                ..sample("https://a.test/form", Some("ok"))
+            },
+        );
+        store.upsert(
+            7,
+            CapturedResponse {
+                status: 201,
+                ..sample("https://a.test/form", None)
+            },
+        );
+        let got = store.list(None);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].status, 201);
+        assert_eq!(got[0].body.as_deref(), Some("ok"));
+        assert_eq!(&*got[0].headers, [HttpHeader::new("set-cookie", "a=1")]);
+        assert_eq!(got[0].request_method.as_deref(), Some("POST"));
+        assert_eq!(got[0].request_body.as_deref(), Some("x=1"));
+    }
+
+    /// HPACK literal header field without indexing, new name, no Huffman (short strings).
+    fn hpack_literal(out: &mut Vec<u8>, name: &str, value: &str) {
+        out.push(0x00);
+        out.push(u8::try_from(name.len()).unwrap_or(0));
+        out.extend_from_slice(name.as_bytes());
+        out.push(u8::try_from(value.len()).unwrap_or(0));
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn h2_frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(payload.len()).unwrap_or(0).to_be_bytes();
+        let mut out = vec![len[1], len[2], len[3], ftype, flags];
+        out.extend_from_slice(&stream_id.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn streaming_response_metadata_survives_store_eviction() {
+        use waybound_net::{HttpConnectionCorrelator, InflightCounter, ResponseCallback};
+
+        let store = Arc::new(ResponseStore::default());
+        let sink = |store: &Arc<ResponseStore>| -> ResponseCallback {
+            let store = Arc::clone(store);
+            Arc::new(move |seq, resp| store.upsert(seq, resp))
+        };
+        let mut live = HttpConnectionCorrelator::new(
+            "live.test".to_owned(),
+            1,
+            InflightCounter::default(),
+            sink(&store),
+        );
+        let mut req = Vec::new();
+        hpack_literal(&mut req, ":method", "POST");
+        hpack_literal(&mut req, ":authority", "live.test");
+        hpack_literal(&mut req, ":path", "/sse");
+        hpack_literal(&mut req, "x-token", "t1");
+        let mut c2s = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        c2s.extend(h2_frame(0x1, 0x4, 1, &req));
+        c2s.extend(h2_frame(0x0, 0x1, 1, b"q=1"));
+        live.feed_client(&c2s);
+        let mut resp = Vec::new();
+        hpack_literal(&mut resp, ":status", "200");
+        hpack_literal(&mut resp, "set-cookie", "a=1");
+        let mut s2c = h2_frame(0x1, 0x4, 1, &resp);
+        s2c.extend(h2_frame(0x0, 0, 1, b"data: 1\n\n"));
+        live.feed_server(&s2c);
+
+        // Enough other responses to evict the long-lived stream's entry.
+        let mut other = HttpConnectionCorrelator::new(
+            "other.test".to_owned(),
+            10_000_000,
+            InflightCounter::default(),
+            sink(&store),
+        );
+        for i in 0..MAX_CAPTURED_RESPONSES + 100 {
+            other.feed_client(format!("GET /{i} HTTP/1.1\r\nHost: other.test\r\n\r\n").as_bytes());
+            other.feed_server(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        }
+        assert_eq!(store.list(Some("/sse")).len(), 0);
+
+        live.feed_server(&h2_frame(0x0, 0, 1, b"data: 2\n\n"));
+        let got = store.list(Some("/sse"));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].request_method.as_deref(), Some("POST"));
+        assert_eq!(got[0].request_body.as_deref(), Some("q=1"));
+        assert_eq!(got[0].request_headers.len(), 1);
+        assert_eq!(got[0].headers.len(), 1);
+        assert_eq!(got[0].body.as_deref(), Some("data: 1\n\ndata: 2\n\n"));
+    }
+
+    #[test]
+    fn websocket_frames_are_bounded_and_filterable() {
+        use waybound_core::{WebSocketDirection, WebSocketOpcode};
+
+        let store = ResponseStore::default();
+        for i in 0..=MAX_CAPTURED_WS_FRAMES {
+            let host = if i % 2 == 0 { "even" } else { "odd" };
+            store.push_websocket_frame(CapturedWebSocketFrame {
+                url: format!("wss://{host}.test/ws"),
+                direction: WebSocketDirection::Received,
+                opcode: WebSocketOpcode::Text,
+                payload: Some(i.to_string()),
+                payload_len: 1,
+                compressed: false,
+                truncated: false,
+                close_code: None,
+            });
+        }
+        let all = store.list_websocket_frames(None, None);
+        assert_eq!(all.len(), MAX_CAPTURED_WS_FRAMES);
+        assert_eq!(all[0].payload.as_deref(), Some("1"));
+        let odd = store.list_websocket_frames(Some("ODD.test"), None);
+        assert_eq!(odd.len(), MAX_CAPTURED_WS_FRAMES / 2);
+        let recent = store.list_websocket_frames(Some("even"), Some(2));
+        let recent_payloads: Vec<_> = recent.iter().map(|f| f.payload.as_deref()).collect();
+        let last = MAX_CAPTURED_WS_FRAMES.to_string();
+        let before = (MAX_CAPTURED_WS_FRAMES - 2).to_string();
+        assert_eq!(
+            recent_payloads,
+            vec![Some(before.as_str()), Some(last.as_str())]
+        );
+        // The legacy tshark path never produces WebSocket frames or the new response fields.
+        assert_eq!(store.list(None), Vec::new());
     }
 
     #[test]

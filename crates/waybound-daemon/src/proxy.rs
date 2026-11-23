@@ -38,6 +38,7 @@ use waybound_core::Result;
 use crate::peer::{PeerDecision, PeerVerifier, platform_verifier};
 use waybound_net::{
     Direction, HostBlocker, InflightCounter, KeyLogStore, PassiveConnectionTap, ResponseCallback,
+    WebSocketCallback,
 };
 
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
@@ -184,6 +185,24 @@ pub struct PassiveTapConfig {
     pub inflight: InflightCounter,
     /// Callback invoked with each decrypted HTTP response.
     pub on_response: ResponseCallback,
+    /// Callback invoked with each decrypted WebSocket message (`None` disables WebSocket capture).
+    pub on_websocket: Option<WebSocketCallback>,
+}
+
+impl PassiveTapConfig {
+    /// Creates the per-connection passive tap for a tunnel to `host`.
+    fn connection_tap(&self, host: String) -> PassiveConnectionTap {
+        let tap = PassiveConnectionTap::new(
+            host,
+            self.keylog.clone(),
+            self.inflight.clone(),
+            Arc::clone(&self.on_response),
+        );
+        match &self.on_websocket {
+            Some(cb) => tap.with_websocket_callback(Arc::clone(cb)),
+            None => tap,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -209,12 +228,7 @@ impl ForwarderConfig {
             }
         }
         self.tap.as_ref().map(|t| {
-            let tap: Arc<dyn TunnelObserver> = Arc::new(PassiveConnectionTap::new(
-                host.to_owned(),
-                t.keylog.clone(),
-                t.inflight.clone(),
-                Arc::clone(&t.on_response),
-            ));
+            let tap: Arc<dyn TunnelObserver> = Arc::new(t.connection_tap(host.to_owned()));
             tap
         })
     }

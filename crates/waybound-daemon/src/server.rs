@@ -206,6 +206,14 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
         Request::CapturedResponses { url_contains } => Response::HttpResponses {
             responses: state.responses.list(url_contains.as_deref()),
         },
+        Request::CapturedWebsocketFrames {
+            url_contains,
+            limit,
+        } => Response::WebsocketFrames {
+            frames: state
+                .responses
+                .list_websocket_frames(url_contains.as_deref(), limit),
+        },
         Request::WaitForResponse {
             url_contains,
             timeout_ms,

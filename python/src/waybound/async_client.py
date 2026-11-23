@@ -13,7 +13,13 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from waybound.client import Locator, Page
-    from waybound.types import AccessibilityNode, CapturedResponse, KeyModifier, Role
+    from waybound.types import (
+        AccessibilityNode,
+        CapturedResponse,
+        CapturedWebSocketFrame,
+        KeyModifier,
+        Role,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +196,14 @@ class AsyncPage:
         """Wait until a passively decrypted HTTP response matches `url_contains`."""
         return await asyncio.to_thread(
             self._inner.wait_for_response, url_contains, timeout_ms=timeout_ms
+        )
+
+    async def captured_websocket_frames(
+        self, *, url_contains: str | None = None, limit: int | None = None
+    ) -> list[CapturedWebSocketFrame]:
+        """Return passively decrypted WebSocket messages (oldest first, newest `limit`)."""
+        return await asyncio.to_thread(
+            self._inner.captured_websocket_frames, url_contains=url_contains, limit=limit
         )
 
     async def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:

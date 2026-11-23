@@ -48,7 +48,7 @@ def test_mcp_server_initialize_list_and_tool_calls() -> None:
         assert isinstance(result, dict)
         tools = result["tools"]
         assert isinstance(tools, list)
-        assert len(tools) == 8
+        assert len(tools) == 9
 
         url_resp = handle_rpc_message(
             provider,

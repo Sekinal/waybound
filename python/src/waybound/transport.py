@@ -13,9 +13,13 @@ from waybound.types import (
     AccessibilityNode,
     Bounds,
     CapturedResponse,
+    CapturedWebSocketFrame,
+    HttpHeader,
     KeyModifier,
     LocatorQuery,
     Role,
+    WebSocketDirection,
+    WebSocketOpcode,
 )
 
 if TYPE_CHECKING:
@@ -196,6 +200,27 @@ class UnixSocketTransport:
             msg = f"unexpected captured_responses payload: {response!r}"
             raise WayboundDaemonError("protocol_error", msg)
         return [_parse_http_response(item) for item in raw_items if isinstance(item, dict)]
+
+    def captured_websocket_frames(
+        self, *, url_contains: str | None = None, limit: int | None = None
+    ) -> list[CapturedWebSocketFrame]:
+        """Return passively captured WebSocket messages (oldest first).
+
+        Optionally filtered by URL substring and limited to the newest `limit` messages.
+        """
+        payload: dict[str, object] = {
+            "method": "captured_websocket_frames",
+            "url_contains": url_contains,
+        }
+        if limit is not None:
+            payload["limit"] = max(0, limit)
+        response = self._request(payload)
+        raw_items = response.get("frames")
+        if not isinstance(raw_items, list):
+            msg = f"unexpected captured_websocket_frames payload: {response!r}"
+            raise WayboundDaemonError("protocol_error", msg)
+        frames = (_parse_websocket_frame(item) for item in raw_items if isinstance(item, dict))
+        return [frame for frame in frames if frame is not None]
 
     def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
         """Wait until a passively captured HTTP response matches `url_contains`.
@@ -487,19 +512,67 @@ def _parse_node(item: dict[object, object]) -> AccessibilityNode:
     )
 
 
+def _opt_str(raw: object) -> str | None:
+    return raw if isinstance(raw, str) else None
+
+
+def _opt_int(raw: object) -> int | None:
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+
+
+def _parse_headers(raw: object) -> tuple[HttpHeader, ...]:
+    if not isinstance(raw, list):
+        return ()
+    headers: list[HttpHeader] = []
+    for item in raw:
+        if isinstance(item, dict):
+            name = item.get("name")
+            value = item.get("value")
+            if isinstance(name, str) and isinstance(value, str):
+                headers.append(HttpHeader(name=name, value=value))
+    return tuple(headers)
+
+
 def _parse_optional_bool(raw: object) -> bool | None:
     return raw if isinstance(raw, bool) else None
 
 
 def _parse_http_response(item: dict[object, object]) -> CapturedResponse:
     url = str(item.get("url", ""))
-    raw_status = item.get("status", 0)
-    status = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else 0
-    ct = item.get("content_type")
-    content_type = ct if isinstance(ct, str) else None
-    body_val = item.get("body")
-    body = body_val if isinstance(body_val, str) else None
-    return CapturedResponse(url=url, status=status, content_type=content_type, body=body)
+    status = _opt_int(item.get("status", 0)) or 0
+    return CapturedResponse(
+        url=url,
+        status=status,
+        content_type=_opt_str(item.get("content_type")),
+        body=_opt_str(item.get("body")),
+        headers=_parse_headers(item.get("headers")),
+        request_method=_opt_str(item.get("request_method")),
+        request_headers=_parse_headers(item.get("request_headers")),
+        request_body=_opt_str(item.get("request_body")),
+    )
+
+
+def _parse_websocket_frame(item: dict[object, object]) -> CapturedWebSocketFrame | None:
+    """Parse one WebSocket message, skipping items with an unknown direction or opcode."""
+    raw_direction = item.get("direction")
+    raw_opcode = item.get("opcode")
+    if not isinstance(raw_direction, str) or not isinstance(raw_opcode, str):
+        return None
+    try:
+        direction = WebSocketDirection(raw_direction)
+        opcode = WebSocketOpcode(raw_opcode)
+    except ValueError:
+        return None
+    return CapturedWebSocketFrame(
+        url=str(item.get("url", "")),
+        direction=direction,
+        opcode=opcode,
+        payload=_opt_str(item.get("payload")),
+        payload_len=_opt_int(item.get("payload_len")) or 0,
+        compressed=item.get("compressed") is True,
+        truncated=item.get("truncated") is True,
+        close_code=_opt_int(item.get("close_code")),
+    )
 
 
 def _encode_query(query: LocatorQuery) -> dict[str, object]:
