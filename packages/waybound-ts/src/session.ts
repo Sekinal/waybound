@@ -46,6 +46,8 @@ export interface LaunchOptions {
   readonly blockPresets?: readonly string[];
   readonly timezone?: string;
   readonly locale?: string;
+  /** Linux Chrome `--password-store` override (`"basic"`, `"gnome-libsecret"`, `"kwallet5"`, `"kwallet6"`). */
+  readonly passwordStore?: "basic" | "gnome-libsecret" | "kwallet5" | "kwallet6";
   readonly focus?: boolean;
   readonly noMotion?: boolean;
   /** Use loopback TCP instead of a Unix socket (always on for Windows). */
@@ -81,6 +83,7 @@ export function buildDaemonArgs(options: LaunchOptions, endpoint: Endpoint): str
     ["--ssl-keylog", options.sslKeylog],
     ["--timezone", options.timezone],
     ["--locale", options.locale],
+    ["--password-store", options.passwordStore],
   ];
   for (const [flag, value] of pairs) {
     if (value !== undefined) {
@@ -315,15 +318,20 @@ export class Session {
   }
 }
 
+/** How long `stopChild()` waits after a `shutdown` ack for graceful Chrome teardown (5 s + margin). */
+const DAEMON_EXIT_TIMEOUT_MS = 8_000;
+/** How long `stopChild()` waits after `SIGTERM` before escalating to `SIGKILL`. */
+const SIGTERM_EXIT_TIMEOUT_MS = 2_000;
+
 async function stopChild(child: ChildProcess, shutdownSent: boolean): Promise<void> {
   if (hasExited(child) || child.pid === undefined) {
     return;
   }
-  if (shutdownSent && (await waitForExit(child, 2_000))) {
+  if (shutdownSent && (await waitForExit(child, DAEMON_EXIT_TIMEOUT_MS))) {
     return;
   }
   child.kill("SIGTERM");
-  if (await waitForExit(child, 2_000)) {
+  if (await waitForExit(child, SIGTERM_EXIT_TIMEOUT_MS)) {
     return;
   }
   child.kill("SIGKILL");

@@ -410,16 +410,26 @@ def profile_lock_state(profile_dir: Path | str) -> LockState:
     return _singleton_target_state(target)
 
 
+_MAX_PID_DIGITS = 10
+
+
 def _singleton_target_state(target: str) -> LockState:
     host, sep, pid_text = target.rpartition("-")
-    if not sep or not host or not pid_text.isdigit():
+    if (
+        not sep
+        or not host
+        or not (pid_text.isascii() and pid_text.isdigit() and len(pid_text) <= _MAX_PID_DIGITS)
+    ):
+        return "live"
+    pid = int(pid_text)
+    if pid <= 0:
         return "live"
     if host != socket.gethostname():
         return "foreign"
     if os.name != "posix":
         return "live"
     try:
-        os.kill(int(pid_text), 0)
+        os.kill(pid, 0)
     except ProcessLookupError:
         return "stale"
     except (PermissionError, OverflowError, OSError):
@@ -455,6 +465,30 @@ def _check_lock(root: Path, *, ignore_lock: bool) -> list[str]:
 _PREFIX_RE = re.compile(rb"^v[0-9]{2}$")
 
 
+def _open_regular_nofollow(path: Path) -> io.BufferedReader:
+    """Open `path` without following a final symlink and verify it is a regular file."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags)
+    fh = os.fdopen(fd, "rb")
+    try:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            msg = f"not a regular file: {path}"
+            raise ProfileError(msg)
+    except BaseException:
+        fh.close()
+        raise
+    return fh
+
+
+def _has_symlink_component(base: Path, rel: str) -> bool:
+    cur = base
+    for part in rel.split("/"):
+        cur = cur / part
+        if cur.is_symlink():
+            return True
+    return False
+
+
 def detect_cookie_encryption(
     profile_dir: Path | str, *, scratch_dir: Path | str | None = None
 ) -> tuple[str, ...] | None:
@@ -475,8 +509,10 @@ def detect_cookie_encryption(
         if entry.is_symlink() or not _PROFILE_DIR_RE.match(entry.name):
             continue
         for db in COOKIE_DATABASES:
+            if _has_symlink_component(entry, db):
+                continue
             path = entry / db
-            if path.is_symlink() or not path.is_file():
+            if not path.is_file():
                 continue
             found = _read_prefixes(path, scratch_dir)
             if found is None:
@@ -492,14 +528,21 @@ def _read_prefixes(db: Path, scratch_dir: Path | str | None) -> set[str] | None:
         try:
             for suffix in _SQLITE_SIDECARS:
                 src = Path(f"{db}{suffix}")
-                if src.is_file() and not src.is_symlink():
-                    shutil.copyfile(src, f"{copy}{suffix}")
+                try:
+                    with (
+                        _open_regular_nofollow(src) as in_fh,
+                        Path(f"{copy}{suffix}").open("wb") as out_fh,
+                    ):
+                        shutil.copyfileobj(in_fh, out_fh, _CHUNK)
+                except FileNotFoundError:
+                    if suffix == "":
+                        return None
             with contextlib.closing(sqlite3.connect(copy)) as conn:
                 rows = conn.execute(
                     "SELECT DISTINCT substr(encrypted_value, 1, 3) FROM cookies "
                     "WHERE length(encrypted_value) > 0"
                 ).fetchall()
-        except (sqlite3.Error, OSError):
+        except (sqlite3.Error, OSError, ProfileError):
             return None
     for (prefix,) in rows:
         if isinstance(prefix, bytes) and _PREFIX_RE.match(prefix):
@@ -642,11 +685,7 @@ def _fix_permissions(root: Path) -> None:
 def _sha256_file(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
-    with os.fdopen(fd, "rb") as fh:
-        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-            msg = f"not a regular file: {path}"
-            raise ProfileError(msg)
+    with _open_regular_nofollow(path) as fh:
         while chunk := fh.read(_CHUNK):
             digest.update(chunk)
             size += len(chunk)
@@ -755,6 +794,9 @@ def export_profile(  # noqa: PLR0913
     if out.is_symlink():
         msg = f"refusing to write the bundle through a symlink: {out}"
         raise ProfileError(msg)
+    if out.is_dir():
+        msg = f"bundle output path is a directory: {out}"
+        raise ProfileError(msg)
     if out.exists() and not overwrite:
         msg = f"bundle already exists: {out} (pass overwrite=True / --force to replace it)"
         raise ProfileError(msg)
@@ -782,7 +824,10 @@ def _build_manifest(
     if len(rel_paths) > MAX_FILES:
         msg = f"profile has {len(rel_paths)} files to export; the limit is {MAX_FILES}"
         raise ProfileError(msg)
-    if not any(p.endswith("/Cookies") and _profile_and_rest(p) for p in rel_paths):
+    if not any(
+        (split := _profile_and_rest(p)) is not None and split[1] in COOKIE_DATABASES
+        for p in rel_paths
+    ):
         warnings.append("no Cookies database found; the bundle will not carry a logged-in session")
 
     files = []
@@ -823,11 +868,14 @@ def _write_bundle(root: Path, out: Path, manifest: Manifest, manifest_bytes: byt
             tar.addfile(_tarinfo(MANIFEST_NAME, len(manifest_bytes)), io.BytesIO(manifest_bytes))
             for entry in manifest.files:
                 info = _tarinfo(PAYLOAD_PREFIX + entry.path, entry.size)
-                with (root / entry.path).open("rb") as fh:
+                with _open_regular_nofollow(root / entry.path) as fh:
                     tar.addfile(info, fh)
         tmp.chmod(0o600)
         # Re-read what was written: catches a file that changed between hashing and archiving.
-        verify_bundle(tmp, max_bytes=max(DEFAULT_MAX_BYTES, manifest.total_bytes))
+        verify_bundle(
+            tmp,
+            max_bytes=max(DEFAULT_MAX_BYTES, manifest.total_bytes, tmp.stat().st_size),
+        )
         tmp.replace(out)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -851,13 +899,20 @@ def _tarinfo(name: str, size: int) -> tarfile.TarInfo:
 
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PREFIX_LEN = 16
+_MAX_PREFIX_COUNT = 32
 _MAX_FIELD_LEN = 256
+_ASCII_PRINTABLE_MIN = 0x20
+_ASCII_DEL = 0x7F
 
 
 def _str_field(doc: dict[object, object], key: str) -> str:
     value = doc.get(key)
-    if not isinstance(value, str) or len(value) > _MAX_FIELD_LEN:
-        msg = f"manifest field {key!r} must be a short string"
+    if (
+        not isinstance(value, str)
+        or len(value) > _MAX_FIELD_LEN
+        or any(ord(ch) < _ASCII_PRINTABLE_MIN or ord(ch) == _ASCII_DEL for ch in value)
+    ):
+        msg = f"manifest field {key!r} must be a short printable string"
         raise BundleVerificationError(msg)
     return value
 
@@ -913,8 +968,10 @@ def _parse_prefixes(doc: dict[object, object]) -> tuple[str, ...] | None:
     raw = doc.get("cookie_encryption_prefixes")
     if raw is None:
         return None
-    if not isinstance(raw, list) or not all(
-        isinstance(p, str) and len(p) <= _MAX_PREFIX_LEN for p in raw
+    if (
+        not isinstance(raw, list)
+        or len(raw) > _MAX_PREFIX_COUNT
+        or not all(isinstance(p, str) and len(p) <= _MAX_PREFIX_LEN for p in raw)
     ):
         raise _fail("manifest field 'cookie_encryption_prefixes' is malformed")
     return tuple(str(p) for p in raw)
@@ -976,7 +1033,7 @@ class _GzipMember:
     def __init__(self, path: Path) -> None:
         self._fh = path.open("rb")
         self._inflate = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
-        self._buf = b""
+        self._buf = bytearray()
 
     def read(self, size: int = -1, /) -> bytes:
         if size < 0:
@@ -987,9 +1044,10 @@ class _GzipMember:
             if not data:
                 msg = "bundle is truncated (the gzip stream ends early)"
                 raise BundleVerificationError(msg)
-            self._buf += self._inflate.decompress(data, size - len(self._buf))
+            self._buf.extend(self._inflate.decompress(data, size - len(self._buf)))
             self._reject_trailing_data()
-        out, self._buf = self._buf[:size], self._buf[size:]
+        out = bytes(self._buf[:size])
+        del self._buf[:size]
         return out
 
     def _reject_trailing_data(self) -> None:
