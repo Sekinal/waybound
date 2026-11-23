@@ -4,6 +4,12 @@ from waybound.async_client import AsyncLocator, AsyncPage, AsyncSession, launch_
 from waybound.client import Locator, Page
 from waybound.handoff import AsyncHandoffHttpClient, HandoffHttpClient, HandoffResponse
 from waybound.pool import BrowserPool, PoolSlotConfig, PoolStats
+from waybound.profiles import (
+    DEFAULT_MAX_SNAPSHOT_BYTES,
+    EXCLUDED_PROFILE_NAMES,
+    ProfileStore,
+    validate_profile_name,
+)
 from waybound.session import LaunchOptions, Session, launch
 from waybound.transport import UnixSocketTransport, WayboundDaemonError
 from waybound.types import (
@@ -33,6 +39,8 @@ from waybound.types import (
 )
 
 __all__ = [
+    "DEFAULT_MAX_SNAPSHOT_BYTES",
+    "EXCLUDED_PROFILE_NAMES",
     "AccessibilityNode",
     "AsyncHandoffHttpClient",
     "AsyncLocator",
@@ -59,6 +67,7 @@ __all__ = [
     "Page",
     "PoolSlotConfig",
     "PoolStats",
+    "ProfileStore",
     "Role",
     "Session",
     "SessionFingerprint",
@@ -73,4 +82,5 @@ __all__ = [
     "WebSocketOpcode",
     "launch",
     "launch_async",
+    "validate_profile_name",
 ]
