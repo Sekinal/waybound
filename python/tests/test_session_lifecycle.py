@@ -264,29 +264,125 @@ def test_concurrent_close_runs_one_shutdown(monkeypatch: pytest.MonkeyPatch) -> 
     assert session.daemon_pid is None
 
 
+def test_lifetime_variables_cannot_come_from_extra_env_or_be_our_group() -> None:
+    for name in ("WAYBOUND_REAP_PGID", "WAYBOUND_EXIT_WITH_PARENT"):
+        with pytest.raises(ValueError, match="SDK manages"):
+            Session(MOCK, extra_env={name: "12345"})
+    for bad in (0, 1, os.getpgrp(), os.getpid()):
+        with pytest.raises(ValueError, match="refusing to reap"):
+            Session(MOCK, _reap_pgid=bad)
+
+
+def _helper_group() -> subprocess.Popen[bytes]:
+    # Stands in for a pool slot's Xvfb/D-Bus stack: its own process group.
+    helper = subprocess.Popen(["/bin/sh", "-c", "sleep 60 & sleep 60"], process_group=0)
+    time.sleep(0.2)
+    return helper
+
+
+def _group_alive(pgid: int) -> bool:
+    """Whether the group has a live (non-zombie) member; `killpg(pgid, 0)` cannot tell, as
+    macOS answers EPERM for a group whose members are zombies awaiting their reaper."""
+    out = subprocess.run(
+        ["/bin/ps", "-axo", "pgid=,stat="], capture_output=True, text=True, check=True
+    ).stdout
+    return any(
+        parts[0] == str(pgid) and not parts[1].startswith("Z")
+        for parts in (line.split() for line in out.splitlines())
+        if len(parts) == 2
+    )
+
+
+def _stop_group(helper: subprocess.Popen[bytes]) -> None:
+    if _group_alive(helper.pid):
+        os.killpg(helper.pid, signal.SIGKILL)
+    helper.wait()
+
+
 @pytest.mark.usefixtures("daemon")
-def test_daemon_is_told_our_pid_and_reaps_the_given_process_group(tmp_path: Path) -> None:
+def test_inherited_lifetime_variables_are_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    helper = _helper_group()
+    try:
+        # A stale value in the user's environment must not reach the daemon.
+        monkeypatch.setenv("WAYBOUND_REAP_PGID", str(helper.pid))
+        monkeypatch.setenv("WAYBOUND_EXIT_WITH_PARENT", "1")
+        with Session(MOCK) as page:
+            assert page.url() == MOCK_URL
+        time.sleep(0.5)
+        assert _group_alive(helper.pid), "an inherited WAYBOUND_REAP_PGID was honoured"
+    finally:
+        _stop_group(helper)
+
+
+@pytest.mark.usefixtures("daemon")
+def test_daemon_behind_a_wrapper_that_does_not_exec_keeps_running(tmp_path: Path) -> None:
     seen = tmp_path / "env.txt"
-    wrapper = tmp_path / "daemon-env.sh"
+    wrapper = tmp_path / "daemon-noexec.sh"
     wrapper.write_text(
         "#!/bin/sh\n"
-        f'printf "%s %s\\n" "$WAYBOUND_EXIT_WITH_PARENT" "$WAYBOUND_REAP_PGID" > "{seen}"\n'
-        f'exec "{DAEMON_BIN}" "$@"\n'
+        f'printf "%s\\n" "$WAYBOUND_EXIT_WITH_PARENT" > "{seen}"\n'
+        f'"{DAEMON_BIN}" "$@"\n'  # no exec: the daemon's parent is the shell, not us
     )
     wrapper.chmod(0o755)
-    # Stands in for a pool slot's Xvfb/D-Bus stack: its own process group.
-    helper = subprocess.Popen(["/bin/sleep", "60"], process_group=0)
+    with Session(replace(MOCK, daemon_binary=wrapper)) as page:
+        time.sleep(1.0)  # several watchdog polls
+        assert page.url() == MOCK_URL
+    assert seen.read_text().split() == [str(os.getpid())]
+
+
+@pytest.mark.usefixtures("daemon")
+def test_helper_group_is_left_to_us_while_we_live_and_close_is_fast() -> None:
+    helper = _helper_group()
     try:
-        session = Session(
-            replace(MOCK, daemon_binary=wrapper),
-            extra_env={"WAYBOUND_REAP_PGID": str(helper.pid)},
-        )
-        with session:
-            pass
-        assert seen.read_text().split() == [str(os.getpid()), str(helper.pid)]
-        # The daemon stopped the helper group at the end of its graceful shutdown.
-        helper.wait(timeout=10)
+        session = Session(MOCK, _reap_pgid=helper.pid)
+        session.__enter__()
+        started = time.monotonic()
+        session.close()
+        assert time.monotonic() - started < 1.5  # no 2 s reap grace on the normal path
+        assert _group_alive(helper.pid), "daemon reaped helpers although we are alive"
     finally:
-        if helper.poll() is None:
-            helper.kill()
-            helper.wait()
+        _stop_group(helper)
+
+
+_REAP_CHILD = """
+import os, subprocess, sys, time
+from pathlib import Path
+from waybound import LaunchOptions, Session
+helper = subprocess.Popen(["/bin/sh", "-c", "sleep 60 & sleep 60"], process_group=0)
+time.sleep(0.2)
+session = Session(LaunchOptions(backend="mock", daemon_binary=Path(sys.argv[1])),
+                  _reap_pgid=helper.pid)
+session.__enter__()
+print(helper.pid, session.daemon_pid, flush=True)
+time.sleep(60)
+"""
+
+
+@pytest.mark.usefixtures("daemon")
+@pytest.mark.parametrize("sig", [signal.SIGKILL, signal.SIGTERM], ids=["sigkill", "sigterm"])
+def test_helper_group_is_stopped_when_python_alone_dies(sig: int) -> None:
+    child = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", _REAP_CHILD, str(DAEMON_BIN)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+    )
+    assert child.stdout is not None
+    helper_pgid = daemon_pid = 0
+    try:
+        helper_pgid, daemon_pid = (int(v) for v in child.stdout.readline().split())
+        os.kill(child.pid, sig)  # the Python process alone, not its group
+        child.wait(timeout=20)
+        deadline = time.monotonic() + 10
+        while _group_alive(helper_pgid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _group_alive(helper_pgid), "helper group outlived the dead Python process"
+        assert _wait_daemon_gone(daemon_pid)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        child.stdout.close()
+        if helper_pgid and _group_alive(helper_pgid):
+            os.killpg(helper_pgid, signal.SIGKILL)

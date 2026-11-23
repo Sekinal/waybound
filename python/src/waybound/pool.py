@@ -294,9 +294,9 @@ class _IsolatedDisplayStack:
         self.display = f":{display_num}" if display_num is not None else None
         self.env = env
         self._processes = processes
-        # All of the stack's processes share one process group led by Xvfb, which the slot's
-        # daemon is told to stop (`WAYBOUND_REAP_PGID`) when it shuts down, so the stack does
-        # not outlive a Python process that died without closing the pool.
+        # All of the stack's processes share one process group led by Xvfb. The slot's daemon
+        # is told about it (`WAYBOUND_REAP_PGID`) and stops it only if this Python process is
+        # gone when the daemon shuts down; normally `close()` stops the stack itself.
         self.pgid: int | None = processes[0].pid if processes else None
         self._owner_pid = os.getpid()
         with _LIVE_STACKS_LOCK:
@@ -1010,11 +1010,13 @@ class BrowserPool:
             try:
                 slot_opts = dataclasses.replace(self._launch_options, proxy=effective_proxy)
                 extra_env: dict[str, str] | None = None
+                reap_pgid: int | None = None
                 if use_wayland:
                     if use_isolated:
                         display_stack = _IsolatedDisplayStack.start_wayland_dbus()
                         if display_stack is not None:
                             extra_env = display_stack.env
+                            reap_pgid = display_stack.pgid
                     slot_opts = dataclasses.replace(
                         slot_opts,
                         display=None,
@@ -1028,11 +1030,10 @@ class BrowserPool:
                         display=display_stack.display,
                         headless_xvfb=False,
                     )
-                    extra_env = dict(display_stack.env)
-                    if display_stack.pgid is not None:
-                        extra_env["WAYBOUND_REAP_PGID"] = str(display_stack.pgid)
+                    extra_env = display_stack.env
+                    reap_pgid = display_stack.pgid
 
-                session = Session(slot_opts, extra_env=extra_env)
+                session = Session(slot_opts, extra_env=extra_env, _reap_pgid=reap_pgid)
                 page = session.__enter__()
                 return _PoolSlot(
                     page=AsyncPage(page),

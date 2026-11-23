@@ -152,6 +152,9 @@ def _connect_with_retry(
     raise TimeoutError(msg)
 
 
+_SDK_ONLY_ENV = ("WAYBOUND_EXIT_WITH_PARENT", "WAYBOUND_REAP_PGID")
+
+
 def _daemon_env(
     proxy: str | None,
     extra_env: Mapping[str, str] | None = None,
@@ -163,6 +166,11 @@ def _daemon_env(
     the environment of every process it spawns in turn.
     """
     env = os.environ.copy()
+    # Lifetime controls can make the daemon signal other processes, so they are only ever set
+    # by `Session` itself, never inherited (a stale value in the user's environment would
+    # otherwise make a plain session kill an unrelated process group).
+    for name in _SDK_ONLY_ENV:
+        env.pop(name, None)
     if extra_env is not None:
         env.update(extra_env)
     if proxy is not None:
@@ -270,8 +278,22 @@ class Session:
         options: LaunchOptions | None = None,
         *,
         extra_env: Mapping[str, str] | None = None,
+        _reap_pgid: int | None = None,
     ) -> None:
         opts = options if options is not None else LaunchOptions()
+        if extra_env is not None and (reserved := set(extra_env) & set(_SDK_ONLY_ENV)):
+            # Rejected rather than silently dropped: these make the daemon exit or signal a
+            # process group, so a caller setting them is a bug worth surfacing.
+            msg = f"extra_env must not set {sorted(reserved)}; the SDK manages them"
+            raise ValueError(msg)
+        if _reap_pgid is not None and (
+            _reap_pgid <= 1 or _reap_pgid in (os.getpgrp(), os.getpid())
+        ):
+            msg = f"refusing to reap process group {_reap_pgid}: it is not a helper group"
+            raise ValueError(msg)
+        # Private (BrowserPool only): a process group of helpers the daemon stops if this
+        # process dies without closing the session.
+        self._reap_pgid = _reap_pgid
         self._options = opts
         self._extra_env: dict[str, str] | None = dict(extra_env) if extra_env is not None else None
         self._daemon_binary = _resolve_daemon_binary(opts.daemon_binary)
@@ -361,10 +383,12 @@ class Session:
         child_env = _daemon_env(opts.proxy, self._extra_env)
         detach = sys.platform != "win32"
         if detach:
-            # Read by daemons that support it; older daemons ignore unknown variables.
-            # The pid to watch, so a parent that dies before the daemon's watchdog starts is
-            # still noticed. Older daemons ignore the variable.
+            # The pid to watch (alive or not, even through a wrapper script), so a parent that
+            # dies before the daemon's watchdog starts is still noticed. Older daemons ignore
+            # unknown variables.
             child_env["WAYBOUND_EXIT_WITH_PARENT"] = str(os.getpid())
+            if self._reap_pgid is not None:
+                child_env["WAYBOUND_REAP_PGID"] = str(self._reap_pgid)
 
         try:
             with _LIVE_SESSIONS_LOCK:
