@@ -72,6 +72,17 @@ pub enum Direction {
     ServerToClient,
 }
 
+impl Direction {
+    /// Returns the other direction of the same connection.
+    #[must_use]
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::ClientToServer => Self::ServerToClient,
+            Self::ServerToClient => Self::ClientToServer,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TrafficKeyState {
     suite: Tls13CipherSuite,

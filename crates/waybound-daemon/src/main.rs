@@ -6,6 +6,7 @@
 mod launcher;
 mod mock_driver;
 mod net_tap;
+mod peer;
 mod proxy;
 #[cfg(feature = "replay")]
 mod replay;
@@ -52,6 +53,8 @@ struct CliArgs {
     ssl_keylog_file: Option<PathBuf>,
     initial_url: Option<String>,
     proxy: Option<String>,
+    /// Whether `proxy` came from `--proxy` (world-readable argv) rather than `WAYBOUND_PROXY`.
+    proxy_from_argv: bool,
     block_hosts: Vec<String>,
     timezone: Option<String>,
     locale: Option<String>,
@@ -82,6 +85,7 @@ fn parse_args() -> Result<CliArgs, String> {
         ssl_keylog_file: None,
         initial_url: None,
         proxy: env::var("WAYBOUND_PROXY").ok(),
+        proxy_from_argv: false,
         block_hosts: Vec::new(),
         timezone: None,
         locale: None,
@@ -126,7 +130,10 @@ fn parse_args() -> Result<CliArgs, String> {
                 cli.ssl_keylog_file = Some(PathBuf::from(next_arg(&mut args, "--ssl-keylog")?));
             }
             "--url" => cli.initial_url = Some(next_arg(&mut args, "--url")?),
-            "--proxy" => cli.proxy = Some(next_arg(&mut args, "--proxy")?),
+            "--proxy" => {
+                cli.proxy = Some(next_arg(&mut args, "--proxy")?);
+                cli.proxy_from_argv = true;
+            }
             "--block-host" => cli.block_hosts.push(next_arg(&mut args, "--block-host")?),
             "--block-hosts" => {
                 let csv = next_arg(&mut args, "--block-hosts")?;
@@ -165,6 +172,7 @@ fn setup_proxy(
     let blocker = HostBlocker::new(block_hosts);
     let tap = ssl_keylog.map(|path| {
         let store = Arc::clone(responses);
+        let ws_store = Arc::clone(responses);
         PassiveTapConfig {
             keylog: KeyLogStore::new(path),
             inflight: inflight.clone(),
@@ -172,6 +180,9 @@ fn setup_proxy(
             on_response: Arc::new(move |seq, resp| {
                 store.upsert(seq, resp);
             }),
+            on_websocket: Some(Arc::new(move |frame| {
+                ws_store.push_websocket_frame(frame);
+            })),
         }
     });
 
@@ -417,6 +428,14 @@ fn main() -> ExitCode {
 
     if cli.replay {
         return run_replay_mode();
+    }
+
+    if cli.proxy_from_argv && cli.proxy.as_deref().is_some_and(|p| p.contains('@')) {
+        // Never log the value itself.
+        tracing::warn!(
+            "--proxy carries credentials on the command line, where every local user can read \
+             them; pass the proxy in the WAYBOUND_PROXY environment variable instead"
+        );
     }
 
     let tcp_addr = cli.tcp_addr.clone();

@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use md5::Md5;
 use sha2::{Digest, Sha256};
 use waybound_core::{
-    CapturedCookie, HeaderEntry, Http2Fingerprint, Http2Setting, SessionFingerprint, TlsFingerprint,
+    CapturedCookie, HeaderEntry, Http2Fingerprint, Http2Setting, Http2StreamDependency,
+    SessionFingerprint, TlsFingerprint,
 };
 
 const HANDSHAKE_CLIENT_HELLO: u8 = 1;
@@ -444,8 +445,11 @@ struct RecorderState {
     h2_settings: Vec<Http2Setting>,
     h2_window_update: Option<u32>,
     h2_pseudo_order: Vec<String>,
+    h2_headers_priority: Option<Http2StreamDependency>,
     default_headers: Vec<HeaderEntry>,
     default_headers_score: usize,
+    api_headers: Vec<HeaderEntry>,
+    api_headers_score: usize,
     cookies: Vec<CapturedCookie>,
 }
 
@@ -528,6 +532,15 @@ impl FingerprintRecorder {
         }
     }
 
+    /// Records the stream priority/dependency carried on the client's HTTP/2 `HEADERS` frame.
+    pub fn record_h2_headers_priority(&self, priority: Http2StreamDependency) {
+        if let Ok(mut st) = self.inner.lock()
+            && st.h2_headers_priority.is_none()
+        {
+            st.h2_headers_priority = Some(priority);
+        }
+    }
+
     /// Records ordered request headers (extracting both `default_headers` and any `Cookie` values).
     pub fn record_request_headers(&self, host: &str, headers: &[(String, String)]) {
         if headers.is_empty() {
@@ -560,11 +573,13 @@ impl FingerprintRecorder {
                 }
             }
 
-            // 2. Score this request to prefer top-level navigation headers (User-Agent + Client Hints + Accept).
+            // 2. Score this request to prefer top-level navigation headers (`default_headers`)
+            //    and separately record `fetch()`/`XHR` API headers (`api_headers`).
             let mut has_ua = false;
             let mut has_ch_ua = false;
             let mut has_accept_lang = false;
             let mut is_navigate = false;
+            let mut is_api = false;
             let mut filtered = Vec::new();
             for (k, v) in headers {
                 let lower = k.to_ascii_lowercase();
@@ -576,6 +591,10 @@ impl FingerprintRecorder {
                     has_accept_lang = true;
                 } else if lower == "sec-fetch-mode" && v.eq_ignore_ascii_case("navigate") {
                     is_navigate = true;
+                } else if (lower == "sec-fetch-mode" && v.eq_ignore_ascii_case("cors"))
+                    || (lower == "sec-fetch-dest" && v.eq_ignore_ascii_case("empty"))
+                {
+                    is_api = true;
                 }
                 if !is_volatile_request_header(&lower) {
                     filtered.push(HeaderEntry {
@@ -585,14 +604,18 @@ impl FingerprintRecorder {
                 }
             }
 
-            let score = usize::from(has_ua) * 10
+            let base_score = usize::from(has_ua) * 10
                 + usize::from(has_ch_ua) * 5
                 + usize::from(has_accept_lang) * 3
-                + usize::from(is_navigate) * 20
                 + filtered.len();
-            if has_ua && score > st.default_headers_score {
+            if has_ua && is_api && base_score > st.api_headers_score {
+                st.api_headers.clone_from(&filtered);
+                st.api_headers_score = base_score;
+            }
+            let nav_score = base_score + usize::from(is_navigate) * 20;
+            if has_ua && nav_score > st.default_headers_score {
                 st.default_headers = filtered;
-                st.default_headers_score = score;
+                st.default_headers_score = nav_score;
             }
         }
     }
@@ -681,6 +704,7 @@ impl FingerprintRecorder {
                 settings: st.h2_settings.clone(),
                 initial_window_update: st.h2_window_update,
                 pseudo_header_order: st.h2_pseudo_order.clone(),
+                headers_priority: st.h2_headers_priority,
                 akamai_fingerprint: akamai,
             })
         };
@@ -688,6 +712,7 @@ impl FingerprintRecorder {
             tls: st.tls.clone(),
             http2,
             default_headers: st.default_headers.clone(),
+            api_headers: st.api_headers.clone(),
             cookies: st.cookies.clone(),
         }
     }

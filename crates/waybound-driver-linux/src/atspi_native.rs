@@ -11,7 +11,10 @@ use waybound_core::{AccessibilityNode, Bounds, Result, Role, WayboundError};
 use zbus::blocking::{Connection, connection::Builder};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
-use crate::atspi::{AtspiSnapshot, MAX_NODES, map_atspi_role};
+use crate::atspi::{
+    AtspiSnapshot, AtspiStates, MAX_NODES, decode_atspi_node_states, is_checkable_atspi_role,
+    map_atspi_role,
+};
 use crate::process::BACKEND_NAME;
 
 const REGISTRY_BUS: &str = "org.a11y.atspi.Registry";
@@ -24,8 +27,6 @@ const IFACE_PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
 /// `ATSPI_COORD_TYPE_SCREEN = 0`.
 const COORD_TYPE_SCREEN: u32 = 0;
-/// `ATSPI_STATE_FOCUSED = 11` (bit 11 in the first 32-bit state word).
-const STATE_FOCUSED_BIT: u32 = 1 << 11;
 const CHROME_TOKENS: [&str; 4] = ["chrome", "chromium", "google-chrome", "brave"];
 
 type AccessibleRef = (String, OwnedObjectPath);
@@ -279,10 +280,15 @@ impl AtspiClient {
                 width: 0.0,
                 height: 0.0,
             });
-            let focused = if matches!(role, Role::StaticText | Role::Unknown | Role::Document) {
-                false
+            // One `GetState` round trip per node yields focused, checked, disabled, and
+            // expanded together; text, unknown, and document nodes skip it entirely.
+            let states = if matches!(role, Role::StaticText | Role::Unknown | Role::Document) {
+                AtspiStates::default()
             } else {
-                self.is_focused(&bus, path.as_str())
+                self.get_state(&bus, path.as_str())
+                    .map_or_else(AtspiStates::default, |words| {
+                        decode_atspi_node_states(&words, role, is_checkable_atspi_role(&role_raw))
+                    })
             };
 
             if bounds.width >= 0.0 && bounds.height >= 0.0 {
@@ -292,7 +298,10 @@ impl AtspiClient {
                     name,
                     value,
                     bounds,
-                    focused,
+                    focused: states.focused,
+                    checked: states.checked,
+                    disabled: states.disabled,
+                    expanded: states.expanded,
                 });
             }
 
@@ -378,19 +387,12 @@ impl AtspiClient {
         })
     }
 
-    fn is_focused(&self, bus: &str, path: &str) -> bool {
-        let Ok(msg) =
-            self.conn
-                .call_method(Some(bus), path, Some(IFACE_ACCESSIBLE), "GetState", &())
-        else {
-            return false;
-        };
-        let Ok(states) = msg.body().deserialize::<Vec<u32>>() else {
-            return false;
-        };
-        states
-            .first()
-            .is_some_and(|&w| (w & STATE_FOCUSED_BIT) != 0)
+    fn get_state(&self, bus: &str, path: &str) -> Option<Vec<u32>> {
+        let msg = self
+            .conn
+            .call_method(Some(bus), path, Some(IFACE_ACCESSIBLE), "GetState", &())
+            .ok()?;
+        msg.body().deserialize::<Vec<u32>>().ok()
     }
 
     fn get_document_url(&self, bus: &str, path: &str) -> Option<String> {

@@ -4,15 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 [features]
 default = []
-replay = ["dep:tokio", "dep:waybound-http"]
+replay = ["dep:serde", "dep:tokio", "dep:waybound-http"]
 
 [dependencies]
-brotli.workspace = true
-flate2.workspace = true
-serde.workspace = true
+serde = { workspace = true, optional = true }
 serde_json.workspace = true
 signal-hook.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
@@ -25,6 +24,10 @@ waybound-driver-macos.workspace = true
 waybound-driver-windows.workspace = true
 waybound-http = { workspace = true, optional = true }
 waybound-net.workspace = true
+
+[dev-dependencies]
+brotli.workspace = true
+flate2.workspace = true
 
 [lints]
 workspace = true

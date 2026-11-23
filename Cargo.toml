@@ -16,12 +16,15 @@ version = "0.4.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
+# None of these crates are published to crates.io; the daemon ships as release binaries.
+publish = false
 
 [workspace.dependencies]
 brotli = "8.0"
 flate2 = "1.1"
+ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 thiserror = "2.0"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 signal-hook = { version = "0.3", default-features = false }
 tracing = "0.1"

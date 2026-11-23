@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from waybound.types import (
         AccessibilityNode,
         CapturedResponse,
+        CapturedWebSocketFrame,
         KeyModifier,
         Role,
         SessionFingerprint,
@@ -92,6 +93,30 @@ class AsyncLocator:
     async def fill(self, text: str) -> None:
         """Fill the resolved input element using native keyboard events."""
         await asyncio.to_thread(self._inner.fill, text)
+
+    async def drag_to(self, target: AsyncLocator, *, timeout_ms: int = 5_000) -> None:
+        """Drag this element onto `target` with a native press, pointer path, and release."""
+        await asyncio.to_thread(self._inner.drag_to, target._inner, timeout_ms=timeout_ms)
+
+    async def check(self) -> None:
+        """Ensure the checkbox/radio/switch is checked, clicking only if it is not."""
+        await asyncio.to_thread(self._inner.check)
+
+    async def uncheck(self) -> None:
+        """Ensure the checkbox/switch is unchecked, clicking only if it is checked.
+
+        A mixed (indeterminate) checkbox counts as unchecked and is left as is; radio buttons
+        cannot be unchecked.
+        """
+        await asyncio.to_thread(self._inner.uncheck)
+
+    async def is_checked(self, *, timeout_ms: int = 5_000) -> bool:
+        """Return whether the element is checked (a mixed checkbox is not checked)."""
+        return await asyncio.to_thread(self._inner.is_checked, timeout_ms=timeout_ms)
+
+    async def is_enabled(self, *, timeout_ms: int = 5_000) -> bool:
+        """Return `True` unless the element is disabled."""
+        return await asyncio.to_thread(self._inner.is_enabled, timeout_ms=timeout_ms)
 
 
 class AsyncPage:
@@ -176,6 +201,14 @@ class AsyncPage:
             self._inner.wait_for_response, url_contains, timeout_ms=timeout_ms
         )
 
+    async def captured_websocket_frames(
+        self, *, url_contains: str | None = None, limit: int | None = None
+    ) -> list[CapturedWebSocketFrame]:
+        """Return passively decrypted WebSocket messages (oldest first, newest `limit`)."""
+        return await asyncio.to_thread(
+            self._inner.captured_websocket_frames, url_contains=url_contains, limit=limit
+        )
+
     async def wait_for_network_idle(self, *, idle_ms: int = 500, timeout_ms: int = 15_000) -> None:
         """Wait until zero HTTP/1.1 or HTTP/2 requests remain inflight for `idle_ms`."""
         await asyncio.to_thread(
@@ -215,7 +248,10 @@ class AsyncPage:
         )
 
     async def screenshot(self, path: Path | str | None = None) -> bytes:
-        """Capture a native OS PNG screenshot of the browser window and return PNG bytes."""
+        """Capture a native OS PNG screenshot and return PNG bytes.
+
+        macOS captures the browser window; the other backends capture the whole screen.
+        """
         return await asyncio.to_thread(self._inner.screenshot, path)
 
     def get_by_role(

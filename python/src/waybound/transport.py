@@ -14,14 +14,19 @@ from waybound.types import (
     Bounds,
     CapturedCookie,
     CapturedResponse,
+    CapturedWebSocketFrame,
     HeaderEntry,
     Http2Fingerprint,
     Http2Setting,
+    Http2StreamDependency,
+    HttpHeader,
     KeyModifier,
     LocatorQuery,
     Role,
     SessionFingerprint,
     TlsFingerprint,
+    WebSocketDirection,
+    WebSocketOpcode,
 )
 
 if TYPE_CHECKING:
@@ -48,6 +53,11 @@ _NAMED_KEYS = frozenset(
 )
 # The daemon paces typing at up to ~180 ms per key; allow headroom on top of the base timeout.
 _FILL_SECONDS_PER_CHAR = 0.25
+# A drag waits up to `timeout_ms` for each of its two elements before moving.
+_DRAG_WAITED_ELEMENTS = 2
+# `set_checked` may wait 5 s for the element (and for it to become enabled) plus 2 s for the
+# click to settle, on top of the click itself.
+_SET_CHECKED_WAIT_S = 7.0
 
 
 class WayboundDaemonError(RuntimeError):
@@ -198,6 +208,27 @@ class UnixSocketTransport:
             raise WayboundDaemonError("protocol_error", msg)
         return [_parse_http_response(item) for item in raw_items if isinstance(item, dict)]
 
+    def captured_websocket_frames(
+        self, *, url_contains: str | None = None, limit: int | None = None
+    ) -> list[CapturedWebSocketFrame]:
+        """Return passively captured WebSocket messages (oldest first).
+
+        Optionally filtered by URL substring and limited to the newest `limit` messages.
+        """
+        payload: dict[str, object] = {
+            "method": "captured_websocket_frames",
+            "url_contains": url_contains,
+        }
+        if limit is not None:
+            payload["limit"] = max(0, limit)
+        response = self._request(payload)
+        raw_items = response.get("frames")
+        if not isinstance(raw_items, list):
+            msg = f"unexpected captured_websocket_frames payload: {response!r}"
+            raise WayboundDaemonError("protocol_error", msg)
+        frames = (_parse_websocket_frame(item) for item in raw_items if isinstance(item, dict))
+        return [frame for frame in frames if frame is not None]
+
     def wait_for_response(self, url_contains: str, *, timeout_ms: int = 10_000) -> CapturedResponse:
         """Wait until a passively captured HTTP response matches `url_contains`.
 
@@ -239,7 +270,7 @@ class UnixSocketTransport:
 
     def dblclick(self, query: LocatorQuery) -> None:
         """Locate the target element and dispatch a native double-click."""
-        self._expect_ok({"method": "dblclick", "query": _encode_query(query)}, "dblclick")
+        self._expect_ok({"method": "dbl_click", "query": _encode_query(query)}, "dblclick")
 
     def select_option(
         self,
@@ -280,6 +311,24 @@ class UnixSocketTransport:
             timeout_override_s=self._base_timeout_s + _FILL_SECONDS_PER_CHAR * len(text),
         )
 
+    def set_checked(self, query: LocatorQuery, *, checked: bool) -> AccessibilityNode:
+        """Idempotently drive a checkbox/radio/switch to `checked`; return the re-read node.
+
+        The daemon auto-waits for the element (and for it to become enabled when a click is
+        needed), refuses elements that stay disabled (`element_disabled`), elements without a
+        checked state and unchecking a radio button (`invalid_element_state`), clicks only
+        when the state differs, and verifies the new state.
+        """
+        response = self._request(
+            {"method": "set_checked", "query": _encode_query(query), "checked": checked},
+            timeout_override_s=self._base_timeout_s + _SET_CHECKED_WAIT_S,
+        )
+        raw_node = response.get("node")
+        if not isinstance(raw_node, dict):
+            msg = f"unexpected set_checked response: {response!r}"
+            raise WayboundDaemonError("protocol_error", msg)
+        return _parse_node(raw_node)
+
     def navigate(self, url: str) -> None:
         """Navigate the active browser tab to `url`."""
         self._expect_ok({"method": "navigate", "url": url}, "navigate")
@@ -313,7 +362,7 @@ class UnixSocketTransport:
         self._expect_ok({"method": "prev_tab"}, "prev_tab")
 
     def screenshot(self, path: str) -> None:
-        """Capture a native OS PNG screenshot of the browser window to `path`."""
+        """Capture a native OS PNG screenshot to `path` (browser window on macOS, else screen)."""
         self._expect_ok({"method": "screenshot", "path": path}, "screenshot")
 
     def export_fingerprint(self) -> SessionFingerprint:
@@ -342,6 +391,23 @@ class UnixSocketTransport:
                 "modifiers": [m.value for m in modifiers],
             },
             "press",
+        )
+
+    def drag_to(
+        self, source: LocatorQuery, target: LocatorQuery, *, timeout_ms: int = 5_000
+    ) -> None:
+        """Press on `source`, drag along a native pointer path to `target`, and release."""
+        clamped_ms = max(0, timeout_ms)
+        self._expect_ok(
+            {
+                "method": "drag_to",
+                "source": _encode_query(source),
+                "target": _encode_query(target),
+                "timeout_ms": clamped_ms,
+            },
+            "drag_to",
+            # Both element waits run back to back before the drag itself starts.
+            timeout_override_s=self._base_timeout_s + _DRAG_WAITED_ELEMENTS * clamped_ms / 1000.0,
         )
 
     def _expect_ok(
@@ -434,6 +500,9 @@ def _parse_node(item: dict[object, object]) -> AccessibilityNode:
     val = item.get("value")
     value = val if isinstance(val, str) else None
     focused = bool(item.get("focused", False))
+    checked = _parse_optional_bool(item.get("checked"))
+    disabled = item.get("disabled") is True
+    expanded = _parse_optional_bool(item.get("expanded"))
 
     raw_bounds = item.get("bounds")
     if isinstance(raw_bounds, dict):
@@ -453,18 +522,73 @@ def _parse_node(item: dict[object, object]) -> AccessibilityNode:
         value=value,
         bounds=bounds,
         focused=focused,
+        checked=checked,
+        disabled=disabled,
+        expanded=expanded,
     )
+
+
+def _opt_str(raw: object) -> str | None:
+    return raw if isinstance(raw, str) else None
+
+
+def _opt_int(raw: object) -> int | None:
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+
+
+def _parse_headers(raw: object) -> tuple[HttpHeader, ...]:
+    if not isinstance(raw, list):
+        return ()
+    headers: list[HttpHeader] = []
+    for item in raw:
+        if isinstance(item, dict):
+            name = item.get("name")
+            value = item.get("value")
+            if isinstance(name, str) and isinstance(value, str):
+                headers.append(HttpHeader(name=name, value=value))
+    return tuple(headers)
+
+
+def _parse_optional_bool(raw: object) -> bool | None:
+    return raw if isinstance(raw, bool) else None
 
 
 def _parse_http_response(item: dict[object, object]) -> CapturedResponse:
     url = str(item.get("url", ""))
-    raw_status = item.get("status", 0)
-    status = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else 0
-    ct = item.get("content_type")
-    content_type = ct if isinstance(ct, str) else None
-    body_val = item.get("body")
-    body = body_val if isinstance(body_val, str) else None
-    return CapturedResponse(url=url, status=status, content_type=content_type, body=body)
+    status = _opt_int(item.get("status", 0)) or 0
+    return CapturedResponse(
+        url=url,
+        status=status,
+        content_type=_opt_str(item.get("content_type")),
+        body=_opt_str(item.get("body")),
+        headers=_parse_headers(item.get("headers")),
+        request_method=_opt_str(item.get("request_method")),
+        request_headers=_parse_headers(item.get("request_headers")),
+        request_body=_opt_str(item.get("request_body")),
+    )
+
+
+def _parse_websocket_frame(item: dict[object, object]) -> CapturedWebSocketFrame | None:
+    """Parse one WebSocket message, skipping items with an unknown direction or opcode."""
+    raw_direction = item.get("direction")
+    raw_opcode = item.get("opcode")
+    if not isinstance(raw_direction, str) or not isinstance(raw_opcode, str):
+        return None
+    try:
+        direction = WebSocketDirection(raw_direction)
+        opcode = WebSocketOpcode(raw_opcode)
+    except ValueError:
+        return None
+    return CapturedWebSocketFrame(
+        url=str(item.get("url", "")),
+        direction=direction,
+        opcode=opcode,
+        payload=_opt_str(item.get("payload")),
+        payload_len=_opt_int(item.get("payload_len")) or 0,
+        compressed=item.get("compressed") is True,
+        truncated=item.get("truncated") is True,
+        close_code=_opt_int(item.get("close_code")),
+    )
 
 
 def _parse_int(raw: object, default: int = 0) -> int:
@@ -483,6 +607,21 @@ def _parse_str_tuple(raw: object) -> tuple[str, ...]:
     if not isinstance(raw, list):
         return ()
     return tuple(x for x in raw if isinstance(x, str))
+
+
+def _parse_header_entries(raw: object) -> tuple[HeaderEntry, ...]:
+    if not isinstance(raw, list):
+        return ()
+    out: list[HeaderEntry] = []
+    for entry in raw:
+        if isinstance(entry, dict):
+            out.append(
+                HeaderEntry(
+                    name=str(entry.get("name", "")),
+                    value=str(entry.get("value", "")),
+                )
+            )
+    return tuple(out)
 
 
 def parse_session_fingerprint(item: dict[object, object]) -> SessionFingerprint:
@@ -533,24 +672,24 @@ def parse_session_fingerprint(item: dict[object, object]) -> SessionFingerprint:
                     )
         raw_wu = raw_h2.get("initial_window_update")
         wu = raw_wu if isinstance(raw_wu, int) and not isinstance(raw_wu, bool) else None
+        raw_prio = raw_h2.get("headers_priority")
+        headers_priority: Http2StreamDependency | None = None
+        if isinstance(raw_prio, dict):
+            headers_priority = Http2StreamDependency(
+                dependency_id=_parse_int(raw_prio.get("dependency_id")),
+                weight=_parse_int(raw_prio.get("weight")),
+                exclusive=bool(raw_prio.get("exclusive", False)),
+            )
         http2 = Http2Fingerprint(
             settings=tuple(settings),
             initial_window_update=wu,
             pseudo_header_order=_parse_str_tuple(raw_h2.get("pseudo_header_order")),
+            headers_priority=headers_priority,
             akamai_fingerprint=str(raw_h2.get("akamai_fingerprint", "")),
         )
 
-    headers: list[HeaderEntry] = []
-    raw_headers = item.get("default_headers")
-    if isinstance(raw_headers, list):
-        for entry in raw_headers:
-            if isinstance(entry, dict):
-                headers.append(
-                    HeaderEntry(
-                        name=str(entry.get("name", "")),
-                        value=str(entry.get("value", "")),
-                    )
-                )
+    default_headers = _parse_header_entries(item.get("default_headers"))
+    api_headers = _parse_header_entries(item.get("api_headers"))
 
     cookies: list[CapturedCookie] = []
     raw_cookies = item.get("cookies")
@@ -571,7 +710,8 @@ def parse_session_fingerprint(item: dict[object, object]) -> SessionFingerprint:
     return SessionFingerprint(
         tls=tls,
         http2=http2,
-        default_headers=tuple(headers),
+        default_headers=default_headers,
+        api_headers=api_headers,
         cookies=tuple(cookies),
     )
 

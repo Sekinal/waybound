@@ -48,7 +48,7 @@ def test_mcp_server_initialize_list_and_tool_calls() -> None:
         assert isinstance(result, dict)
         tools = result["tools"]
         assert isinstance(tools, list)
-        assert len(tools) == 8
+        assert len(tools) == 9
 
         url_resp = handle_rpc_message(
             provider,
@@ -81,7 +81,12 @@ def test_mcp_server_initialize_list_and_tool_calls() -> None:
         snap_content = snap_res["content"]
         assert isinstance(snap_content, list)
         nodes = json.loads(snap_content[0]["text"])
-        assert len(nodes) == 2
+        assert len(nodes) == 5
+        by_id = {node["id"]: node for node in nodes}
+        assert by_id["chk-insurance"]["checked"] is True
+        assert by_id["chk-insurance"]["disabled"] is True
+        assert by_id["combo-cabin"]["expanded"] is False
+        assert by_id["btn-search"]["checked"] is None
 
         shot_resp = handle_rpc_message(
             provider,

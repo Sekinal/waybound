@@ -1,4 +1,7 @@
 //! Live incremental parser for NSS `SSLKEYLOGFILE` files.
+//!
+//! Understands the TLS 1.3 `CLIENT_TRAFFIC_SECRET_0` / `SERVER_TRAFFIC_SECRET_0` labels and
+//! the TLS 1.2 `CLIENT_RANDOM` label (which carries the 48-byte master secret).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -6,19 +9,24 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// TLS 1.3 traffic secrets associated with a single `client_random`.
+/// TLS secrets associated with a single `client_random`.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct TrafficSecrets {
     /// `CLIENT_TRAFFIC_SECRET_0` (client -> server application data).
     pub client_traffic_secret_0: Option<Vec<u8>>,
     /// `SERVER_TRAFFIC_SECRET_0` (server -> client application data).
     pub server_traffic_secret_0: Option<Vec<u8>>,
+    /// `CLIENT_RANDOM` (TLS 1.2 master secret).
+    pub master_secret: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
 struct KeyLogInner {
     path: PathBuf,
     offset: u64,
+    /// Bumped whenever new secrets become visible, so callers can skip repeated misses.
+    generation: u64,
     secrets: HashMap<[u8; 32], TrafficSecrets>,
 }
 
@@ -36,6 +44,7 @@ impl KeyLogStore {
             inner: Arc::new(Mutex::new(KeyLogInner {
                 path: path.as_ref().to_path_buf(),
                 offset: 0,
+                generation: 0,
                 secrets: HashMap::new(),
             })),
         }
@@ -49,6 +58,27 @@ impl KeyLogStore {
         guard.secrets.get(client_random).cloned()
     }
 
+    /// Like [`Self::lookup`], but returns `None` without searching when no new secrets have
+    /// been read since the miss recorded in `last_miss`, and records the generation of a new
+    /// miss there. Lets per-connection decoders poll cheaply while a keylog line is missing.
+    #[must_use]
+    pub fn lookup_if_changed(
+        &self,
+        client_random: &[u8; 32],
+        last_miss: &mut Option<u64>,
+    ) -> Option<TrafficSecrets> {
+        let mut guard = self.inner.lock().ok()?;
+        let _ = refresh_locked(&mut guard);
+        if *last_miss == Some(guard.generation) {
+            return None;
+        }
+        let found = guard.secrets.get(client_random).cloned();
+        if found.is_none() {
+            *last_miss = Some(guard.generation);
+        }
+        found
+    }
+
     /// Inserts a secret directly (useful in unit tests).
     pub fn insert_for_test(
         &self,
@@ -57,18 +87,39 @@ impl KeyLogStore {
         server_secret: Vec<u8>,
     ) {
         if let Ok(mut guard) = self.inner.lock() {
-            let _ = guard.secrets.insert(
-                client_random,
-                TrafficSecrets {
-                    client_traffic_secret_0: Some(client_secret),
-                    server_traffic_secret_0: Some(server_secret),
-                },
-            );
+            let entry = guard.secrets.entry(client_random).or_default();
+            entry.client_traffic_secret_0 = Some(client_secret);
+            entry.server_traffic_secret_0 = Some(server_secret);
+            guard.generation = guard.generation.wrapping_add(1);
+        }
+    }
+
+    /// Inserts a TLS 1.2 master secret directly (unit tests only).
+    #[cfg(test)]
+    pub(crate) fn insert_master_secret_for_test(
+        &self,
+        client_random: [u8; 32],
+        master_secret: Vec<u8>,
+    ) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard
+                .secrets
+                .entry(client_random)
+                .or_default()
+                .master_secret = Some(master_secret);
+            guard.generation = guard.generation.wrapping_add(1);
         }
     }
 }
 
 fn refresh_locked(inner: &mut KeyLogInner) -> std::io::Result<()> {
+    // Cheap `stat` first: most lookups happen when nothing was appended.
+    let Ok(meta) = std::fs::metadata(&inner.path) else {
+        return Ok(());
+    };
+    if meta.len() == inner.offset {
+        return Ok(());
+    }
     let Ok(mut file) = File::open(&inner.path) else {
         return Ok(());
     };
@@ -95,6 +146,7 @@ fn refresh_locked(inner: &mut KeyLogInner) -> std::io::Result<()> {
         }
         inner.offset = inner.offset.saturating_add(n as u64);
         parse_keylog_line(&line, &mut inner.secrets);
+        inner.generation = inner.generation.wrapping_add(1);
     }
     Ok(())
 }
@@ -132,6 +184,7 @@ pub fn parse_keylog_line<S: std::hash::BuildHasher>(
     match label {
         "CLIENT_TRAFFIC_SECRET_0" => entry.client_traffic_secret_0 = Some(secret_bytes),
         "SERVER_TRAFFIC_SECRET_0" => entry.server_traffic_secret_0 = Some(secret_bytes),
+        "CLIENT_RANDOM" => entry.master_secret = Some(secret_bytes),
         _ => {}
     }
 }
@@ -185,6 +238,68 @@ mod tests {
         if let Some(sec) = found {
             assert_eq!(sec.client_traffic_secret_0, Some(vec![0xAA; 32]));
             assert_eq!(sec.server_traffic_secret_0, Some(vec![0xBB; 48]));
+            assert_eq!(sec.master_secret, None);
         }
+    }
+
+    #[test]
+    fn parses_tls12_client_random_lines() {
+        let mut map = HashMap::new();
+        let random_hex = "0f".repeat(32);
+        let ms_hex = "Cd".repeat(48);
+        parse_keylog_line(&format!("CLIENT_RANDOM {random_hex} {ms_hex}\n"), &mut map);
+        // Malformed lines (short random, odd hex) are ignored.
+        parse_keylog_line(&format!("CLIENT_RANDOM 0f0f {ms_hex}\n"), &mut map);
+        parse_keylog_line(&format!("CLIENT_RANDOM {random_hex} abc\n"), &mut map);
+
+        assert_eq!(map.len(), 1);
+        let found = map.get(&[0x0Fu8; 32]);
+        assert!(found.is_some());
+        if let Some(sec) = found {
+            assert_eq!(sec.master_secret, Some(vec![0xCD; 48]));
+            assert_eq!(sec.client_traffic_secret_0, None);
+        }
+    }
+
+    #[test]
+    fn lookup_if_changed_skips_until_new_lines_arrive() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "waybound-keylog-test-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let other = format!("CLIENT_RANDOM {} {}\n", "02".repeat(32), "aa".repeat(48));
+        let wanted = format!("CLIENT_RANDOM {} {}\n", "03".repeat(32), "bb".repeat(48));
+        let write = |text: &str| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| f.write_all(text.as_bytes()))
+        };
+        assert!(write(&other).is_ok());
+
+        let store = KeyLogStore::new(&path);
+        let mut last_miss = None;
+        assert!(
+            store
+                .lookup_if_changed(&[0x03; 32], &mut last_miss)
+                .is_none()
+        );
+        let first_miss = last_miss;
+        assert_ne!(first_miss, None);
+        assert!(
+            store
+                .lookup_if_changed(&[0x03; 32], &mut last_miss)
+                .is_none()
+        );
+        assert_eq!(last_miss, first_miss);
+
+        assert!(write(&wanted).is_ok());
+        let found = store.lookup_if_changed(&[0x03; 32], &mut last_miss);
+        assert_eq!(found.and_then(|s| s.master_secret), Some(vec![0xBB; 48]));
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -11,12 +11,14 @@ pub mod input;
 pub mod locator;
 pub mod motion;
 pub mod network;
+pub mod process;
 pub mod protocol;
 
 pub use driver::{BackendKind, Driver, SessionConfig};
 pub use error::{Result, WayboundError};
 pub use fingerprint::{
-    CapturedCookie, HeaderEntry, Http2Fingerprint, Http2Setting, SessionFingerprint, TlsFingerprint,
+    CapturedCookie, HeaderEntry, Http2Fingerprint, Http2Setting, Http2StreamDependency,
+    SessionFingerprint, TlsFingerprint,
 };
 pub use input::{InputEvent, KeyCode, KeyModifier, MouseButton, Point};
 pub use locator::{AccessibilityNode, Bounds, LocatorQuery, Role};
@@ -25,5 +27,7 @@ pub use motion::{
     key_hold_ms, mouse_hold_ms, pick_click_point, plan_human_pointer_path, plan_pointer_path,
     plan_scroll_burst,
 };
-pub use network::CapturedResponse;
+pub use network::{
+    CapturedResponse, CapturedWebSocketFrame, HttpHeader, WebSocketDirection, WebSocketOpcode,
+};
 pub use protocol::{Request, Response};

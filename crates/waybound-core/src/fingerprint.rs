@@ -65,6 +65,17 @@ pub struct Http2Setting {
     pub value: u32,
 }
 
+/// HTTP/2 `HEADERS` frame stream dependency / priority fields (RFC 9113 §6.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Http2StreamDependency {
+    /// Stream identifier this stream depends on (typically `0` for Chrome).
+    pub dependency_id: u32,
+    /// Wire-encoded weight (`0..=255`; RFC 9113 effective weight is `weight + 1`, so `255` = `256`).
+    pub weight: u8,
+    /// Exclusive dependency flag (`E` bit).
+    pub exclusive: bool,
+}
+
 /// Exact HTTP/2 connection & header framing fingerprint observed from the live browser.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Http2Fingerprint {
@@ -75,6 +86,9 @@ pub struct Http2Fingerprint {
     /// Pseudo-header wire order from the client's first `HEADERS` frame
     /// (e.g. `[":method", ":authority", ":scheme", ":path"]`).
     pub pseudo_header_order: Vec<String>,
+    /// Stream priority/dependency carried on the client's `HEADERS` frame (`PRIORITY` flag `0x20`), if present.
+    #[serde(default)]
+    pub headers_priority: Option<Http2StreamDependency>,
     /// Akamai HTTP/2 fingerprint string (`settings|window_update|priorities|pseudo_initials`).
     pub akamai_fingerprint: String,
 }
@@ -114,8 +128,11 @@ pub struct SessionFingerprint {
     pub tls: Option<TlsFingerprint>,
     /// Captured HTTP/2 connection fingerprint, if any HTTP/2 connection was observed.
     pub http2: Option<Http2Fingerprint>,
-    /// Ordered default request headers observed from the browser (User-Agent, Client Hints, Accept, etc.).
+    /// Ordered default navigation request headers observed from the browser (User-Agent, Client Hints, Accept, etc.).
     pub default_headers: Vec<HeaderEntry>,
+    /// Ordered `fetch()` / XHR API request headers (`sec-fetch-mode: cors`, `sec-fetch-dest: empty`, etc.), if observed.
+    #[serde(default)]
+    pub api_headers: Vec<HeaderEntry>,
     /// Live cookies observed across the session (from both `Set-Cookie` and `Cookie` headers).
     pub cookies: Vec<CapturedCookie>,
 }

@@ -23,7 +23,7 @@ def test_ergonomic_launch_full_workflow() -> None:
 
     with launch(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
         nodes = page.snapshot_tree()
-        assert len(nodes) == 2
+        assert len(nodes) == 5
         assert nodes[0].role is Role.TEXTBOX
         assert nodes[0].name == "Origin"
         assert page.url() == "https://mock.waybound.local/"
@@ -38,9 +38,15 @@ def test_ergonomic_launch_full_workflow() -> None:
         page.goto("https://example.com")
         page.get_by_role(Role.TEXTBOX, name="Origin").fill("NRT")
         page.get_by_role(Role.BUTTON, name="Search").click()
+        page.get_by_role(Role.BUTTON, name="Search").dblclick()
         page.scroll(delta_y=-200.0)
         page.press("enter")
         page.press("l", modifiers=(KeyModifier.META,))
+
+        # The mock backend has no network tap: both capture lists are empty but well-formed.
+        assert page.captured_responses() == []
+        assert page.captured_websocket_frames(url_contains="wss://") == []
+        assert page.captured_websocket_frames(limit=5) == []
 
         png_bytes = page.screenshot()
         assert png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
@@ -63,6 +69,83 @@ async def test_async_launch_workflow() -> None:
         assert await page.get_by_role(Role.BUTTON).nth(0).text_content() == "Search Flights"
         await page.get_by_role(Role.TEXTBOX, name="Origin").fill("HND")
         await page.get_by_role(Role.BUTTON, name="Search").click()
+
+
+def test_drag_to_against_mock_daemon() -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    with launch(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
+        origin = page.get_by_role(Role.TEXTBOX, name="Origin")
+        search = page.get_by_role(Role.BUTTON, name="Search")
+        origin.drag_to(search)
+        search.drag_to(origin, timeout_ms=200)
+
+        with pytest.raises(WayboundDaemonError) as missing:
+            origin.drag_to(page.get_by_role(Role.BUTTON, name="Nonexistent"), timeout_ms=100)
+        assert missing.value.code == "element_not_found"
+
+        # The connection stays usable after a failed drag.
+        assert page.url() == "https://mock.waybound.local/"
+
+
+async def test_async_drag_to_against_mock_daemon() -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    async with launch_async(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
+        origin = page.get_by_role(Role.TEXTBOX, name="Origin")
+        await origin.drag_to(page.get_by_role(Role.BUTTON, name="Search"), timeout_ms=200)
+
+
+def test_check_uncheck_round_trip_against_mock() -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    with launch(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
+        nonstop = page.get_by_role(Role.CHECKBOX, name="Nonstop")
+        assert nonstop.is_checked() is False
+        assert nonstop.is_enabled() is True
+
+        nonstop.check()
+        assert nonstop.is_checked() is True
+        nonstop.check()  # idempotent: already checked, no click
+        assert nonstop.is_checked() is True
+
+        nonstop.uncheck()
+        assert nonstop.is_checked() is False
+        nonstop.uncheck()
+        assert nonstop.is_checked() is False
+
+        insurance = page.get_by_role(Role.CHECKBOX, name="Travel insurance")
+        assert insurance.is_enabled() is False
+        assert insurance.is_checked() is True
+        insurance.check()  # already in the requested state: allowed even though disabled
+        # Refusing `uncheck()` waits out the 5 s enable auto-wait; the daemon unit tests cover
+        # it with a short injected wait instead.
+
+        with pytest.raises(WayboundDaemonError) as not_checkable:
+            page.get_by_role(Role.BUTTON, name="Search").check()
+        assert not_checkable.value.code == "invalid_element_state"
+        with pytest.raises(WayboundDaemonError):
+            page.get_by_role(Role.BUTTON, name="Search").is_checked()
+
+        cabin = page.get_by_role(Role.COMBOBOX, name="Cabin").wait_for(timeout_ms=1_000)
+        assert cabin.expanded is False
+        assert cabin.checked is None
+
+
+async def test_async_check_uncheck_against_mock() -> None:
+    if not DAEMON_BIN.exists():
+        pytest.skip("waybound-daemon binary not built yet (run cargo build)")
+
+    async with launch_async(LaunchOptions(backend="mock", daemon_binary=DAEMON_BIN)) as page:
+        nonstop = page.get_by_role(Role.CHECKBOX, name="Nonstop")
+        await nonstop.check()
+        assert await nonstop.is_checked() is True
+        await nonstop.uncheck()
+        assert await nonstop.is_checked() is False
+        assert await nonstop.is_enabled() is True
 
 
 def _wait_for_socket(path: Path, proc: subprocess.Popen[bytes]) -> None:

@@ -20,7 +20,9 @@ use waybound_core::{
 };
 use wreq::cookie::Jar;
 use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
-use wreq::http2::{Http2Options, PseudoId, PseudoOrder, SettingId, SettingsOrder};
+use wreq::http2::{
+    Http2Options, PseudoId, PseudoOrder, SettingId, SettingsOrder, StreamDependency, StreamId,
+};
 use wreq::tls::compress::{CertificateCompressionAlgorithm, CertificateCompressor, Codec};
 use wreq::tls::{AlpnProtocol, AlpsProtocol, TlsOptions, TlsVersion};
 use wreq::{Client, Emulation, Group, Method, Proxy, Uri};
@@ -397,6 +399,14 @@ pub fn build_http2_options(fp: &Http2Fingerprint) -> Http2Options {
         builder = builder.headers_pseudo_order(pseudo_builder.build());
     }
 
+    if let Some(dep) = fp.headers_priority {
+        builder = builder.headers_stream_dependency(StreamDependency::new(
+            StreamId::from(dep.dependency_id),
+            dep.weight,
+            dep.exclusive,
+        ));
+    }
+
     builder.build()
 }
 
@@ -680,6 +690,11 @@ mod tests {
                     ":scheme".to_owned(),
                     ":path".to_owned(),
                 ],
+                headers_priority: Some(waybound_core::Http2StreamDependency {
+                    dependency_id: 0,
+                    weight: 255,
+                    exclusive: true,
+                }),
                 akamai_fingerprint: "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p".to_owned(),
             }),
             default_headers: vec![
@@ -692,6 +707,7 @@ mod tests {
                     value: "en-US,en;q=0.9".to_owned(),
                 },
             ],
+            api_headers: Vec::new(),
             cookies: vec![CapturedCookie {
                 name: "sid".to_owned(),
                 value: "test123".to_owned(),

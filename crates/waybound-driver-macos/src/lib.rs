@@ -114,19 +114,30 @@ impl Driver for MacOsDriver {
         #[cfg(target_os = "macos")]
         {
             // Clicks and keystrokes go to the frontmost application, so make sure that is
-            // the target browser before sending either.
+            // the target browser before sending either. A drag's press counts too, but never
+            // its release: a focus failure must not stop a held button from being let go.
             if matches!(
                 event,
-                InputEvent::KeyPress { .. } | InputEvent::MouseClick { .. }
+                InputEvent::KeyPress { .. }
+                    | InputEvent::MouseClick { .. }
+                    | InputEvent::MouseDown { .. }
             ) {
                 ax::ensure_frontmost(self.pid)?;
             }
-            let mut guard = self.cursor.lock().map_err(|_| {
-                waybound_core::WayboundError::BackendUnavailable {
-                    backend: "macos_native".to_owned(),
-                    reason: "cursor state mutex poisoned".to_owned(),
+            let mut guard = match self.cursor.lock() {
+                Ok(guard) => guard,
+                // A release must still go out after an earlier panic poisoned the cursor
+                // state; the tracked position is only a fallback for the real one anyway.
+                Err(poisoned) if matches!(event, InputEvent::MouseUp { .. }) => {
+                    poisoned.into_inner()
                 }
-            })?;
+                Err(_) => {
+                    return Err(waybound_core::WayboundError::BackendUnavailable {
+                        backend: "macos_native".to_owned(),
+                        reason: "cursor state mutex poisoned".to_owned(),
+                    });
+                }
+            };
             input::dispatch_cg_event(event, &mut guard)
         }
         #[cfg(not(target_os = "macos"))]
