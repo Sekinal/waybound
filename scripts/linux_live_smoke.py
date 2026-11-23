@@ -40,7 +40,10 @@ PAGE2_HTML = """<!doctype html>
 
 
 class _FixtureHandler(BaseHTTPRequestHandler):
+    hits: list[str] = []
+
     def do_GET(self) -> None:
+        self.hits.append(self.path)
         if self.path == "/api/data":
             body = json.dumps({"status": "Loaded!", "ok": True}).encode("utf-8")
             self.send_response(200)
@@ -123,9 +126,16 @@ def main() -> int:
 
                 link = page.get_by_role(waybound.Role.LINK, name="Go to Page Two", strict=True)
                 link.click()
-                page2 = page.get_by_role(waybound.Role.HEADING, name="Page Two").wait_for(
-                    timeout_ms=15_000
-                )
+                try:
+                    page2 = page.get_by_role(waybound.Role.HEADING, name="Page Two").wait_for(
+                        timeout_ms=5_000
+                    )
+                except Exception:
+                    sys.stderr.write(
+                        f"DEBUG link click: hits={_FixtureHandler.hits!r} "
+                        f"url={page.url()!r} nodes={page.snapshot_tree()!r}\n"
+                    )
+                    raise
                 sys.stdout.write(f"7. After link click (/page2) -> HEADING: {page2.name!r}\n")
 
                 png = page.screenshot()
