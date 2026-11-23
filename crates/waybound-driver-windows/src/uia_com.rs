@@ -69,12 +69,13 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::Ole::{
-    SafeArrayGetDim, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound,
+    SafeArrayGetDim, SafeArrayGetElement, SafeArrayGetElemsize, SafeArrayGetLBound,
+    SafeArrayGetUBound,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
-use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I4, VariantClear};
+use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I4};
 use windows::Win32::UI::Accessibility::{
     AutomationElementMode_None, CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2,
     IUIAutomationCacheRequest, IUIAutomationCondition, IUIAutomationElement,
@@ -595,36 +596,19 @@ impl Drop for ComApartment {
     }
 }
 
-/// A caller-owned `VARIANT` (from `GetCachedPropertyValue`) released with `VariantClear`.
+/// A caller-owned `VARIANT` (from `GetCachedPropertyValue`).
+///
+/// `windows::Win32::System::Variant::VARIANT` already implements `Drop` via `VariantClear`, so
+/// wrapping it without a second `Drop` impl releases its payload exactly once.
 struct OwnedVariant(VARIANT);
-
-impl Drop for OwnedVariant {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` is a VARIANT this wrapper exclusively owns (returned by an `[out]`
-        // parameter or built from plain data); `VariantClear` frees its BSTR/SAFEARRAY/interface
-        // payload exactly once and leaves it `VT_EMPTY`.
-        let _ = unsafe { VariantClear(&raw mut self.0) };
-    }
-}
 
 impl OwnedVariant {
     fn from_i32(value: i32) -> Self {
-        let mut variant = VARIANT::default();
-        // SAFETY: `VARIANT::default()` is all-zero (`VT_EMPTY`); writing the `vt` tag and the
-        // matching `lVal` member of the plain-data union produces a valid `VT_I4` VARIANT with
-        // nothing to free.
-        unsafe {
-            let inner = &mut *variant.Anonymous.Anonymous;
-            inner.vt = VT_I4;
-            inner.Anonymous.lVal = value;
-        }
-        Self(variant)
+        Self(VARIANT::from(value))
     }
 
     fn vt(&self) -> u16 {
-        // SAFETY: every VARIANT, including the zeroed default, starts with a valid `vt` tag;
-        // reading it through the union does not depend on which member is active.
-        unsafe { self.0.Anonymous.Anonymous.vt.0 }
+        self.0.vt().0
     }
 
     fn as_i32(&self) -> Option<i32> {
@@ -669,7 +653,7 @@ impl OwnedVariant {
         // array's element type per the `VT_I4` tag) into a local, for indices inside the
         // bounds just read.
         unsafe {
-            if SafeArrayGetDim(array) != 1 {
+            if SafeArrayGetDim(array) != 1 || SafeArrayGetElemsize(array) != 4 {
                 return None;
             }
             let lower = SafeArrayGetLBound(array, 1).ok()?;
@@ -934,6 +918,8 @@ enum SnapError {
     Call(CallError),
     /// The page is not readable yet (between documents, or an unreadable root): `transient`.
     NotReady(String),
+    /// The query deadline left too little time to start a fallback walk.
+    Timeout(String),
 }
 
 impl From<CallError> for SnapError {
@@ -949,6 +935,10 @@ impl SnapError {
             Self::NotReady(reason) => WayboundError::Transient {
                 backend: "windows".to_owned(),
                 reason: format!("Windows UIAutomation (native COM): {reason}"),
+            },
+            Self::Timeout(operation) => WayboundError::Timeout {
+                operation: format!("Windows UIAutomation (native COM): {operation}"),
+                timeout_ms: UIA_QUERY_TIMEOUT_MS,
             },
         }
     }
@@ -1366,13 +1356,13 @@ impl UiaSession {
                     error = %describe(&failed.err),
                     "UIAutomation subtree snapshot failed; walking level by level"
                 );
-                self.walk_levels(&base, limit, deadline, &mut parts)?
+                self.walk_levels(&base, limit, deadline, &mut parts, Some(failed))?
             }
             None => {
                 tracing::debug!(
                     "WAYBOUND_WINDOWS_UIA_FORCE_LEVEL_WALK set; walking level by level"
                 );
-                self.walk_levels(&base, limit, deadline, &mut parts)?
+                self.walk_levels(&base, limit, deadline, &mut parts, None)?
             }
         };
 
@@ -1427,10 +1417,16 @@ impl UiaSession {
         limit: usize,
         deadline: Instant,
         parts: &mut PageParts,
+        trigger_error: Option<CallError>,
     ) -> std::result::Result<(Vec<RawUiaNode>, bool), SnapError> {
         if deadline.saturating_duration_since(Instant::now()) < MIN_LEVEL_WALK {
-            return Err(SnapError::NotReady(
-                "not enough time left for the level-by-level walk".to_owned(),
+            return Err(trigger_error.map_or_else(
+                || {
+                    SnapError::Timeout(
+                        "not enough time left for the level-by-level walk".to_owned(),
+                    )
+                },
+                SnapError::Call,
             ));
         }
         self.arm(deadline);
@@ -1466,7 +1462,17 @@ impl UiaSession {
                     .BuildUpdatedCache(&self.level_request)
                     .and_then(|refreshed| refreshed.GetCachedChildren())
             };
-            let children = elements_of(children).unwrap_or_default();
+            let children = match elements_of(children) {
+                Ok(list) => list,
+                Err(err) if uia_model::classify_hresult(hresult(&err)) == HresultClass::Timeout => {
+                    tracing::debug!(
+                        error = %describe(&err),
+                        "level walk child fetch timed out; stopping with partial tree"
+                    );
+                    return Visit::Stop;
+                }
+                Err(_) => Vec::new(),
+            };
             Visit::Node(node, children)
         }))
     }
@@ -1539,8 +1545,8 @@ impl UiaSession {
     }
 
     /// Finds the omnibox URL and the web content root among the window's descendants, like
-    /// the PowerShell walker's two `FindAll` passes (in one call here). Failures are logged
-    /// and ignored, as the walker's `try {} catch {}` did.
+    /// the PowerShell walker's two `FindAll` passes (in one call here). Failures are
+    /// propagated as `CallError` so callers never misread a failed search as "no document".
     fn locate_chrome_parts(
         &self,
         window: &IUIAutomationElement,
@@ -1632,9 +1638,13 @@ impl UiaSession {
         .map_err(|err| CallError::search(err, "raw-view Document search"))?;
         if tracing::enabled!(tracing::Level::DEBUG) {
             for (idx, document) in documents.iter().enumerate() {
+                if Instant::now() >= deadline {
+                    break;
+                }
                 let (name, rect) = cached_basics(document)
                     .map(|(_, name, rect)| (name, rect))
                     .unwrap_or_default();
+                self.arm(deadline);
                 // SAFETY: COM method on a live element with a live condition; returns an owned
                 // array. Debug logging only.
                 let children = elements_of(unsafe {
