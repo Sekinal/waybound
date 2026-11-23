@@ -48,6 +48,7 @@ class LaunchOptions:
     serial: str | None = None
     display: str | None = None
     headless_xvfb: bool = False
+    headless_wayland: bool = False
     launch_chrome: bool = False
     launch_waydroid: bool = False
     instance_id: str | None = None
@@ -67,6 +68,9 @@ class LaunchOptions:
     startup_timeout_s: float = 5.0
 
     def __post_init__(self) -> None:
+        if self.headless_xvfb and self.headless_wayland:
+            msg = "headless_xvfb and headless_wayland are mutually exclusive"
+            raise ValueError(msg)
         if self.block_presets:
             _validate_block_presets(self.block_presets)
 
@@ -217,6 +221,8 @@ class Session:
             cmd.extend(["--block-preset", preset])
         if opts.headless_xvfb:
             cmd.append("--headless-xvfb")
+        if opts.headless_wayland:
+            cmd.append("--headless-wayland")
         if opts.launch_chrome:
             cmd.append("--launch-chrome")
         if opts.launch_waydroid:
@@ -328,12 +334,18 @@ def launch(
     *,
     backend: BackendName = "mock",
     launch_chrome: bool = False,
+    headless_wayland: bool = False,
     url: str | None = None,
 ) -> Session:
     """Create a `Session` context manager for ergonomic out-of-band browser automation."""
     resolved = (
         options
         if options is not None
-        else LaunchOptions(backend=backend, launch_chrome=launch_chrome, url=url)
+        else LaunchOptions(
+            backend=backend,
+            launch_chrome=launch_chrome,
+            headless_wayland=headless_wayland,
+            url=url,
+        )
     )
     return Session(resolved)

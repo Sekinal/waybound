@@ -36,6 +36,8 @@ pub struct ChromeLaunchOptions {
     pub locale: Option<String>,
     /// Optional X11 `DISPLAY` environment variable (e.g., `:99` for headless Xvfb on Linux).
     pub display: Option<String>,
+    /// Optional Wayland display `(WAYLAND_DISPLAY, XDG_RUNTIME_DIR)` for headless compositor mode.
+    pub wayland_display: Option<(String, PathBuf)>,
     /// Whether to bring the launched browser window to the foreground on macOS.
     pub focus: bool,
 }
@@ -179,7 +181,16 @@ pub fn launch_chrome(options: &ChromeLaunchOptions) -> Result<LaunchedChrome> {
     if let Some(proxy_server) = &options.proxy_server {
         let _ = cmd.arg(format!("--proxy-server={proxy_server}"));
     }
-    if let Some(display) = &options.display {
+    if let Some((wayland_display, runtime_dir)) = &options.wayland_display {
+        let _ = cmd
+            .arg("--ozone-platform=wayland")
+            .arg("--disable-gpu")
+            .arg("--disable-gpu-compositing")
+            .arg("--disable-dev-shm-usage")
+            .env("WAYLAND_DISPLAY", wayland_display)
+            .env("XDG_RUNTIME_DIR", runtime_dir)
+            .env_remove("DISPLAY");
+    } else if let Some(display) = &options.display {
         let _ = cmd.env("DISPLAY", display);
     }
     if let Some(tz) = &options.timezone {
@@ -253,13 +264,15 @@ mod tests {
             locale: None,
             focus: false,
             display: None,
+            wayland_display: None,
         }
     }
 
     /// Writes a stand-in "browser" that records its arguments and then idles.
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn fake_browser(dir: &Path) -> PathBuf {
         let script = dir.join("fake-chrome.sh");
-        let body = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nexec sleep 30\n";
+        let body = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nprintf 'WAYLAND_DISPLAY=%s\\nXDG_RUNTIME_DIR=%s\\nDISPLAY=%s\\n' \"${WAYLAND_DISPLAY:-}\" \"${XDG_RUNTIME_DIR:-}\" \"${DISPLAY:-}\" > \"$0.env\"\nexec sleep 30\n";
         assert!(std::fs::write(&script, body).is_ok());
         assert!(std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).is_ok());
         script
@@ -323,6 +336,60 @@ mod tests {
             explicit.exists(),
             "an explicit profile must never be deleted"
         );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn launch_with_wayland_display_sets_ozone_flags_and_env() {
+        let scratch = create_temp_profile_dir().unwrap_or_default();
+        assert!(scratch.is_dir(), "could not create scratch dir");
+        let script = fake_browser(&scratch);
+        let runtime_dir = scratch.join("xdg");
+        assert!(std::fs::create_dir_all(&runtime_dir).is_ok());
+
+        let mut opts = options(&script, None);
+        opts.display = Some(":99".to_owned());
+        opts.wayland_display = Some(("wayland-wb-0".to_owned(), runtime_dir.clone()));
+
+        let launched = launch_chrome(&opts);
+        assert!(launched.is_ok());
+        // Wait for fake script to write both .args and .env.
+        assert!(recorded_profile_dir(&script).is_some());
+
+        let args_text =
+            std::fs::read_to_string(format!("{}.args", script.display())).unwrap_or_default();
+        let args: Vec<&str> = args_text.lines().collect();
+        assert!(args.contains(&"--ozone-platform=wayland"));
+        assert!(args.contains(&"--disable-gpu"));
+        assert!(args.contains(&"--disable-gpu-compositing"));
+        assert!(args.contains(&"--disable-dev-shm-usage"));
+
+        let env_file = PathBuf::from(format!("{}.env", script.display()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut env_text = String::new();
+        while Instant::now() < deadline {
+            if let Ok(content) = std::fs::read_to_string(&env_file)
+                && !content.is_empty()
+            {
+                env_text = content;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            env_text.contains("WAYLAND_DISPLAY=wayland-wb-0\n"),
+            "missing WAYLAND_DISPLAY in {env_text:?}"
+        );
+        assert!(
+            env_text.contains(&format!("XDG_RUNTIME_DIR={}\n", runtime_dir.display())),
+            "missing XDG_RUNTIME_DIR in {env_text:?}"
+        );
+        assert!(
+            env_text.contains("DISPLAY=\n"),
+            "DISPLAY should be unset in Wayland mode, got {env_text:?}"
+        );
+
+        drop(launched);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }

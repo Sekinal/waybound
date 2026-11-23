@@ -4,7 +4,15 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -16,11 +24,13 @@ import {
   buildDbusArgs,
   buildSlotEnv,
   buildXvfbArgs,
+  type DisplayBackend,
   findFreeDisplayNum,
   parseRemoteWorker,
   Role,
   Transport,
 } from "../src/index.js";
+import { buildDaemonArgs } from "../src/session.js";
 
 const REPO_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 const DAEMON_BIN =
@@ -154,6 +164,36 @@ describe("BrowserPool pure helpers", () => {
         }),
       RangeError,
     );
+    assert.throws(
+      () =>
+        new BrowserPool({
+          size: 1,
+          displayBackend: "invalid" as DisplayBackend,
+        }),
+      RangeError,
+    );
+  });
+
+  it("forwards --headless-wayland and rejects combining with --headless-xvfb", () => {
+    const waylandArgs = buildDaemonArgs(
+      { backend: "linux", headlessWayland: true },
+      { host: "127.0.0.1", port: 49222 },
+    );
+    assert.ok(waylandArgs.includes("--headless-wayland"));
+    assert.ok(!waylandArgs.includes("--headless-xvfb"));
+
+    assert.throws(
+      () =>
+        buildDaemonArgs(
+          { backend: "linux", headlessXvfb: true, headlessWayland: true },
+          { host: "127.0.0.1", port: 49222 },
+        ),
+      RangeError,
+    );
+
+    const waylandEnv = buildSlotEnv({ dbusAddress: "unix:path=/tmp/dbus-wl" });
+    assert.equal(waylandEnv.DISPLAY, undefined);
+    assert.equal(waylandEnv.DBUS_SESSION_BUS_ADDRESS, "unix:path=/tmp/dbus-wl");
   });
 });
 
@@ -421,5 +461,41 @@ describe("BrowserPool live daemon integration", { skip }, () => {
       recycled: 1,
       failed: 0,
     });
+  });
+
+  it("skips Xvfb and forwards --headless-wayland when displayBackend is 'wayland'", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const dir = mkdtempSync(path.join(tmpdir(), "wb-wl-pool-"));
+    const argsLog = path.join(dir, "daemon.args");
+    const wrapper = path.join(dir, "daemon-wrapper.sh");
+    writeFileSync(
+      wrapper,
+      `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argsLog)}\nexec ${JSON.stringify(DAEMON_BIN)} "$@"\n`,
+    );
+    chmodSync(wrapper, 0o755);
+
+    try {
+      await using pool = new BrowserPool({
+        size: 1,
+        isolatedDisplays: true,
+        displayBackend: "wayland",
+        launchOptions: {
+          backend: "mock",
+          headlessXvfb: true,
+          daemonBinary: wrapper,
+        },
+      });
+      await pool.withPage(async (page) => {
+        assert.ok((await page.snapshotTree()).length > 0);
+      });
+
+      const recorded = readFileSync(argsLog, "utf8").trim().split("\n");
+      assert.ok(recorded.includes("--headless-wayland"), `missing --headless-wayland: ${recorded}`);
+      assert.ok(!recorded.includes("--headless-xvfb"), `unexpected --headless-xvfb: ${recorded}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

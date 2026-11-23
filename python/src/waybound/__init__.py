@@ -3,7 +3,7 @@
 from waybound.async_client import AsyncLocator, AsyncPage, AsyncSession, launch_async
 from waybound.client import Locator, Page
 from waybound.handoff import AsyncHandoffHttpClient, HandoffHttpClient, HandoffResponse
-from waybound.pool import BrowserPool, PoolSlotConfig, PoolStats
+from waybound.pool import BrowserPool, DisplayBackend, PoolSlotConfig, PoolStats
 from waybound.profiles import (
     DEFAULT_MAX_SNAPSHOT_BYTES,
     EXCLUDED_PROFILE_NAMES,
@@ -60,6 +60,7 @@ __all__ = [
     "CapturedCookie",
     "CapturedResponse",
     "CapturedWebSocketFrame",
+    "DisplayBackend",
     "HandoffHttpClient",
     "HandoffResponse",
     "HeaderEntry",

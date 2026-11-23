@@ -13,16 +13,16 @@ mod replay;
 mod server;
 
 use std::env;
-#[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tracing_subscriber::EnvFilter;
+use waybound_compositor::{CompositorConfig, HeadlessCompositor};
 use waybound_core::Driver;
 use waybound_driver_android::{AndroidDriver, WaydroidConfig, WaydroidSession};
 use waybound_driver_linux::{HeadlessDisplayConfig, HeadlessDisplaySession, LinuxDriver};
@@ -47,6 +47,7 @@ struct CliArgs {
     serial: Option<String>,
     display: Option<String>,
     headless_xvfb: bool,
+    headless_wayland: bool,
     launch_chrome: bool,
     launch_waydroid: bool,
     instance_id: Option<String>,
@@ -84,6 +85,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, St
         serial: None,
         display: None,
         headless_xvfb: false,
+        headless_wayland: false,
         launch_chrome: false,
         launch_waydroid: false,
         instance_id: None,
@@ -121,6 +123,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, St
             "--serial" => cli.serial = Some(next_arg(&mut args, "--serial")?),
             "--display" => cli.display = Some(next_arg(&mut args, "--display")?),
             "--headless-xvfb" => cli.headless_xvfb = true,
+            "--headless-wayland" => cli.headless_wayland = true,
             "--launch-chrome" => cli.launch_chrome = true,
             "--launch-waydroid" => cli.launch_waydroid = true,
             "--instance-id" => cli.instance_id = Some(next_arg(&mut args, "--instance-id")?),
@@ -161,12 +164,39 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<CliArgs, St
         }
     }
 
+    if cli.headless_xvfb && cli.headless_wayland {
+        return Err("--headless-xvfb and --headless-wayland are mutually exclusive".to_owned());
+    }
+
     if !cli.block_presets.is_empty() {
         let expanded = expand_block_presets(&cli.block_presets)?;
         cli.block_hosts.extend(expanded);
     }
 
     Ok(cli)
+}
+
+static WAYLAND_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// RAII guard that removes a temporary directory when dropped.
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn create_wayland_runtime_dir() -> std::io::Result<PathBuf> {
+    let unique = WAYLAND_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = env::temp_dir().join(format!(
+        "waybound-wl-daemon-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
 }
 
 #[cfg(unix)]
@@ -219,17 +249,21 @@ fn setup_proxy(
 }
 
 struct BackendBundle {
+    // Drop Chrome before the driver/compositor and runtime dir so Chrome never sees the
+    // Wayland socket disappear while it is still running.
+    _launched: Option<launcher::LaunchedChrome>,
     driver: Arc<dyn Driver>,
     use_motion: bool,
-    _launched: Option<launcher::LaunchedChrome>,
     proxy_forwarder: Option<ProxyForwarder>,
     _waydroid: Option<WaydroidSession>,
     _xvfb: Option<HeadlessDisplaySession>,
+    _wayland_runtime_dir: Option<TempDirGuard>,
 }
 
 fn launch_desktop_chrome(
     cli: &CliArgs,
     display: Option<String>,
+    wayland_display: Option<(String, PathBuf)>,
     responses: &Arc<ResponseStore>,
     inflight: &InflightCounter,
     fingerprint: &FingerprintRecorder,
@@ -251,6 +285,7 @@ fn launch_desktop_chrome(
         timezone: cli.timezone.clone(),
         locale: cli.locale.clone(),
         display,
+        wayland_display,
         focus: cli.focus,
     };
     let chrome = launch_chrome(&opts).map_err(|e| e.to_string())?;
@@ -273,6 +308,7 @@ fn build_backend(
             proxy_forwarder: None,
             _waydroid: None,
             _xvfb: None,
+            _wayland_runtime_dir: None,
         }),
         "android" => {
             let (serial, waydroid_session, proxy_fwd) = if cli.launch_waydroid {
@@ -321,12 +357,13 @@ fn build_backend(
                 proxy_forwarder: proxy_fwd,
                 _waydroid: waydroid_session,
                 _xvfb: None,
+                _wayland_runtime_dir: None,
             })
         }
         "macos" => {
             let (target_pid, launched, fwd) = if cli.launch_chrome {
                 let (pid, chrome, proxy_fwd) =
-                    launch_desktop_chrome(&cli, None, responses, inflight, fingerprint)?;
+                    launch_desktop_chrome(&cli, None, None, responses, inflight, fingerprint)?;
                 (pid, Some(chrome), proxy_fwd)
             } else if let Some(pid) = cli.pid {
                 (pid, None, None)
@@ -343,22 +380,40 @@ fn build_backend(
                 proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: None,
+                _wayland_runtime_dir: None,
             })
         }
         "linux" => {
-            let (xvfb_session, display_env) = if cli.headless_xvfb {
-                let session = HeadlessDisplaySession::start(HeadlessDisplayConfig::default())
-                    .map_err(|e| e.to_string())?;
-                let disp = session.display();
-                (Some(session), Some(disp))
-            } else {
-                (None, cli.display.clone())
-            };
+            let (xvfb_session, display_env, compositor, wayland_runtime_guard) =
+                if cli.headless_wayland {
+                    let runtime_dir = create_wayland_runtime_dir().map_err(|e| e.to_string())?;
+                    let guard = TempDirGuard(runtime_dir.clone());
+                    let comp = Arc::new(
+                        HeadlessCompositor::start(CompositorConfig {
+                            runtime_dir: Some(runtime_dir),
+                            ..CompositorConfig::default()
+                        })
+                        .map_err(|e| e.to_string())?,
+                    );
+                    (None, None, Some(comp), Some(guard))
+                } else if cli.headless_xvfb {
+                    let session = HeadlessDisplaySession::start(HeadlessDisplayConfig::default())
+                        .map_err(|e| e.to_string())?;
+                    let disp = session.display();
+                    (Some(session), Some(disp), None, None)
+                } else {
+                    (None, cli.display.clone(), None, None)
+                };
+
+            let wayland_display = compositor
+                .as_ref()
+                .map(|c| (c.socket_name().to_owned(), c.runtime_dir().to_path_buf()));
 
             let (target_pid, launched, fwd) = if cli.launch_chrome {
                 let (pid, chrome, proxy_fwd) = launch_desktop_chrome(
                     &cli,
                     display_env.clone(),
+                    wayland_display,
                     responses,
                     inflight,
                     fingerprint,
@@ -368,20 +423,35 @@ fn build_backend(
                 (cli.pid, None, None)
             };
 
-            tracing::info!(pid = ?target_pid, ?display_env, "starting linux desktop driver");
+            let driver: Arc<dyn Driver> = compositor.map_or_else(
+                || {
+                    tracing::info!(pid = ?target_pid, ?display_env, "starting linux desktop driver");
+                    Arc::new(LinuxDriver::with_display(target_pid, display_env))
+                },
+                |comp| {
+                    tracing::info!(
+                        pid = ?target_pid,
+                        socket = %comp.socket_name(),
+                        "starting linux headless wayland driver"
+                    );
+                    Arc::new(LinuxDriver::with_compositor(target_pid, comp))
+                },
+            );
+
             Ok(BackendBundle {
-                driver: Arc::new(LinuxDriver::with_display(target_pid, display_env)),
+                driver,
                 use_motion: !cli.no_motion,
                 _launched: launched,
                 proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: xvfb_session,
+                _wayland_runtime_dir: wayland_runtime_guard,
             })
         }
         "windows" => {
             let (target_pid, launched, fwd) = if cli.launch_chrome {
                 let (pid, chrome, proxy_fwd) =
-                    launch_desktop_chrome(&cli, None, responses, inflight, fingerprint)?;
+                    launch_desktop_chrome(&cli, None, None, responses, inflight, fingerprint)?;
                 (Some(pid), Some(chrome), proxy_fwd)
             } else {
                 (cli.pid, None, None)
@@ -395,6 +465,7 @@ fn build_backend(
                 proxy_forwarder: fwd,
                 _waydroid: None,
                 _xvfb: None,
+                _wayland_runtime_dir: None,
             })
         }
         other => Err(format!(
@@ -583,5 +654,26 @@ mod tests {
         assert!(
             matches!(err, Err(msg) if msg.contains("nonexistent") && msg.contains("analytics"))
         );
+    }
+
+    #[test]
+    fn parse_args_accepts_headless_wayland_and_rejects_xvfb_combination() {
+        let parsed = parse_args_from([
+            "--backend".to_owned(),
+            "linux".to_owned(),
+            "--headless-wayland".to_owned(),
+        ]);
+        assert!(parsed.is_ok());
+        if let Ok(cli) = parsed {
+            assert!(cli.headless_wayland);
+            assert!(!cli.headless_xvfb);
+            assert_eq!(cli.backend, "linux");
+        }
+
+        let conflict = parse_args_from([
+            "--headless-xvfb".to_owned(),
+            "--headless-wayland".to_owned(),
+        ]);
+        assert!(matches!(conflict, Err(msg) if msg.contains("mutually exclusive")));
     }
 }

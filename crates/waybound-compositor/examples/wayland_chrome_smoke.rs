@@ -12,13 +12,21 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use waybound_compositor::{CompositorConfig, HeadlessCompositor};
+use waybound_core::{InputEvent, KeyCode, MouseButton, Point};
 
 const HTML_BODY: &str = r#"<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Waybound Wayland Smoke</title></head>
-<body style="margin:0;background:#2266cc;color:#ffffff;font-family:sans-serif">
+<body style="margin:0;padding:0;background:#2266cc;color:#ffffff;font-family:sans-serif">
+  <button id="btn" style="width:300px;height:120px" onclick="fetch('/clicked')">Click Me</button>
   <h1 style="padding:40px">Hello Wayland</h1>
   <script>
+    window.addEventListener('pointerdown', () => {
+      fetch('/input?kind=click');
+    });
+    document.addEventListener('keydown', () => {
+      fetch('/input?kind=key');
+    });
     const params = new URLSearchParams({
       w: String(window.screen.width),
       h: String(window.screen.height),
@@ -31,12 +39,19 @@ const HTML_BODY: &str = r#"<!doctype html>
 </html>
 "#;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct PageReport {
     width: String,
     height: String,
     visibility: String,
     is_extended: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PageEvent {
+    Report(PageReport),
+    InputClick,
+    InputKey,
 }
 
 struct ChildGuard(Child);
@@ -103,7 +118,7 @@ fn parse_report_query(path: &str) -> Option<PageReport> {
     })
 }
 
-fn spawn_http_server(report_tx: mpsc::Sender<PageReport>) -> Result<u16, String> {
+fn spawn_http_server(event_tx: mpsc::Sender<PageEvent>) -> Result<u16, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind http: {e}"))?;
     let port = listener
         .local_addr()
@@ -136,7 +151,15 @@ fn spawn_http_server(report_tx: mpsc::Sender<PageReport>) -> Result<u16, String>
 
             let mut writer = &stream;
             if let Some(report) = parse_report_query(&path) {
-                let _ = report_tx.send(report);
+                let _ = event_tx.send(PageEvent::Report(report));
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = writer.write_all(resp.as_bytes());
+            } else if path == "/input?kind=click" || path == "/clicked" {
+                let _ = event_tx.send(PageEvent::InputClick);
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = writer.write_all(resp.as_bytes());
+            } else if path == "/input?kind=key" {
+                let _ = event_tx.send(PageEvent::InputKey);
                 let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
                 let _ = writer.write_all(resp.as_bytes());
             } else {
@@ -206,8 +229,8 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
         compositor.runtime_dir().display()
     ));
 
-    let (report_tx, report_rx) = mpsc::channel();
-    let port = spawn_http_server(report_tx)?;
+    let (event_tx, event_rx) = mpsc::channel();
+    let port = spawn_http_server(event_tx)?;
     let url = format!("http://127.0.0.1:{port}/");
 
     let child = waybound_core::process::command(&chrome_bin)
@@ -232,6 +255,9 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut received_report: Option<PageReport> = None;
     let mut captured_png: Option<Vec<u8>> = None;
+    let mut target_window_id: Option<u64> = None;
+    let mut saw_click = false;
+    let mut saw_key = false;
 
     while Instant::now() < deadline {
         if let Ok(Some(status)) = child_guard.0.try_wait() {
@@ -240,11 +266,19 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
                 compositor.windows()
             ));
         }
-        if received_report.is_none()
-            && let Ok(report) = report_rx.try_recv()
-        {
-            log_line(&format!("Received page report: {report:?}"));
-            received_report = Some(report);
+        while let Ok(evt) = event_rx.try_recv() {
+            match evt {
+                PageEvent::Report(report) => {
+                    log_line(&format!("Received page report: {report:?}"));
+                    received_report = Some(report);
+                }
+                PageEvent::InputClick => {
+                    saw_click = true;
+                }
+                PageEvent::InputKey => {
+                    saw_key = true;
+                }
+            }
         }
 
         if captured_png.is_none()
@@ -257,6 +291,7 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
                 "Captured committed wl_buffer from window {} ({}x{}, title={:?})",
                 win.id, win.width, win.height, win.title
             ));
+            target_window_id = Some(win.id);
             captured_png = Some(png_bytes);
         }
 
@@ -294,8 +329,68 @@ fn run_smoke(work_dir: &Path) -> Result<(), String> {
         )
     })?;
     let (w, h, non_black) = verify_png_non_blank(&png_bytes)?;
+
+    // Dispatch synthetic pointer click + keyboard press via wl_seat and verify the page receives both.
+    let win_id = target_window_id;
+    compositor
+        .dispatch_input(
+            win_id,
+            &InputEvent::PointerMove {
+                to: Point { x: 400.0, y: 400.0 },
+            },
+        )
+        .map_err(|e| format!("dispatch PointerMove failed: {e}"))?;
+    compositor
+        .dispatch_input(
+            win_id,
+            &InputEvent::MouseClick {
+                button: MouseButton::Left,
+                hold_ms: 20,
+            },
+        )
+        .map_err(|e| format!("dispatch MouseClick failed: {e}"))?;
+    thread::sleep(Duration::from_millis(100));
+    compositor
+        .dispatch_input(
+            win_id,
+            &InputEvent::KeyPress {
+                key: KeyCode::Char('a'),
+                modifiers: Vec::new(),
+                hold_ms: 20,
+            },
+        )
+        .map_err(|e| format!("dispatch KeyPress failed: {e}"))?;
+
+    let input_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < input_deadline && !(saw_click && saw_key) {
+        while let Ok(evt) = event_rx.try_recv() {
+            match evt {
+                PageEvent::InputClick => {
+                    log_line("Received synthetic pointer click callback from Chrome");
+                    saw_click = true;
+                }
+                PageEvent::InputKey => {
+                    log_line("Received synthetic keyboard press callback from Chrome");
+                    saw_key = true;
+                }
+                PageEvent::Report(_) => {}
+            }
+        }
+        if saw_click && saw_key {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if !saw_click {
+        return Err("timed out waiting for synthetic pointerdown callback from Chrome".to_owned());
+    }
+    if !saw_key {
+        return Err("timed out waiting for synthetic keydown callback from Chrome".to_owned());
+    }
+
     log_line(&format!(
-        "PASS: Chrome rendered {w}x{h} PNG ({} bytes, {non_black} non-black pixels) on pure-Rust Wayland compositor",
+        "PASS: Chrome rendered {w}x{h} PNG ({} bytes, {non_black} non-black pixels) and received synthetic wl_seat click + key press on pure-Rust Wayland compositor",
         png_bytes.len()
     ));
 

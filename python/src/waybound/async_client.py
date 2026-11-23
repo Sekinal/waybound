@@ -322,12 +322,18 @@ def launch_async(
     *,
     backend: BackendName = "mock",
     launch_chrome: bool = False,
+    headless_wayland: bool = False,
     url: str | None = None,
 ) -> AsyncSession:
     """Create an `AsyncSession` context manager for `async with` browser automation."""
     resolved = (
         options
         if options is not None
-        else LaunchOptions(backend=backend, launch_chrome=launch_chrome, url=url)
+        else LaunchOptions(
+            backend=backend,
+            launch_chrome=launch_chrome,
+            headless_wayland=headless_wayland,
+            url=url,
+        )
     )
     return AsyncSession(resolved)

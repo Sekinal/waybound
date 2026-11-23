@@ -28,6 +28,8 @@ export interface LaunchOptions {
   /** X11/Wayland display. */
   readonly display?: string;
   readonly headlessXvfb?: boolean;
+  /** Run an in-process pure-Rust headless Wayland compositor per daemon on Linux. */
+  readonly headlessWayland?: boolean;
   /** Let the daemon launch Chrome. */
   readonly launchChrome?: boolean;
   readonly launchWaydroid?: boolean;
@@ -60,6 +62,9 @@ export interface LaunchOptions {
 
 /** Build the daemon argv (without the executable) for `options` and `endpoint`. */
 export function buildDaemonArgs(options: LaunchOptions, endpoint: Endpoint): string[] {
+  if (options.headlessXvfb && options.headlessWayland) {
+    throw new RangeError("headlessXvfb and headlessWayland are mutually exclusive");
+  }
   const args: string[] =
     "socketPath" in endpoint
       ? ["--socket", endpoint.socketPath]
@@ -98,6 +103,7 @@ export function buildDaemonArgs(options: LaunchOptions, endpoint: Endpoint): str
   }
   const flags: [string, boolean | undefined][] = [
     ["--headless-xvfb", options.headlessXvfb],
+    ["--headless-wayland", options.headlessWayland],
     ["--launch-chrome", options.launchChrome],
     ["--launch-waydroid", options.launchWaydroid],
     ["--focus", options.focus],
