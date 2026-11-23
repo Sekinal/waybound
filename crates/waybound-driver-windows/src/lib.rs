@@ -1,6 +1,6 @@
 //! Native Windows backend driver implementing [`waybound_core::Driver`] via
-//! `UIAutomation` (in-process COM `IUIAutomation`, with a PowerShell fallback selected by
-//! `WAYBOUND_WINDOWS_UIA=powershell`) and Win32 `SendInput` (`user32.dll`).
+//! `UIAutomation` (in-process COM `IUIAutomation`; `WAYBOUND_WINDOWS_UIA=powershell` selects
+//! the PowerShell fallback and `native-strict` forbids it) and Win32 `SendInput` (`user32.dll`).
 
 pub mod input;
 pub mod screenshot;
@@ -85,7 +85,7 @@ impl Driver for WindowsDriver {
     fn current_url(&self) -> Result<Option<String>> {
         #[cfg(target_os = "windows")]
         {
-            uia::query_uia_tree(self.pid).map(|snapshot| snapshot.current_url)
+            uia::query_uia_page_info(self.pid).map(|(url, _)| url)
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -96,7 +96,7 @@ impl Driver for WindowsDriver {
     fn viewport_bounds(&self) -> Result<Option<Bounds>> {
         #[cfg(target_os = "windows")]
         {
-            uia::query_uia_tree(self.pid).map(|snapshot| snapshot.viewport_bounds)
+            uia::query_uia_page_info(self.pid).map(|(_, viewport)| viewport)
         }
         #[cfg(not(target_os = "windows"))]
         {

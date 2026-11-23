@@ -207,9 +207,13 @@ pub fn select_web_root(documents: &[(f64, f64, f64, f64)]) -> Option<(usize, Opt
     }
 }
 
-/// Process names the walker accepts when no target pid is configured, in priority order
-/// (PowerShell: `Get-Process -Name 'chrome','msedge','chromium'`).
-pub const BROWSER_PROCESS_NAMES: [&str; 3] = ["chrome", "msedge", "chromium"];
+/// Process names the walker accepts when no target pid is configured, in priority order.
+///
+/// PowerShell's `Get-Process -Name 'chrome','msedge','chromium'` returns the matching
+/// processes sorted by process name and then by id (`ProcessBaseCommand` sorts its matches),
+/// so the old walker effectively tried `chrome`, then `chromium`, then `msedge`, each in
+/// ascending pid order. This list keeps that alphabetical order.
+pub const BROWSER_PROCESS_NAMES: [&str; 3] = ["chrome", "chromium", "msedge"];
 
 /// Reduces a full image path (`C:\...\chrome.exe`) to a lowercase process name (`chrome`).
 #[must_use]
@@ -221,28 +225,56 @@ pub fn process_name_from_image_path(path: &str) -> String {
         .map_or_else(|| lower.clone(), str::to_owned)
 }
 
-/// Picks the browser window among top-level windows, given each window's process name.
+/// A top-level UIA element considered as the browser window when no pid is configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowCandidate {
+    /// Lowercase process name of the owning process, if it could be read.
+    pub process_name: Option<String>,
+    /// Owning process id.
+    pub pid: i32,
+    /// `true` when the element's control type is `Window` (not a popup, tooltip or pane).
+    pub is_window: bool,
+}
+
+/// Picks the browser window among top-level elements (given in UIA order).
 ///
-/// A window of an earlier entry of [`BROWSER_PROCESS_NAMES`] wins; among windows of the same
-/// browser the first in UIA order (z-order, topmost first) wins.
+/// The order is: browser name in [`BROWSER_PROCESS_NAMES`] order, then lowest pid (both as
+/// the PowerShell walker's `Get-Process` loop did), then an element whose control type is
+/// `Window` over any other top-level element of that process (a popup or tooltip can come
+/// first in UIA order), then UIA order.
 #[must_use]
-pub fn pick_browser_window(process_names: &[Option<String>]) -> Option<usize> {
-    BROWSER_PROCESS_NAMES.iter().find_map(|wanted| {
-        process_names
-            .iter()
-            .position(|name| name.as_deref() == Some(*wanted))
-    })
+pub fn pick_browser_window(candidates: &[WindowCandidate]) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, c)| {
+            let rank = BROWSER_PROCESS_NAMES
+                .iter()
+                .position(|name| c.process_name.as_deref() == Some(*name))?;
+            Some(((rank, c.pid, !c.is_window, idx), idx))
+        })
+        .min_by_key(|(key, _)| *key)
+        .map(|(_, idx)| idx)
+}
+
+/// What [`bfs_limited`]'s visitor decided for one node.
+pub enum Visit<T, N> {
+    /// Keep the node and offer its children.
+    Node(T, Vec<N>),
+    /// Drop the node and its subtree (the PowerShell walker's per-node `catch {}`).
+    Skip,
+    /// Stop the walk now (deadline); the result is marked truncated.
+    Stop,
 }
 
 /// Capped breadth-first walk with exactly the PowerShell walker's truncation rule.
 ///
-/// `visit` reads one node and returns its item and children, or `None` to skip the node and
-/// its subtree (the walker's per-node `catch {}`). Children are enqueued until
-/// `items + queued` reaches `limit`; a child that no longer fits marks the walk truncated.
+/// Children are enqueued until `items + queued` reaches `limit`; a child that no longer fits
+/// marks the walk truncated, as does [`Visit::Stop`].
 pub fn bfs_limited<N, T>(
     root: N,
     limit: usize,
-    mut visit: impl FnMut(N) -> Option<(T, Vec<N>)>,
+    mut visit: impl FnMut(N) -> Visit<T, N>,
 ) -> (Vec<T>, bool) {
     let mut queue = VecDeque::from([root]);
     let mut items = Vec::new();
@@ -251,8 +283,13 @@ pub fn bfs_limited<N, T>(
         let Some(node) = queue.pop_front() else {
             break;
         };
-        let Some((item, children)) = visit(node) else {
-            continue;
+        let (item, children) = match visit(node) {
+            Visit::Node(item, children) => (item, children),
+            Visit::Skip => continue,
+            Visit::Stop => {
+                truncated = true;
+                break;
+            }
         };
         items.push(item);
         for child in children {
@@ -269,12 +306,20 @@ pub fn bfs_limited<N, T>(
     (items, truncated)
 }
 
+/// `E_FAIL`: unspecified failure. Chrome returns it for elements torn down mid-navigation.
+pub const E_FAIL: u32 = 0x8000_4005;
 /// `UIA_E_ELEMENTNOTAVAILABLE`: the element no longer exists (stale).
 pub const UIA_E_ELEMENTNOTAVAILABLE: u32 = 0x8004_0201;
 /// `UIA_E_TIMEOUT`: the provider did not answer within the UIA connection/transaction timeout.
 pub const UIA_E_TIMEOUT: u32 = 0x8013_1505;
 /// `RPC_E_DISCONNECTED`: the provider process went away mid-call.
 pub const RPC_E_DISCONNECTED: u32 = 0x8001_0108;
+/// `RPC_E_SERVER_DIED`: the provider process died during the call.
+pub const RPC_E_SERVER_DIED: u32 = 0x8001_0007;
+/// `RPC_E_SERVER_DIED_DNE`: the provider process died before the call was delivered.
+pub const RPC_E_SERVER_DIED_DNE: u32 = 0x8001_0012;
+/// `CO_E_OBJNOTCONNECTED`: the remote object was disconnected from its process.
+pub const CO_E_OBJNOTCONNECTED: u32 = 0x8004_01FD;
 /// `HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE)`: the provider process is gone.
 pub const RPC_S_SERVER_UNAVAILABLE: u32 = 0x8007_06BA;
 /// `HRESULT_FROM_WIN32(RPC_S_CALL_FAILED)`: the cross-process call failed (provider exiting).
@@ -297,6 +342,9 @@ pub const fn classify_hresult(code: u32) -> HresultClass {
     match code {
         UIA_E_ELEMENTNOTAVAILABLE
         | RPC_E_DISCONNECTED
+        | RPC_E_SERVER_DIED
+        | RPC_E_SERVER_DIED_DNE
+        | CO_E_OBJNOTCONNECTED
         | RPC_S_SERVER_UNAVAILABLE
         | RPC_S_CALL_FAILED => HresultClass::Stale,
         UIA_E_TIMEOUT => HresultClass::Timeout,
@@ -304,17 +352,36 @@ pub const fn classify_hresult(code: u32) -> HresultClass {
     }
 }
 
+/// Like [`classify_hresult`], for calls that read the web content tree.
+///
+/// There `E_FAIL` is also stale: Chrome returns it for a document that is being replaced by a navigation,
+/// where the PowerShell walker swallowed the error and returned a partial or empty tree.
+#[must_use]
+pub const fn classify_tree_hresult(code: u32) -> HresultClass {
+    if code == E_FAIL {
+        HresultClass::Stale
+    } else {
+        classify_hresult(code)
+    }
+}
+
 /// Converts a failed native `UIAutomation` call into a [`WayboundError`].
 ///
-/// Stale elements are `Transient`, provider timeouts are `Timeout`, everything else is
-/// `BackendUnavailable`. The message always carries the `HRESULT` in hex.
+/// [`HresultClass::Stale`] becomes `Transient`, [`HresultClass::Timeout`] becomes `Timeout`
+/// and everything else `BackendUnavailable`. The message always carries the `HRESULT` in hex.
 #[must_use]
-pub fn uia_error(code: u32, operation: &str, message: &str, timeout_ms: u64) -> WayboundError {
+pub fn uia_error(
+    class: HresultClass,
+    code: u32,
+    operation: &str,
+    message: &str,
+    timeout_ms: u64,
+) -> WayboundError {
     let detail = format!(
         "Windows UIAutomation (native COM) {operation} failed: HRESULT 0x{code:08X} ({})",
         message.trim()
     );
-    match classify_hresult(code) {
+    match class {
         HresultClass::Stale => WayboundError::Transient {
             backend: "windows".to_owned(),
             reason: detail,
@@ -330,11 +397,51 @@ pub fn uia_error(code: u32, operation: &str, message: &str, timeout_ms: u64) -> 
     }
 }
 
+/// Lifecycle of a COM worker thread, shared between the thread and the callers that wait on
+/// it. Drives the count of abandoned (hung) workers so it can never leak.
+pub mod worker_life {
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+    /// The worker is running and still owned by the request slot.
+    pub const LIVE: u8 = 0;
+    /// A caller gave up on the worker; it is counted until its thread exits.
+    pub const ABANDONED: u8 = 1;
+    /// The worker thread has exited.
+    pub const EXITED: u8 = 2;
+
+    /// Marks the worker abandoned and counts it, unless it was already abandoned or has
+    /// exited. Returns `true` if this call counted it.
+    pub fn abandon(life: &AtomicU8, abandoned_count: &AtomicUsize) -> bool {
+        // Count first so a concurrent exit always finds the increment it may undo.
+        let _ = abandoned_count.fetch_add(1, Ordering::SeqCst);
+        if life
+            .compare_exchange(LIVE, ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            true
+        } else {
+            let _ = abandoned_count.fetch_sub(1, Ordering::SeqCst);
+            false
+        }
+    }
+
+    /// Records the worker thread's exit, un-counting it if it had been abandoned.
+    pub fn exited(life: &AtomicU8, abandoned_count: &AtomicUsize) {
+        if life.swap(EXITED, Ordering::SeqCst) == ABANDONED {
+            let _ = abandoned_count.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Which implementation answers `UIAutomation` queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiaBackend {
-    /// In-process COM `IUIAutomation` (default).
+    /// In-process COM `IUIAutomation` (default); falls back to PowerShell only if COM
+    /// initialization fails.
     NativeCom,
+    /// In-process COM with no fallback: if COM initialization fails, queries return
+    /// `backend_unavailable`. Used by CI to prove the native path ran.
+    NativeStrict,
     /// The original `powershell.exe` + .NET `UIAutomationClient` walker.
     PowerShell,
 }
@@ -345,6 +452,7 @@ impl UiaBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NativeCom => "native-com",
+            Self::NativeStrict => "native-strict",
             Self::PowerShell => "powershell",
         }
     }
@@ -355,9 +463,9 @@ pub const UIA_BACKEND_ENV: &str = "WAYBOUND_WINDOWS_UIA";
 
 /// Parses the value of [`UIA_BACKEND_ENV`].
 ///
-/// `powershell` (or `ps`) selects the PowerShell walker; unset,
-/// empty, `native` or `com` select native COM. The second value is `false` for an
-/// unrecognized setting, which also selects native COM.
+/// `powershell` (or `ps`) selects the PowerShell walker; `native-strict` (or `strict`)
+/// selects native COM without fallback; unset, empty, `native` or `com` select native COM.
+/// The second value is `false` for an unrecognized setting, which also selects native COM.
 #[must_use]
 pub fn parse_uia_backend(raw: Option<&str>) -> (UiaBackend, bool) {
     let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
@@ -366,6 +474,7 @@ pub fn parse_uia_backend(raw: Option<&str>) -> (UiaBackend, bool) {
     match value.to_ascii_lowercase().as_str() {
         "powershell" | "ps" => (UiaBackend::PowerShell, true),
         "native" | "com" => (UiaBackend::NativeCom, true),
+        "native-strict" | "strict" => (UiaBackend::NativeStrict, true),
         _ => (UiaBackend::NativeCom, false),
     }
 }
@@ -514,25 +623,45 @@ mod tests {
             process_name_from_image_path("/usr/bin/chromium"),
             "chromium"
         );
-        let names = [
-            Some("explorer".to_owned()),
-            Some("msedge".to_owned()),
-            None,
-            Some("chrome".to_owned()),
-            Some("chrome".to_owned()),
+        let c = |name: Option<&str>, pid: i32, is_window: bool| WindowCandidate {
+            process_name: name.map(str::to_owned),
+            pid,
+            is_window,
+        };
+        let candidates = [
+            c(Some("explorer"), 1, true),
+            c(Some("msedge"), 5, true),
+            c(None, 2, true),
+            c(Some("chromium"), 9, true),
+            c(Some("chrome"), 40, false), // a chrome popup listed first
+            c(Some("chrome"), 40, true),
+            c(Some("chrome"), 30, false),
         ];
-        assert_eq!(pick_browser_window(&names), Some(3));
-        assert_eq!(pick_browser_window(&names[..3]), Some(1));
-        assert_eq!(pick_browser_window(&[Some("code".to_owned())]), None);
+        // chrome beats chromium and msedge; lowest pid wins even if only a popup.
+        assert_eq!(pick_browser_window(&candidates), Some(6));
+        // Within one process, a Window beats a popup listed before it.
+        assert_eq!(pick_browser_window(&candidates[..6]), Some(5));
+        // chromium before msedge (alphabetical, like Get-Process).
+        assert_eq!(pick_browser_window(&candidates[..4]), Some(3));
+        assert_eq!(pick_browser_window(&candidates[..3]), Some(1));
+        assert_eq!(pick_browser_window(&[c(Some("code"), 1, true)]), None);
     }
 
     /// Tree used by the walk tests: node `n` has the children listed at index `n`.
-    fn walk(tree: &[Vec<usize>], limit: usize, skip: Option<usize>) -> (Vec<usize>, bool) {
+    fn walk(
+        tree: &[Vec<usize>],
+        limit: usize,
+        skip: Option<usize>,
+        stop: Option<usize>,
+    ) -> (Vec<usize>, bool) {
         bfs_limited(0usize, limit, |n| {
             if Some(n) == skip {
-                return None;
+                return Visit::Skip;
             }
-            Some((n, tree.get(n).cloned().unwrap_or_default()))
+            if Some(n) == stop {
+                return Visit::Stop;
+            }
+            Visit::Node(n, tree.get(n).cloned().unwrap_or_default())
         })
     }
 
@@ -540,39 +669,94 @@ mod tests {
     fn bfs_walk_matches_powershell_truncation() {
         // 0 -> [1, 2], 1 -> [3, 4], 2 -> [5]
         let tree = vec![vec![1, 2], vec![3, 4], vec![5], vec![], vec![], vec![]];
-        assert_eq!(walk(&tree, 100, None), (vec![0, 1, 2, 3, 4, 5], false));
-        assert_eq!(walk(&tree, 6, None), (vec![0, 1, 2, 3, 4, 5], false));
+        assert_eq!(
+            walk(&tree, 100, None, None),
+            (vec![0, 1, 2, 3, 4, 5], false)
+        );
+        assert_eq!(walk(&tree, 6, None, None), (vec![0, 1, 2, 3, 4, 5], false));
         // At 3, node 1's children no longer fit after 0, 1, 2 are taken or queued.
-        assert_eq!(walk(&tree, 3, None), (vec![0, 1, 2], true));
-        assert_eq!(walk(&tree, 1, None), (vec![0], true));
+        assert_eq!(walk(&tree, 3, None, None), (vec![0, 1, 2], true));
+        assert_eq!(walk(&tree, 1, None, None), (vec![0], true));
         // A failing node is dropped together with its subtree.
-        assert_eq!(walk(&tree, 100, Some(1)), (vec![0, 2, 5], false));
+        assert_eq!(walk(&tree, 100, Some(1), None), (vec![0, 2, 5], false));
+        // A deadline stop keeps what was read and marks the walk truncated.
+        assert_eq!(walk(&tree, 100, None, Some(3)), (vec![0, 1, 2], true));
     }
 
     #[test]
     fn hresults_map_to_existing_error_codes() {
-        let stale = uia_error(UIA_E_ELEMENTNOTAVAILABLE, "tree snapshot", " gone ", 10);
+        let stale = uia_error(
+            classify_hresult(UIA_E_ELEMENTNOTAVAILABLE),
+            UIA_E_ELEMENTNOTAVAILABLE,
+            "tree snapshot",
+            " gone ",
+            10,
+        );
         assert!(matches!(
             &stale,
             WayboundError::Transient { reason, .. }
                 if reason.contains("HRESULT 0x80040201") && reason.contains("(gone)")
         ));
         assert!(matches!(
-            uia_error(UIA_E_TIMEOUT, "x", "", 10_000),
+            uia_error(
+                classify_hresult(UIA_E_TIMEOUT),
+                UIA_E_TIMEOUT,
+                "x",
+                "",
+                10_000
+            ),
             WayboundError::Timeout {
                 timeout_ms: 10_000,
                 ..
             }
         ));
-        assert_eq!(
-            classify_hresult(RPC_S_SERVER_UNAVAILABLE),
-            HresultClass::Stale
-        );
-        assert_eq!(classify_hresult(0x8000_4005), HresultClass::Other);
+        for code in [
+            RPC_S_SERVER_UNAVAILABLE,
+            RPC_S_CALL_FAILED,
+            RPC_E_DISCONNECTED,
+            RPC_E_SERVER_DIED,
+            RPC_E_SERVER_DIED_DNE,
+            CO_E_OBJNOTCONNECTED,
+        ] {
+            assert_eq!(classify_hresult(code), HresultClass::Stale, "{code:08X}");
+        }
+        assert_eq!(classify_hresult(E_FAIL), HresultClass::Other);
+        assert_eq!(classify_tree_hresult(E_FAIL), HresultClass::Stale);
+        assert_eq!(classify_tree_hresult(UIA_E_TIMEOUT), HresultClass::Timeout);
         assert!(matches!(
-            uia_error(0x8000_4005, "x", "", 1),
+            uia_error(classify_hresult(E_FAIL), E_FAIL, "x", "", 1),
             WayboundError::BackendUnavailable { .. }
         ));
+    }
+
+    #[test]
+    fn abandoned_worker_count_never_leaks() {
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+        use worker_life::{ABANDONED, EXITED, LIVE, abandon, exited};
+
+        // Abandoned, then exits: counted, then un-counted.
+        let (life, count) = (AtomicU8::new(LIVE), AtomicUsize::new(0));
+        assert!(abandon(&life, &count));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(!abandon(&life, &count)); // a second caller does not double count
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        exited(&life, &count);
+        assert_eq!(
+            (life.load(Ordering::SeqCst), count.load(Ordering::SeqCst)),
+            (EXITED, 0)
+        );
+
+        // Exits first (e.g. init failed after the caller's wait), then a late abandon.
+        let (life, count) = (AtomicU8::new(LIVE), AtomicUsize::new(0));
+        exited(&life, &count);
+        assert!(!abandon(&life, &count));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+
+        // Live worker that exits normally is never counted.
+        let (life, count) = (AtomicU8::new(LIVE), AtomicUsize::new(0));
+        exited(&life, &count);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_ne!(life.load(Ordering::SeqCst), ABANDONED);
     }
 
     #[test]
@@ -594,6 +778,10 @@ mod tests {
         assert_eq!(
             parse_uia_backend(Some("bogus")),
             (UiaBackend::NativeCom, false)
+        );
+        assert_eq!(
+            parse_uia_backend(Some("Native-Strict")),
+            (UiaBackend::NativeStrict, true)
         );
         assert_eq!(UiaBackend::PowerShell.as_str(), "powershell");
     }

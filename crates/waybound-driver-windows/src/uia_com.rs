@@ -4,36 +4,46 @@
 //!
 //! All COM objects live on one dedicated worker thread that joins the multithreaded apartment
 //! (`CoInitializeEx(COINIT_MULTITHREADED)`). UIA client objects need no message pump in the MTA,
-//! and keeping them on one thread means no interface pointer ever crosses threads. Callers send
-//! a [`Job`] over a channel and wait at most [`UIA_QUERY_TIMEOUT_MS`] for the reply, so the
-//! daemon never blocks longer than the PowerShell backend did.
+//! and keeping them on one thread means no interface pointer ever crosses threads and the
+//! process only ever has one `CUIAutomation` object. Callers send a [`Job`] over a channel and
+//! wait at most [`UIA_QUERY_TIMEOUT_MS`] for the reply, so the daemon never blocks longer than
+//! the PowerShell backend did.
 //!
-//! Two layers bound a hung provider:
+//! Three layers bound a hung provider:
 //! 1. `IUIAutomation2::SetConnectionTimeout` / `SetTransactionTimeout` make each cross-process
 //!    call fail with `UIA_E_TIMEOUT` instead of blocking.
-//! 2. The caller's channel wait. When it expires the caller returns
+//! 2. Every job carries the caller's deadline. The worker skips jobs whose caller has already
+//!    given up, and the level-by-level fallback walk stops at the deadline.
+//! 3. The caller's channel wait. When it expires the caller returns
 //!    [`WayboundError::Timeout`] (error code `timeout`, as before) and abandons the worker: the
-//!    next request starts a fresh one, and the abandoned thread exits as soon as its current
-//!    call returns. At most [`MAX_ABANDONED_WORKERS`] abandoned workers may be outstanding.
+//!    next request starts a fresh one, and the abandoned thread exits once its current call
+//!    returns (it skips any queued job whose deadline has passed). At most
+//!    [`MAX_ABANDONED_WORKERS`] abandoned workers may be outstanding.
+//!
+//! Starting a worker never holds the slot lock: the slot goes to `Starting`, and concurrent
+//! callers wait on a condition variable bounded by their own deadline.
 //!
 //! # Snapshot cost
 //!
-//! A snapshot is a fixed number of cross-process calls, independent of tree size:
-//! `FindFirst` (window by pid) or one `FindAllBuildCache` over top-level windows, one
-//! `FindAllBuildCache` for the window's `Edit`/`Document` descendants (address bar and web
-//! root), and one `BuildUpdatedCache` with `TreeScope_Subtree` over the control view of the web
-//! root. Everything else reads the local cache.
+//! With a target pid, a snapshot is three cross-process calls regardless of tree size:
+//! `FindFirst` (top-level window of the pid), one `FindAllBuildCache` for the window's
+//! `Edit`/`Document` descendants (address bar and web root), and one `BuildUpdatedCache` with
+//! `TreeScope_Subtree` over the control view of the web root. Without a pid, the first call is
+//! a `FindAllBuildCache` over top-level windows plus one `OpenProcess` /
+//! `QueryFullProcessImageNameW` per top-level window. Everything else reads the local cache.
+//! `current_url` / `viewport_bounds` stop after the second call.
 //!
-//! The subtree is fetched whole and `max_nodes` is applied while walking the cache. UIA has no
-//! way to cap a subtree cache request, and fetching level by level costs one cross-process call
-//! per expanded node, which is what made the PowerShell walker slow. A very large page therefore
-//! costs one large call rather than being cut short on the provider side; the transaction
-//! timeout still bounds it.
+//! UIA cannot cap a subtree cache request, so `max_nodes` is applied while walking the cache.
+//! If the subtree call fails for any reason other than a stale element (a page too large for
+//! the transaction timeout, or `E_FAIL` mid-navigation), the snapshot falls back to a
+//! level-by-level walk (`TreeScope_Element | TreeScope_Children`, one call per visited node,
+//! at most `max_nodes` calls) that stops at the caller's deadline and reports `truncated`,
+//! like the PowerShell walker did.
 
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use waybound_core::{Result, WayboundError};
@@ -52,60 +62,109 @@ use windows::Win32::UI::Accessibility::{
     AutomationElementMode_None, CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2,
     IUIAutomationCacheRequest, IUIAutomationCondition, IUIAutomationElement,
     IUIAutomationElementArray, TreeScope, TreeScope_Children, TreeScope_Descendants,
-    TreeScope_Subtree, UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
-    UIA_DocumentControlTypeId, UIA_EditControlTypeId,
+    TreeScope_Element, TreeScope_Subtree, UIA_BoundingRectanglePropertyId,
+    UIA_ControlTypePropertyId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
     UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_HasKeyboardFocusPropertyId,
     UIA_IsEnabledPropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
     UIA_IsSelectionItemPatternAvailablePropertyId, UIA_IsTogglePatternAvailablePropertyId,
     UIA_IsValuePatternAvailablePropertyId, UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
     UIA_PROPERTY_ID, UIA_ProcessIdPropertyId, UIA_RuntimeIdPropertyId,
     UIA_SelectionItemIsSelectedPropertyId, UIA_ToggleToggleStatePropertyId,
-    UIA_ValueValuePropertyId,
+    UIA_ValueValuePropertyId, UIA_WindowControlTypeId,
 };
 use windows::core::{Interface, Owned, PWSTR};
 
 use crate::uia::{RawBounds, RawUiaNode, RawUiaSnapshot, UIA_QUERY_TIMEOUT_MS};
 use crate::uia_model::{
-    self, bfs_limited, control_type, control_type_programmatic_name, is_address_bar_candidate,
-    pick_browser_window, probes_expand_state, probes_selection_state, probes_toggle_state,
-    process_name_from_image_path, rect_to_xywh, runtime_id_to_string, select_web_root,
+    self, HresultClass, Visit, WindowCandidate, bfs_limited, control_type,
+    control_type_programmatic_name, is_address_bar_candidate, pick_browser_window,
+    probes_expand_state, probes_selection_state, probes_toggle_state, process_name_from_image_path,
+    rect_to_xywh, runtime_id_to_string, select_web_root, worker_life,
 };
 
 /// UIA connection timeout: how long UIA waits for a provider to accept a call.
 const UIA_CONNECTION_TIMEOUT_MS: u32 = 2_000;
-/// UIA transaction timeout: how long one cross-process call may run. Kept below
-/// [`UIA_QUERY_TIMEOUT_MS`] so a hung provider normally surfaces as `UIA_E_TIMEOUT` from the
-/// worker before the caller gives up on the channel.
-const UIA_TRANSACTION_TIMEOUT_MS: u32 = 8_000;
+/// UIA transaction timeout: how long one cross-process call may run. Kept well below
+/// [`UIA_QUERY_TIMEOUT_MS`] so a too-large subtree call still leaves time for the bounded
+/// level-by-level fallback before the caller gives up.
+const UIA_TRANSACTION_TIMEOUT_MS: u32 = 5_000;
 /// How many abandoned (hung) workers may exist before requests fail fast.
 const MAX_ABANDONED_WORKERS: usize = 4;
+/// Attempts at creating the automation object, conditions and cache requests on a new worker.
+const SESSION_INIT_ATTEMPTS: u32 = 3;
+/// How often an empty tree from a window that exists is re-read (Chrome builds its
+/// accessibility tree lazily, on the first UIA query) and the pause between reads.
+const EMPTY_TREE_RETRIES: u32 = 4;
+const EMPTY_TREE_RETRY_PAUSE: Duration = Duration::from_millis(150);
+/// Time kept back from the caller's deadline when walking level by level.
+const WALK_DEADLINE_MARGIN: Duration = Duration::from_millis(500);
 
 /// Outcome of a native query.
 pub enum NativeOutcome {
     /// The native backend answered (successfully or with a mapped error).
     Done(Result<RawUiaSnapshot>),
     /// COM or `CUIAutomation` could not be initialized; the reason includes the `HRESULT`.
-    /// Callers fall back to PowerShell.
     Unavailable(String),
 }
 
+/// What a job asks the worker for.
+#[derive(Debug, Clone, Copy)]
+enum JobKind {
+    /// Full snapshot capped at `limit` nodes.
+    Snapshot { pid: Option<i32>, limit: usize },
+    /// Address-bar URL and viewport only (no node walk).
+    PageInfo { pid: Option<i32> },
+    /// The desktop root element, read through the level request (tests only).
+    #[cfg(test)]
+    DesktopProbe,
+}
+
 struct Job {
-    pid: Option<i32>,
-    limit: usize,
+    kind: JobKind,
+    deadline: Instant,
     reply: mpsc::SyncSender<Result<RawUiaSnapshot>>,
 }
 
-struct WorkerSlot {
+#[derive(Clone)]
+struct WorkerHandle {
     generation: u64,
     tx: mpsc::Sender<Job>,
-    abandoned: Arc<AtomicBool>,
+    life: Arc<AtomicU8>,
 }
 
-static WORKER: Mutex<Option<WorkerSlot>> = Mutex::new(None);
+enum SlotState {
+    Empty,
+    Starting,
+    Ready(WorkerHandle),
+}
+
+struct Slot {
+    state: Mutex<SlotState>,
+    changed: Condvar,
+}
+
+static SLOT: Slot = Slot {
+    state: Mutex::new(SlotState::Empty),
+    changed: Condvar::new(),
+};
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static ABANDONED_WORKERS: AtomicUsize = AtomicUsize::new(0);
-/// Set once COM initialization has failed; every later query falls back to PowerShell.
+/// Set once COM initialization has failed on every attempt; later queries report
+/// [`NativeOutcome::Unavailable`] without starting another worker.
 static INIT_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+/// Set after the first successful native snapshot has been logged at `info`.
+static FIRST_SNAPSHOT_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn lock_slot() -> MutexGuard<'static, SlotState> {
+    SLOT.state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn init_failure() -> Option<String> {
+    INIT_FAILURE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
 
 fn timeout_error(context: &str) -> WayboundError {
     WayboundError::Timeout {
@@ -114,55 +173,53 @@ fn timeout_error(context: &str) -> WayboundError {
     }
 }
 
-/// Runs one snapshot on the COM worker, starting the worker if needed.
+/// Runs one snapshot capped at `limit` nodes on the COM worker.
 pub fn query(pid: Option<i32>, limit: usize) -> NativeOutcome {
-    let init_failure = INIT_FAILURE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
-    if let Some(reason) = init_failure {
-        return NativeOutcome::Unavailable(reason);
-    }
+    run_job(JobKind::Snapshot { pid, limit })
+}
 
+/// Reads only the address-bar URL and the viewport (no node walk) on the COM worker.
+pub fn query_page_info(pid: Option<i32>) -> NativeOutcome {
+    run_job(JobKind::PageInfo { pid })
+}
+
+fn run_job(kind: JobKind) -> NativeOutcome {
     let deadline = Instant::now() + Duration::from_millis(UIA_QUERY_TIMEOUT_MS);
-    let (generation, tx, abandoned) = match current_worker(deadline) {
-        Ok(slot) => slot,
+    let worker = match acquire_worker(deadline) {
+        Ok(worker) => worker,
         Err(WorkerStart::Unavailable(reason)) => return NativeOutcome::Unavailable(reason),
         Err(WorkerStart::Failed(err)) => return NativeOutcome::Done(Err(err)),
     };
 
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     let job = Job {
-        pid,
-        limit,
+        kind,
+        deadline,
         reply: reply_tx,
     };
-    if tx.send(job).is_err() {
-        // The worker exited (it only does so after a fatal error); start over next time.
-        forget_worker(generation, &abandoned, false);
+    if worker.tx.send(job).is_err() {
+        forget_worker(&worker, false);
         return NativeOutcome::Done(Err(WayboundError::BackendUnavailable {
             backend: "windows".to_owned(),
             reason: "Windows UIAutomation (native COM) worker thread exited".to_owned(),
         }));
     }
-    drop(tx);
 
-    let wait = deadline.saturating_duration_since(Instant::now());
-    match reply_rx.recv_timeout(wait) {
+    match reply_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(result) => NativeOutcome::Done(result),
         Err(RecvTimeoutError::Timeout) => {
             tracing::warn!(
-                generation,
+                generation = worker.generation,
                 timeout_ms = UIA_QUERY_TIMEOUT_MS,
                 "Windows UIAutomation (native COM) query timed out; abandoning worker thread"
             );
-            forget_worker(generation, &abandoned, true);
+            forget_worker(&worker, true);
             NativeOutcome::Done(Err(timeout_error(
                 "Windows UIAutomation (native COM) query",
             )))
         }
         Err(RecvTimeoutError::Disconnected) => {
-            forget_worker(generation, &abandoned, false);
+            forget_worker(&worker, false);
             NativeOutcome::Done(Err(WayboundError::BackendUnavailable {
                 backend: "windows".to_owned(),
                 reason: "Windows UIAutomation (native COM) worker dropped the request".to_owned(),
@@ -176,32 +233,65 @@ enum WorkerStart {
     Failed(WayboundError),
 }
 
-fn current_worker(
-    deadline: Instant,
-) -> std::result::Result<(u64, mpsc::Sender<Job>, Arc<AtomicBool>), WorkerStart> {
-    let mut slot = WORKER.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(existing) = slot.as_ref() {
-        return Ok((
-            existing.generation,
-            existing.tx.clone(),
-            Arc::clone(&existing.abandoned),
-        ));
+/// Returns the live worker, starting one if needed. Never holds the slot lock while a worker
+/// initializes; callers that find one starting wait (bounded by `deadline`) for the outcome.
+fn acquire_worker(deadline: Instant) -> std::result::Result<WorkerHandle, WorkerStart> {
+    let mut state = lock_slot();
+    loop {
+        if let Some(reason) = init_failure() {
+            return Err(WorkerStart::Unavailable(reason));
+        }
+        match &*state {
+            SlotState::Ready(worker) => return Ok(worker.clone()),
+            SlotState::Starting => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(WorkerStart::Failed(timeout_error(
+                        "Windows UIAutomation (native COM) waiting for the worker to start",
+                    )));
+                }
+                state = SLOT
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            SlotState::Empty => break,
+        }
     }
-
+    if Instant::now() >= deadline {
+        return Err(WorkerStart::Failed(timeout_error(
+            "Windows UIAutomation (native COM) query",
+        )));
+    }
     if ABANDONED_WORKERS.load(Ordering::SeqCst) >= MAX_ABANDONED_WORKERS {
         return Err(WorkerStart::Failed(timeout_error(
             "Windows UIAutomation (native COM): earlier queries are still hung in the provider",
         )));
     }
+    *state = SlotState::Starting;
+    drop(state);
 
+    let started = start_worker(deadline);
+
+    let mut state = lock_slot();
+    *state = started
+        .as_ref()
+        .map_or(SlotState::Empty, |worker| SlotState::Ready(worker.clone()));
+    drop(state);
+    SLOT.changed.notify_all();
+    started
+}
+
+fn start_worker(deadline: Instant) -> std::result::Result<WorkerHandle, WorkerStart> {
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst);
-    let abandoned = Arc::new(AtomicBool::new(false));
+    let life = Arc::new(AtomicU8::new(worker_life::LIVE));
     let (tx, rx) = mpsc::channel::<Job>();
     let (init_tx, init_rx) = mpsc::sync_channel::<std::result::Result<&'static str, String>>(1);
-    let worker_abandoned = Arc::clone(&abandoned);
+    let worker_life_flag = Arc::clone(&life);
     let spawned = std::thread::Builder::new()
         .name(format!("waybound-uia-{generation}"))
-        .spawn(move || worker_main(&rx, &init_tx, &worker_abandoned));
+        .spawn(move || worker_main(&rx, &init_tx, &worker_life_flag));
     if let Err(err) = spawned {
         return Err(WorkerStart::Failed(WayboundError::Io(err)));
     }
@@ -214,71 +304,59 @@ fn current_worker(
                 generation,
                 "Windows UIAutomation backend ready (in-process COM, MTA worker thread)"
             );
+            Ok(WorkerHandle {
+                generation,
+                tx,
+                life,
+            })
         }
         Ok(Err(reason)) => {
-            tracing::warn!(
-                %reason,
-                "Windows UIAutomation COM initialization failed; falling back to PowerShell"
-            );
+            tracing::warn!(%reason, "Windows UIAutomation COM initialization failed");
             *INIT_FAILURE.lock().unwrap_or_else(PoisonError::into_inner) = Some(reason.clone());
-            return Err(WorkerStart::Unavailable(reason));
+            Err(WorkerStart::Unavailable(reason))
         }
         Err(_) => {
-            // The worker is stuck in CoCreateInstance; leave it to exit when the channel drops.
-            abandoned.store(true, Ordering::SeqCst);
-            let _ = ABANDONED_WORKERS.fetch_add(1, Ordering::SeqCst);
-            return Err(WorkerStart::Failed(timeout_error(
+            // Stuck in CoCreateInstance; it exits once it notices `tx` is gone.
+            let _ = worker_life::abandon(&life, &ABANDONED_WORKERS);
+            Err(WorkerStart::Failed(timeout_error(
                 "Windows UIAutomation (native COM) initialization",
-            )));
+            )))
         }
-    }
-
-    *slot = Some(WorkerSlot {
-        generation,
-        tx: tx.clone(),
-        abandoned: Arc::clone(&abandoned),
-    });
-    drop(slot);
-    Ok((generation, tx, abandoned))
-}
-
-/// Drops the worker `generation` from the slot so the next request starts a fresh one.
-/// With `hung`, the worker is counted as abandoned until its thread exits.
-fn forget_worker(generation: u64, abandoned: &AtomicBool, hung: bool) {
-    let mut slot = WORKER.lock().unwrap_or_else(PoisonError::into_inner);
-    if slot.as_ref().is_some_and(|s| s.generation == generation) {
-        if hung && !abandoned.swap(true, Ordering::SeqCst) {
-            let _ = ABANDONED_WORKERS.fetch_add(1, Ordering::SeqCst);
-        }
-        *slot = None;
     }
 }
 
-/// Decrements [`ABANDONED_WORKERS`] when an abandoned worker thread finally exits, on every
-/// return path of [`worker_main`].
-struct AbandonedOnExit<'a>(&'a AtomicBool);
+/// Drops `worker` from the slot so the next request starts a fresh one. With `hung`, the
+/// worker is counted as abandoned until its thread exits.
+fn forget_worker(worker: &WorkerHandle, hung: bool) {
+    if hung {
+        let _ = worker_life::abandon(&worker.life, &ABANDONED_WORKERS);
+    }
+    let mut state = lock_slot();
+    if matches!(&*state, SlotState::Ready(current) if current.generation == worker.generation) {
+        *state = SlotState::Empty;
+        drop(state);
+        SLOT.changed.notify_all();
+    }
+}
 
-impl Drop for AbandonedOnExit<'_> {
+/// Records the worker thread's exit on every return path of [`worker_main`].
+struct ExitGuard<'a>(&'a AtomicU8);
+
+impl Drop for ExitGuard<'_> {
     fn drop(&mut self) {
-        if self.0.load(Ordering::SeqCst) {
-            let _ = ABANDONED_WORKERS.fetch_sub(1, Ordering::SeqCst);
-        }
+        worker_life::exited(self.0, &ABANDONED_WORKERS);
     }
 }
-
-/// Set after the first successful native snapshot has been logged at `info`.
-static FIRST_SNAPSHOT_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn worker_main(
     rx: &mpsc::Receiver<Job>,
     init_tx: &mpsc::SyncSender<std::result::Result<&'static str, String>>,
-    abandoned: &AtomicBool,
+    life: &AtomicU8,
 ) {
-    let _exit = AbandonedOnExit(abandoned);
-    // Declared before every COM object so it is dropped after them: all of them must be
-    // released before `CoUninitialize` runs. so it is dropped last: every COM object below must be released before
-    // `CoUninitialize` runs.
-    let apartment = match ComApartment::init_mta() {
+    let _exit = ExitGuard(life);
+    // Declared before every COM object, so it is dropped after them: all of them must be
+    // released before `CoUninitialize` runs.
+    let _apartment = match ComApartment::init_mta() {
         Ok(apartment) => apartment,
         Err(err) => {
             let _ = init_tx.send(Err(format!(
@@ -288,11 +366,10 @@ fn worker_main(
             return;
         }
     };
-    let session = match UiaSession::new() {
+    let session = match UiaSession::new_with_retry() {
         Ok(session) => session,
         Err(reason) => {
             let _ = init_tx.send(Err(reason));
-            drop(apartment);
             return;
         }
     };
@@ -301,41 +378,50 @@ fn worker_main(
     }
 
     while let Ok(job) = rx.recv() {
+        if Instant::now() >= job.deadline {
+            // Its caller already timed out and returned; nobody reads the reply.
+            continue;
+        }
         let started = Instant::now();
-        let result = session.snapshot_with_retry(job.pid, job.limit);
-        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        match &result {
-            Ok(raw) if !FIRST_SNAPSHOT_LOGGED.swap(true, Ordering::Relaxed) => tracing::info!(
+        let result = session.run(job.kind, job.deadline);
+        log_result(job.kind, &result, started);
+        // The caller may have timed out meanwhile; that is fine.
+        let _ = job.reply.send(result);
+    }
+}
+
+fn log_result(kind: JobKind, result: &Result<RawUiaSnapshot>, started: Instant) {
+    let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    match result {
+        Ok(raw)
+            if matches!(kind, JobKind::Snapshot { .. })
+                && !FIRST_SNAPSHOT_LOGGED.swap(true, Ordering::Relaxed) =>
+        {
+            tracing::info!(
                 backend = "native-com",
-                pid = ?job.pid,
-                limit = job.limit,
+                ?kind,
                 nodes = raw.nodes.len(),
                 truncated = raw.truncated,
                 elapsed_us,
                 "first Windows UIAutomation snapshot"
-            ),
-            Ok(raw) => tracing::debug!(
-                backend = "native-com",
-                pid = ?job.pid,
-                limit = job.limit,
-                nodes = raw.nodes.len(),
-                truncated = raw.truncated,
-                elapsed_us,
-                "Windows UIAutomation snapshot"
-            ),
-            Err(err) => tracing::debug!(
-                backend = "native-com",
-                pid = ?job.pid,
-                error = %err,
-                "Windows UIAutomation snapshot failed"
-            ),
+            );
         }
-        // The caller may have timed out and gone; that is fine.
-        let _ = job.reply.send(result);
+        Ok(raw) => tracing::debug!(
+            backend = "native-com",
+            ?kind,
+            nodes = raw.nodes.len(),
+            truncated = raw.truncated,
+            elapsed_us,
+            "Windows UIAutomation query"
+        ),
+        Err(err) => tracing::debug!(
+            backend = "native-com",
+            ?kind,
+            error = %err,
+            elapsed_us,
+            "Windows UIAutomation query failed"
+        ),
     }
-
-    drop(session);
-    drop(apartment);
 }
 
 /// Formats a COM error as `HRESULT 0x........ (message)`.
@@ -353,13 +439,52 @@ const fn is_null_result(err: &windows::core::Error) -> bool {
     err.code().0 == 0
 }
 
-fn to_waybound(err: &windows::core::Error, operation: &str) -> WayboundError {
-    uia_model::uia_error(
-        err.code().0.cast_unsigned(),
-        operation,
-        &err.message(),
-        UIA_QUERY_TIMEOUT_MS,
-    )
+const fn hresult(err: &windows::core::Error) -> u32 {
+    err.code().0.cast_unsigned()
+}
+
+/// A failed COM call together with the operation it belonged to.
+struct CallError {
+    err: windows::core::Error,
+    operation: &'static str,
+    /// The call read the web content tree, where `E_FAIL` means a document mid-navigation.
+    tree: bool,
+}
+
+impl CallError {
+    const fn new(err: windows::core::Error, operation: &'static str) -> Self {
+        Self {
+            err,
+            operation,
+            tree: false,
+        }
+    }
+
+    const fn tree(err: windows::core::Error, operation: &'static str) -> Self {
+        Self {
+            err,
+            operation,
+            tree: true,
+        }
+    }
+
+    const fn class(&self) -> HresultClass {
+        if self.tree {
+            uia_model::classify_tree_hresult(hresult(&self.err))
+        } else {
+            uia_model::classify_hresult(hresult(&self.err))
+        }
+    }
+
+    fn into_waybound(self) -> WayboundError {
+        uia_model::uia_error(
+            self.class(),
+            hresult(&self.err),
+            self.operation,
+            &self.err.message(),
+            UIA_QUERY_TIMEOUT_MS,
+        )
+    }
 }
 
 /// Membership of the current thread in the COM multithreaded apartment. Not `Send`: the
@@ -660,12 +785,14 @@ struct UiaSession {
     flavor: &'static str,
     edit_or_document: IUIAutomationCondition,
     true_condition: IUIAutomationCondition,
-    /// Element-scoped cache for top-level windows: process id.
+    /// Element-scoped cache for top-level windows: process id and control type.
     window_request: IUIAutomationCacheRequest,
     /// Element-scoped cache for `Edit`/`Document` descendants: type, name, bounds, value.
     locate_request: IUIAutomationCacheRequest,
     /// Subtree cache over the control view (cache-only elements) for the node walk.
     tree_request: IUIAutomationCacheRequest,
+    /// Element + children cache (full elements) for the level-by-level fallback walk.
+    level_request: IUIAutomationCacheRequest,
 }
 
 /// Properties cached for every node of the walk.
@@ -687,7 +814,86 @@ const TREE_PROPERTIES: [UIA_PROPERTY_ID; 15] = [
     UIA_ExpandCollapseExpandCollapseStatePropertyId,
 ];
 
+/// Result of one snapshot attempt: the raw snapshot, and whether a target window was found.
+struct Attempt {
+    raw: RawUiaSnapshot,
+    window_found: bool,
+    /// Why the tree is empty, when it is (logged once at `info`).
+    empty_reason: Option<String>,
+    /// Microseconds spent finding the window, locating address bar + web root, and reading
+    /// the tree (logged at `debug`, to show where a snapshot's time goes).
+    phase_us: [u64; 3],
+}
+
+fn micros_since(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Set after the first empty snapshot has been explained at `info`.
+static EMPTY_EXPLAINED: AtomicBool = AtomicBool::new(false);
+
+/// Tracks the address bar URL and viewport seen during a walk, mirroring the PowerShell
+/// walker's in-walk fallbacks.
+struct PageParts {
+    current_url: Option<String>,
+    viewport: Option<RawBounds>,
+    /// The last per-node read failure, kept to explain an empty tree.
+    last_skip: Option<String>,
+}
+
+impl PageParts {
+    fn observe(&mut self, node: &RawUiaNode, ct: i32) {
+        if self.current_url.is_none()
+            && ct == control_type::EDIT
+            && let Some(value) = node.value.as_deref()
+            && is_address_bar_candidate(node.name.as_deref(), value)
+        {
+            self.current_url = Some(value.to_owned());
+        }
+        if self.viewport.is_none()
+            && ct == control_type::DOCUMENT
+            && node.width > 0.0
+            && node.height > 0.0
+        {
+            self.viewport = Some(RawBounds {
+                x: node.x,
+                y: node.y,
+                width: node.width,
+                height: node.height,
+            });
+        }
+    }
+}
+
 impl UiaSession {
+    /// Creates the session, retrying a few times: the first CI run saw one transient
+    /// `E_FAIL` from condition creation (see the module tests), and a permanent fallback for
+    /// the daemon's lifetime is too high a price for one bad attempt.
+    fn new_with_retry() -> std::result::Result<Self, String> {
+        let mut failures = Vec::new();
+        for attempt in 1..=SESSION_INIT_ATTEMPTS {
+            match Self::new() {
+                Ok(session) => {
+                    if attempt > 1 {
+                        tracing::warn!(
+                            attempt,
+                            earlier = %failures.join("; "),
+                            "Windows UIAutomation session created after retrying"
+                        );
+                    }
+                    return Ok(session);
+                }
+                Err(reason) => {
+                    failures.push(format!("attempt {attempt}: {reason}"));
+                    if attempt < SESSION_INIT_ATTEMPTS {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        }
+        Err(failures.join("; "))
+    }
+
     fn new() -> std::result::Result<Self, String> {
         let (automation, flavor) = Self::create_automation()?;
         let fail = |what: &str, err: &windows::core::Error| format!("{what}: {}", describe(err));
@@ -715,27 +921,38 @@ impl UiaSession {
 
         let edit = OwnedVariant::from_i32(UIA_EditControlTypeId.0);
         let document = OwnedVariant::from_i32(UIA_DocumentControlTypeId.0);
-        // SAFETY: COM factory methods on a live interface pointer owned by this thread. The
-        // VARIANT arguments are borrowed for the call only (the callee copies `[in]` VARIANTs);
-        // each result is a new owned reference released on drop.
-        let conditions = unsafe {
-            automation
-                .CreatePropertyCondition(UIA_ControlTypePropertyId, &edit.0)
-                .and_then(|edit_cond| {
-                    let doc_cond = automation
-                        .CreatePropertyCondition(UIA_ControlTypePropertyId, &document.0)?;
-                    automation.CreateOrCondition(&edit_cond, &doc_cond)
-                })
-                .and_then(|or| Ok((or, automation.CreateTrueCondition()?)))
-        };
-        let (edit_or_document, true_condition) =
-            conditions.map_err(|err| fail("creating UIAutomation conditions", &err))?;
+        // SAFETY: COM factory method on a live interface pointer owned by this thread; the
+        // `VT_I4` VARIANT is borrowed for the call only (the callee copies `[in]` VARIANTs) and
+        // the result is a new owned reference released on drop.
+        let edit_cond =
+            unsafe { automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &edit.0) }
+                .map_err(|err| fail("CreatePropertyCondition(ControlType = Edit)", &err))?;
+        // SAFETY: same contract as the Edit condition above, with the Document VARIANT.
+        let doc_cond =
+            unsafe { automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &document.0) }
+                .map_err(|err| fail("CreatePropertyCondition(ControlType = Document)", &err))?;
+        // SAFETY: COM factory method on a live interface pointer; both conditions are live
+        // borrowed references, the result is a new owned reference.
+        let edit_or_document = unsafe { automation.CreateOrCondition(&edit_cond, &doc_cond) }
+            .map_err(|err| fail("CreateOrCondition", &err))?;
+        // SAFETY: COM factory method on a live interface pointer without arguments; the result is
+        // a new owned reference.
+        let true_condition = unsafe { automation.CreateTrueCondition() }
+            .map_err(|err| fail("CreateTrueCondition", &err))?;
+        // SAFETY: COM method on a live interface pointer; returns an owned reference.
+        let control_view = unsafe { automation.ControlViewCondition() }
+            .map_err(|err| fail("ControlViewCondition", &err))?;
 
-        let window_request =
-            Self::cache_request(&automation, &[UIA_ProcessIdPropertyId], None, false)
-                .map_err(|err| fail("creating window cache request", &err))?;
-        let locate_request = Self::cache_request(
-            &automation,
+        let request = |properties: &[UIA_PROPERTY_ID], scope: TreeScope, cache_only: bool| {
+            Self::cache_request(&automation, &control_view, properties, scope, cache_only)
+        };
+        let window_request = request(
+            &[UIA_ProcessIdPropertyId, UIA_ControlTypePropertyId],
+            TreeScope_Element,
+            false,
+        )
+        .map_err(|err| fail("creating window cache request", &err))?;
+        let locate_request = request(
             &[
                 UIA_ControlTypePropertyId,
                 UIA_NamePropertyId,
@@ -743,13 +960,18 @@ impl UiaSession {
                 UIA_IsValuePatternAvailablePropertyId,
                 UIA_ValueValuePropertyId,
             ],
-            None,
+            TreeScope_Element,
             false,
         )
         .map_err(|err| fail("creating locate cache request", &err))?;
-        let tree_request =
-            Self::cache_request(&automation, &TREE_PROPERTIES, Some(TreeScope_Subtree), true)
-                .map_err(|err| fail("creating tree cache request", &err))?;
+        let tree_request = request(&TREE_PROPERTIES, TreeScope_Subtree, true)
+            .map_err(|err| fail("creating tree cache request", &err))?;
+        let level_request = request(
+            &TREE_PROPERTIES,
+            TreeScope(TreeScope_Element.0 | TreeScope_Children.0),
+            false,
+        )
+        .map_err(|err| fail("creating level cache request", &err))?;
 
         Ok(Self {
             automation,
@@ -759,6 +981,7 @@ impl UiaSession {
             window_request,
             locate_request,
             tree_request,
+            level_request,
         })
     }
 
@@ -787,23 +1010,24 @@ impl UiaSession {
         }
     }
 
+    /// Builds a cache request over the control view (set explicitly, matching the PowerShell
+    /// walker's `ControlViewWalker` and .NET's default cache request).
     fn cache_request(
         automation: &IUIAutomation,
+        control_view: &IUIAutomationCondition,
         properties: &[UIA_PROPERTY_ID],
-        scope: Option<TreeScope>,
+        scope: TreeScope,
         cache_only: bool,
     ) -> windows::core::Result<IUIAutomationCacheRequest> {
         // SAFETY: COM methods on live interface pointers owned by this thread, taking plain
-        // values. The default tree filter (the control view) is kept, matching the PowerShell
-        // walker's `ControlViewWalker` and .NET's default cache request.
+        // values or a borrowed live condition.
         unsafe {
             let request = automation.CreateCacheRequest()?;
             for &property in properties {
                 request.AddProperty(property)?;
             }
-            if let Some(scope) = scope {
-                request.SetTreeScope(scope)?;
-            }
+            request.SetTreeScope(scope)?;
+            request.SetTreeFilter(control_view)?;
             if cache_only {
                 request.SetAutomationElementMode(AutomationElementMode_None)?;
             }
@@ -811,86 +1035,266 @@ impl UiaSession {
         }
     }
 
-    /// Takes a snapshot, retrying once when an element went stale mid-query (navigation or a
-    /// tab switch), then mapping errors to [`WayboundError`].
-    fn snapshot_with_retry(&self, pid: Option<i32>, limit: usize) -> Result<RawUiaSnapshot> {
-        match self.snapshot(pid, limit) {
-            Ok(raw) => Ok(raw),
-            Err((err, _))
-                if uia_model::classify_hresult(err.code().0.cast_unsigned())
-                    == uia_model::HresultClass::Stale =>
-            {
-                tracing::debug!(error = %describe(&err), "stale UIAutomation element; retrying once");
-                self.snapshot(pid, limit)
-                    .map_err(|(err, operation)| to_waybound(&err, operation))
+    fn run(&self, kind: JobKind, deadline: Instant) -> Result<RawUiaSnapshot> {
+        match kind {
+            JobKind::Snapshot { pid, limit } => self.snapshot_with_retries(pid, limit, deadline),
+            JobKind::PageInfo { pid } => {
+                Self::retry_stale(|| self.page_info(pid)).map_err(CallError::into_waybound)
             }
-            Err((err, operation)) => Err(to_waybound(&err, operation)),
+            #[cfg(test)]
+            JobKind::DesktopProbe => self.desktop_probe().map_err(CallError::into_waybound),
         }
+    }
+
+    /// Runs `attempt`, and once more if it failed on a stale element (navigation or a tab
+    /// switch replaced it mid-query).
+    fn retry_stale<T>(
+        mut attempt: impl FnMut() -> std::result::Result<T, CallError>,
+    ) -> std::result::Result<T, CallError> {
+        match attempt() {
+            Err(err) if err.class() == HresultClass::Stale => {
+                tracing::debug!(
+                    error = %describe(&err.err),
+                    operation = err.operation,
+                    "stale UIAutomation element; retrying once"
+                );
+                attempt()
+            }
+            other => other,
+        }
+    }
+
+    /// Takes a snapshot with the stale-element retry, then re-reads an empty result up to
+    /// [`EMPTY_TREE_RETRIES`] times, [`EMPTY_TREE_RETRY_PAUSE`] apart, within the deadline.
+    ///
+    /// Chrome builds its accessibility tree lazily on the first UIA query, and the PowerShell
+    /// walker's ~300 ms start-up used to hide that: the first CI run of this backend returned
+    /// an empty tree right after launch where PowerShell returned 4 nodes. The cost is up to
+    /// ~600 ms for a snapshot whose window really is gone or empty.
+    fn snapshot_with_retries(
+        &self,
+        pid: Option<i32>,
+        limit: usize,
+        deadline: Instant,
+    ) -> Result<RawUiaSnapshot> {
+        let mut retries = 0;
+        loop {
+            let attempt = Self::retry_stale(|| self.snapshot(pid, limit, deadline))
+                .map_err(CallError::into_waybound)?;
+            tracing::debug!(
+                window_us = attempt.phase_us[0],
+                locate_us = attempt.phase_us[1],
+                tree_us = attempt.phase_us[2],
+                nodes = attempt.raw.nodes.len(),
+                "Windows UIAutomation snapshot phases"
+            );
+            let budget_left = deadline.saturating_duration_since(Instant::now());
+            // An existing window with an unreadable tree, or a configured pid whose window is
+            // not (yet) a top-level UIA element, is worth a few quick re-reads.
+            let worth_retrying =
+                attempt.raw.nodes.is_empty() && (attempt.window_found || pid.is_some());
+            if !worth_retrying
+                || retries >= EMPTY_TREE_RETRIES
+                || budget_left <= EMPTY_TREE_RETRY_PAUSE + WALK_DEADLINE_MARGIN
+            {
+                if let Some(reason) = attempt.empty_reason.as_deref() {
+                    if EMPTY_EXPLAINED.swap(true, Ordering::Relaxed) {
+                        tracing::debug!(retries, reason, "empty Windows UIAutomation tree");
+                    } else {
+                        tracing::info!(retries, reason, "empty Windows UIAutomation tree");
+                    }
+                } else if retries > 0 {
+                    tracing::info!(
+                        retries,
+                        nodes = attempt.raw.nodes.len(),
+                        "UIAutomation tree became readable after re-reading"
+                    );
+                }
+                return Ok(attempt.raw);
+            }
+            retries += 1;
+            std::thread::sleep(EMPTY_TREE_RETRY_PAUSE);
+        }
+    }
+
+    fn find_window(
+        &self,
+        pid: Option<i32>,
+    ) -> std::result::Result<Option<IUIAutomationElement>, CallError> {
+        // SAFETY: COM method on a live interface pointer; returns an owned reference.
+        let root = unsafe { self.automation.GetRootElement() }
+            .map_err(|err| CallError::new(err, "GetRootElement"))?;
+        pid.map_or_else(
+            || self.browser_window(&root),
+            |pid| self.window_for_pid(&root, pid),
+        )
+        .map_err(|err| CallError::new(err, "window lookup"))
+    }
+
+    fn page_info(&self, pid: Option<i32>) -> std::result::Result<RawUiaSnapshot, CallError> {
+        let Some(window) = self.find_window(pid)? else {
+            return Ok(RawUiaSnapshot::default());
+        };
+        let (current_url, _, viewport_bounds) = self.locate_chrome_parts(&window);
+        Ok(RawUiaSnapshot {
+            current_url,
+            viewport_bounds,
+            ..RawUiaSnapshot::default()
+        })
     }
 
     fn snapshot(
         &self,
         pid: Option<i32>,
         limit: usize,
-    ) -> std::result::Result<RawUiaSnapshot, (windows::core::Error, &'static str)> {
-        // SAFETY: COM method on a live interface pointer; returns an owned reference.
-        let root =
-            unsafe { self.automation.GetRootElement() }.map_err(|err| (err, "GetRootElement"))?;
-        let window = pid
-            .map_or_else(
-                || self.browser_window(&root),
-                |pid| self.window_for_pid(&root, pid),
-            )
-            .map_err(|err| (err, "window lookup"))?;
+        deadline: Instant,
+    ) -> std::result::Result<Attempt, CallError> {
+        let started = Instant::now();
+        let window = self.find_window(pid)?;
+        let window_us = micros_since(started);
         let Some(window) = window else {
-            return Ok(RawUiaSnapshot::default());
+            return Ok(Attempt {
+                raw: RawUiaSnapshot::default(),
+                window_found: false,
+                empty_reason: Some(format!("no top-level UIA element for pid {pid:?}")),
+                phase_us: [window_us, 0, 0],
+            });
         };
 
-        let (mut current_url, web_root, mut viewport) = self.locate_chrome_parts(&window);
+        let started = Instant::now();
+        let (current_url, web_root, viewport) = self.locate_chrome_parts(&window);
+        let locate_us = micros_since(started);
+        let base_is_document = web_root.is_some();
+        let started = Instant::now();
+        let mut parts = PageParts {
+            current_url,
+            viewport,
+            last_skip: None,
+        };
         let base = web_root.unwrap_or(window);
 
         // SAFETY: COM method on a live interface pointer with a live cache request; returns an
         // owned, cache-populated element.
-        let cached_root = unsafe { base.BuildUpdatedCache(&self.tree_request) }
-            .map_err(|err| (err, "tree snapshot (BuildUpdatedCache)"))?;
+        let (nodes, truncated) = match unsafe { base.BuildUpdatedCache(&self.tree_request) } {
+            Ok(cached_root) => Self::walk_cached(cached_root, limit, &mut parts),
+            Err(err) => {
+                let failed = CallError::tree(err, "tree snapshot (BuildUpdatedCache subtree)");
+                if failed.class() == HresultClass::Stale
+                    && hresult(&failed.err) != uia_model::E_FAIL
+                {
+                    return Err(failed);
+                }
+                tracing::info!(
+                    error = %describe(&failed.err),
+                    "UIAutomation subtree snapshot failed; walking level by level"
+                );
+                self.walk_levels(&base, limit, deadline, &mut parts)?
+            }
+        };
 
-        let (nodes, truncated) = bfs_limited(cached_root, limit, |element| {
+        let tree_us = micros_since(started);
+        let empty_reason = nodes.is_empty().then(|| {
+            format!(
+                "walk root ({}) unreadable: {}",
+                if base_is_document {
+                    "web document"
+                } else {
+                    "browser window"
+                },
+                parts.last_skip.as_deref().unwrap_or("no error recorded")
+            )
+        });
+        Ok(Attempt {
+            raw: RawUiaSnapshot {
+                nodes,
+                truncated,
+                current_url: parts.current_url,
+                viewport_bounds: parts.viewport,
+            },
+            window_found: true,
+            empty_reason,
+            phase_us: [window_us, locate_us, tree_us],
+        })
+    }
+
+    /// Walks a subtree cache built by `tree_request` (no cross-process calls).
+    fn walk_cached(
+        cached_root: IUIAutomationElement,
+        limit: usize,
+        parts: &mut PageParts,
+    ) -> (Vec<RawUiaNode>, bool) {
+        bfs_limited(cached_root, limit, |element| {
             let (node, ct) = match read_node(&element) {
                 Ok(read) => read,
                 Err(err) => {
-                    tracing::trace!(error = %describe(&err), "skipping unreadable UIA node");
-                    return None;
+                    let error = describe(&err);
+                    tracing::debug!(%error, "skipping unreadable UIA node");
+                    parts.last_skip = Some(error);
+                    return Visit::Skip;
                 }
             };
-            if current_url.is_none()
-                && ct == control_type::EDIT
-                && let Some(value) = node.value.as_deref()
-                && is_address_bar_candidate(node.name.as_deref(), value)
-            {
-                current_url = Some(value.to_owned());
-            }
-            if viewport.is_none()
-                && ct == control_type::DOCUMENT
-                && node.width > 0.0
-                && node.height > 0.0
-            {
-                viewport = Some(RawBounds {
-                    x: node.x,
-                    y: node.y,
-                    width: node.width,
-                    height: node.height,
-                });
-            }
+            parts.observe(&node, ct);
             // SAFETY: COM method on a live, cache-populated element; reads the local cache.
             let children = elements_of(unsafe { element.GetCachedChildren() }).unwrap_or_default();
-            Some((node, children))
-        });
+            Visit::Node(node, children)
+        })
+    }
 
+    /// Bounded fallback walk: one `BuildUpdatedCache(Element | Children)` per visited node,
+    /// stopping at `limit` nodes or shortly before `deadline` (then `truncated`).
+    fn walk_levels(
+        &self,
+        base: &IUIAutomationElement,
+        limit: usize,
+        deadline: Instant,
+        parts: &mut PageParts,
+    ) -> std::result::Result<(Vec<RawUiaNode>, bool), CallError> {
+        // SAFETY: COM method on a live interface pointer with a live cache request; returns an
+        // owned element whose own properties are cached.
+        let root = unsafe { base.BuildUpdatedCache(&self.level_request) }
+            .map_err(|err| CallError::tree(err, "tree snapshot (level walk root)"))?;
+        let stop_at = deadline
+            .checked_sub(WALK_DEADLINE_MARGIN)
+            .unwrap_or(deadline);
+        Ok(bfs_limited(root, limit, |element| {
+            if Instant::now() >= stop_at {
+                return Visit::Stop;
+            }
+            let (node, ct) = match read_node(&element) {
+                Ok(read) => read,
+                Err(err) => {
+                    let error = describe(&err);
+                    tracing::debug!(%error, "skipping unreadable UIA node");
+                    parts.last_skip = Some(error);
+                    return Visit::Skip;
+                }
+            };
+            parts.observe(&node, ct);
+            // SAFETY: COM methods on a live full-mode element with a live cache request; the
+            // refreshed element and its cached children array are owned references.
+            let children = unsafe {
+                element
+                    .BuildUpdatedCache(&self.level_request)
+                    .and_then(|refreshed| refreshed.GetCachedChildren())
+            };
+            let children = elements_of(children).unwrap_or_default();
+            Visit::Node(node, children)
+        }))
+    }
+
+    #[cfg(test)]
+    fn desktop_probe(&self) -> std::result::Result<RawUiaSnapshot, CallError> {
+        // SAFETY: COM methods on live interface pointers owned by this thread.
+        let root = unsafe {
+            self.automation
+                .GetRootElement()
+                .and_then(|r| r.BuildUpdatedCache(&self.level_request))
+        }
+        .map_err(|err| CallError::new(err, "desktop root"))?;
+        let (node, _) = read_node(&root).map_err(|err| CallError::new(err, "read desktop root"))?;
         Ok(RawUiaSnapshot {
-            nodes,
-            truncated,
-            current_url,
-            viewport_bounds: viewport,
+            nodes: vec![node],
+            ..RawUiaSnapshot::default()
         })
     }
 
@@ -928,16 +1332,20 @@ impl UiaSession {
                 &self.window_request,
             )
         })?;
-        let names: Vec<Option<String>> = windows
+        let candidates: Vec<WindowCandidate> = windows
             .iter()
             .map(|window| {
-                // SAFETY: COM method on a live element, reading the cache built above.
-                unsafe { window.CachedProcessId() }
-                    .ok()
-                    .and_then(process_name)
+                // SAFETY: COM methods on a live element, reading the cache built above.
+                let (pid, ct) = unsafe { (window.CachedProcessId(), window.CachedControlType()) };
+                let pid = pid.unwrap_or(0);
+                WindowCandidate {
+                    process_name: process_name(pid),
+                    pid,
+                    is_window: ct.is_ok_and(|ct| ct == UIA_WindowControlTypeId),
+                }
             })
             .collect();
-        Ok(pick_browser_window(&names).and_then(|idx| windows.into_iter().nth(idx)))
+        Ok(pick_browser_window(&candidates).and_then(|idx| windows.into_iter().nth(idx)))
     }
 
     /// Finds the omnibox URL and the web content root among the window's descendants, like
@@ -1008,40 +1416,18 @@ impl UiaSession {
 mod tests {
     use super::*;
 
-    /// Exercises COM initialization, a cache request, cached properties and the runtime-id
-    /// SAFEARRAY decoding against the desktop root and its direct children (bounded: no
-    /// subtree fetch). Runs on its own thread so a stuck desktop fails the test instead of
-    /// hanging it.
+    /// Reads the desktop root through the single worker (thread start, COM init, cache
+    /// request, cached properties, runtime-id SAFEARRAY decoding).
+    ///
+    /// The first CI run created a second `CUIAutomation` + conditions on the test thread
+    /// concurrently with the worker test, and that path failed in `CreatePropertyCondition`
+    /// with `E_FAIL` while the identical code on the worker succeeded. Production only ever
+    /// has one automation object (the worker's), so the test now goes through it too.
     #[test]
     fn desktop_root_snapshot_reads_cached_properties() {
-        let (tx, rx) = mpsc::sync_channel(1);
-        let _ = std::thread::spawn(move || {
-            let result = (|| -> std::result::Result<Vec<RawUiaNode>, String> {
-                let _apartment = ComApartment::init_mta().map_err(|e| describe(&e))?;
-                let session = UiaSession::new()?;
-                let request = UiaSession::cache_request(
-                    &session.automation,
-                    &TREE_PROPERTIES,
-                    Some(TreeScope(3)), // TreeScope_Element | TreeScope_Children
-                    true,
-                )
-                .map_err(|e| describe(&e))?;
-                // SAFETY: COM methods on live interface pointers owned by this thread.
-                let root = unsafe {
-                    session
-                        .automation
-                        .GetRootElement()
-                        .and_then(|r| r.BuildUpdatedCache(&request))
-                }
-                .map_err(|e| describe(&e))?;
-                let (node, _) = read_node(&root).map_err(|e| describe(&e))?;
-                Ok(vec![node])
-            })();
-            let _ = tx.send(result);
-        });
-        match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Ok(nodes)) => {
-                let root = nodes.first();
+        match run_job(JobKind::DesktopProbe) {
+            NativeOutcome::Done(Ok(raw)) => {
+                let root = raw.nodes.first();
                 // The desktop is an HWND-based element, whose runtime id is `[42, hwnd]`.
                 assert!(
                     root.and_then(|n| n.id.as_deref())
@@ -1050,28 +1436,42 @@ mod tests {
                 );
                 assert_eq!(
                     root.map(|n| n.control_type.as_str()),
-                    Some("ControlType.Pane")
+                    Some("ControlType.Pane"),
+                    "{root:?}"
                 );
             }
-            Ok(Err(reason)) => assert_eq!(reason, "", "native UIAutomation failed"),
-            Err(_) => assert_eq!(0, 1, "native UIAutomation desktop query hung for 30s"),
+            NativeOutcome::Done(Err(err)) => assert_eq!(format!("{err}"), "", "desktop probe"),
+            NativeOutcome::Unavailable(reason) => assert_eq!(reason, "", "COM unavailable"),
         }
     }
 
-    /// Runs the real worker end to end (thread start, COM init, condition with a VARIANT,
-    /// `FindFirst` with no match, top-level window enumeration with process names). Bounded
-    /// by the worker's own 10 s channel timeout.
+    /// Runs the real worker end to end without a browser. The own-pid query must succeed
+    /// (`FindFirst` with no match is an empty snapshot); the no-pid query may meet a desktop
+    /// in flux, so `transient`/`timeout` are tolerated there. Neither may report native COM
+    /// as unavailable, which would mean production silently ran on PowerShell.
     #[test]
     fn worker_answers_without_a_browser() {
         let own_pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
-        for pid in [Some(own_pid), None] {
-            match query(pid, 10) {
-                NativeOutcome::Done(Ok(raw)) => assert!(raw.nodes.len() <= 10, "{pid:?}"),
-                NativeOutcome::Done(Err(err)) => assert_eq!(format!("{err}"), "", "{pid:?}"),
-                NativeOutcome::Unavailable(reason) => {
-                    assert_eq!(reason, "", "COM unavailable");
-                }
+        match query(Some(own_pid), 10) {
+            NativeOutcome::Done(Ok(raw)) => assert!(raw.nodes.len() <= 10),
+            NativeOutcome::Done(Err(err)) => assert_eq!(format!("{err}"), "", "own pid"),
+            NativeOutcome::Unavailable(reason) => assert_eq!(reason, "", "COM unavailable"),
+        }
+        match query(None, 10) {
+            NativeOutcome::Done(Ok(raw)) => assert!(raw.nodes.len() <= 10),
+            NativeOutcome::Done(Err(
+                WayboundError::Transient { .. } | WayboundError::Timeout { .. },
+            )) => {}
+            NativeOutcome::Done(Err(err)) => assert_eq!(format!("{err}"), "", "no pid"),
+            NativeOutcome::Unavailable(reason) => assert_eq!(reason, "", "COM unavailable"),
+        }
+        match query_page_info(Some(own_pid)) {
+            NativeOutcome::Done(Ok(raw)) => {
+                assert!(raw.nodes.is_empty());
+                assert_eq!(raw.current_url, None);
             }
+            NativeOutcome::Done(Err(err)) => assert_eq!(format!("{err}"), "", "page info"),
+            NativeOutcome::Unavailable(reason) => assert_eq!(reason, "", "COM unavailable"),
         }
     }
 

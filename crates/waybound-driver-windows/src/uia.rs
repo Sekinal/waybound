@@ -578,7 +578,8 @@ fn configured_backend() -> UiaBackend {
 ///
 /// The backend is in-process COM `IUIAutomation` unless `WAYBOUND_WINDOWS_UIA=powershell`
 /// selects the original PowerShell walker. If COM itself cannot be initialized, every query
-/// falls back to PowerShell (logged once at `warn`).
+/// falls back to PowerShell (logged once at `warn`), unless
+/// `WAYBOUND_WINDOWS_UIA=native-strict`, which reports `backend_unavailable` instead.
 ///
 /// # Errors
 ///
@@ -607,16 +608,61 @@ pub fn query_uia_tree_with_backend(
     let limit = max_nodes.clamp(MIN_MAX_NODES, MAX_MAX_NODES);
     match backend {
         UiaBackend::PowerShell => query_uia_tree_powershell(pid, limit),
-        UiaBackend::NativeCom => match crate::uia_com::query(pid, limit) {
-            crate::uia_com::NativeOutcome::Done(raw) => {
-                raw.map(|raw| finalize_snapshot(raw, limit))
+        UiaBackend::NativeCom | UiaBackend::NativeStrict => {
+            match crate::uia_com::query(pid, limit) {
+                crate::uia_com::NativeOutcome::Done(raw) => {
+                    raw.map(|raw| finalize_snapshot(raw, limit))
+                }
+                crate::uia_com::NativeOutcome::Unavailable(reason) => {
+                    native_unavailable(backend, &reason)?;
+                    query_uia_tree_powershell(pid, limit)
+                }
             }
-            crate::uia_com::NativeOutcome::Unavailable(reason) => {
-                tracing::debug!(%reason, "native UIAutomation unavailable; using PowerShell");
-                query_uia_tree_powershell(pid, limit)
-            }
-        },
+        }
     }
+}
+
+/// Under [`UiaBackend::NativeStrict`], turns "COM unavailable" into an error instead of the
+/// PowerShell fallback.
+#[cfg(target_os = "windows")]
+fn native_unavailable(backend: UiaBackend, reason: &str) -> Result<()> {
+    if backend == UiaBackend::NativeStrict {
+        return Err(WayboundError::BackendUnavailable {
+            backend: "windows".to_owned(),
+            reason: format!(
+                "native COM UIAutomation unavailable and {UIA_BACKEND_ENV}=native-strict forbids \
+                 the PowerShell fallback: {reason}"
+            ),
+        });
+    }
+    tracing::debug!(%reason, "native UIAutomation unavailable; using PowerShell");
+    Ok(())
+}
+
+/// Reads only the address-bar URL and the active web viewport.
+///
+/// The native backend stops after locating the address bar and the web document (no node
+/// walk); the PowerShell backend runs its full walker, as before.
+///
+/// # Errors
+///
+/// Same as [`query_uia_tree_limited`].
+#[cfg(target_os = "windows")]
+pub fn query_uia_page_info(pid: Option<i32>) -> Result<(Option<String>, Option<Bounds>)> {
+    let backend = configured_backend();
+    let snapshot = match backend {
+        UiaBackend::PowerShell => query_uia_tree_powershell(pid, MAX_NODES)?,
+        UiaBackend::NativeCom | UiaBackend::NativeStrict => {
+            match crate::uia_com::query_page_info(pid) {
+                crate::uia_com::NativeOutcome::Done(raw) => finalize_snapshot(raw?, MAX_NODES),
+                crate::uia_com::NativeOutcome::Unavailable(reason) => {
+                    native_unavailable(backend, &reason)?;
+                    query_uia_tree_powershell(pid, MAX_NODES)?
+                }
+            }
+        }
+    };
+    Ok((snapshot.current_url, snapshot.viewport_bounds))
 }
 
 /// Runs the PowerShell walker (`powershell.exe` + .NET `UIAutomationClient`) with a
