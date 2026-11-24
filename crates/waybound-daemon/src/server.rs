@@ -18,12 +18,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use waybound_core::{
-    BackendKind, Bounds, Driver, InputEvent, KeyCode, KeyModifier, LocatorQuery, MotionConfig,
-    MotorProfile, MouseButton, Point, Request, Response, Result, Role, SplitMix64, WayboundError,
-    WindowSummary, WireRequest, action_pause_for, double_click_gap_for, hover_pause_for,
-    key_hold_for, mouse_hold_for, parse_wire_request, pick_click_point_from,
-    plan_human_pointer_path_with_profile, plan_scroll_burst_with_profile, plan_typing_sequence,
-    reading_pause_for,
+    BackendKind, Bounds, Driver, InputEvent, KeyAction, KeyCode, KeyModifier, LocatorQuery,
+    MotionConfig, MotorProfile, MouseButton, Point, Request, Response, Result, Role, SplitMix64,
+    WayboundError, WindowSummary, WireRequest, action_pause_for, double_click_gap_for,
+    hover_pause_for, key_hold_for, mouse_hold_for, parse_wire_request, pick_click_point_from,
+    plan_human_pointer_path_with_profile, plan_rollover_typing_events,
+    plan_scroll_burst_with_profile, plan_typing_sequence, reading_pause_for,
 };
 use waybound_net::{FingerprintRecorder, InflightCounter, wait_for_network_idle};
 
@@ -882,17 +882,75 @@ const fn char_to_key(ch: char) -> KeyCode {
     }
 }
 
+fn release_held_keys(driver: &dyn Driver, held: &mut Vec<KeyCode>) {
+    while let Some(key) = held.pop() {
+        let _ = driver.dispatch_input(&InputEvent::KeyUp {
+            key,
+            modifiers: Vec::new(),
+        });
+    }
+}
+
+fn type_text_sequential(driver: &dyn Driver, state: &SessionState, text: &str) -> Result<()> {
+    let steps = state.with_motion_rng(|profile, rng| plan_typing_sequence(text, profile, rng));
+    for step in steps {
+        driver.dispatch_input(&InputEvent::KeyPress {
+            key: char_to_key(step.ch),
+            modifiers: Vec::new(),
+            hold_ms: step.hold_ms,
+        })?;
+        if !step.delay_after.is_zero() {
+            thread::sleep(step.delay_after);
+        }
+    }
+    Ok(())
+}
+
 fn type_text(driver: &dyn Driver, state: &SessionState, text: &str, pace: bool) -> Result<()> {
     if pace && driver.backend_kind() != BackendKind::AndroidWaydroid {
-        let steps = state.with_motion_rng(|profile, rng| plan_typing_sequence(text, profile, rng));
-        for step in steps {
-            driver.dispatch_input(&InputEvent::KeyPress {
-                key: char_to_key(step.ch),
-                modifiers: Vec::new(),
-                hold_ms: step.hold_ms,
-            })?;
-            if !step.delay_after.is_zero() {
-                thread::sleep(step.delay_after);
+        let timeline =
+            state.with_motion_rng(|profile, rng| plan_rollover_typing_events(text, profile, rng));
+        let mut held: Vec<KeyCode> = Vec::with_capacity(2);
+        let mut dispatched_any_down = false;
+
+        for event in timeline {
+            if !event.delay.is_zero() {
+                thread::sleep(event.delay);
+            }
+            let key = char_to_key(event.ch);
+            match event.action {
+                KeyAction::Down => {
+                    match driver.dispatch_input(&InputEvent::KeyDown {
+                        key: key.clone(),
+                        modifiers: Vec::new(),
+                    }) {
+                        Ok(()) => {
+                            dispatched_any_down = true;
+                            held.push(key);
+                        }
+                        Err(WayboundError::UnsupportedInput { .. })
+                            if !dispatched_any_down && held.is_empty() =>
+                        {
+                            return type_text_sequential(driver, state, text);
+                        }
+                        Err(err) => {
+                            release_held_keys(driver, &mut held);
+                            return Err(err);
+                        }
+                    }
+                }
+                KeyAction::Up => {
+                    if let Some(pos) = held.iter().position(|k| *k == key) {
+                        let _ = held.remove(pos);
+                    }
+                    if let Err(err) = driver.dispatch_input(&InputEvent::KeyUp {
+                        key,
+                        modifiers: Vec::new(),
+                    }) {
+                        release_held_keys(driver, &mut held);
+                        return Err(err);
+                    }
+                }
             }
         }
         return Ok(());
@@ -2384,17 +2442,209 @@ mod tests {
 
         let driver2 = MockDriver::sample_page();
         assert!(fill_element(&driver2, &st, &origin_box(), "hi").is_ok());
-        let key_holds: Vec<u64> = driver2
-            .recorded_events()
-            .into_iter()
+        let events2 = driver2.recorded_events();
+        let key_holds: Vec<u64> = events2
+            .iter()
             .filter_map(|e| match e {
-                InputEvent::KeyPress { hold_ms, .. } => Some(hold_ms),
+                InputEvent::KeyPress { hold_ms, .. } => Some(*hold_ms),
                 _ => None,
             })
             .collect();
-        // Ctrl/Cmd+A + 'h' + 'i'
-        assert_eq!(key_holds.len(), 3);
-        assert!(key_holds.iter().all(|&h| h > 0));
+        // Ctrl/Cmd+A uses KeyPress with non-zero hold_ms; "hi" uses rollover KeyDown/KeyUp.
+        assert_eq!(key_holds.len(), 1);
+        assert!(key_holds[0] > 0);
+        let downs = events2
+            .iter()
+            .filter(|e| matches!(e, InputEvent::KeyDown { .. }))
+            .count();
+        let ups = events2
+            .iter()
+            .filter(|e| matches!(e, InputEvent::KeyUp { .. }))
+            .count();
+        assert_eq!(downs, 2);
+        assert_eq!(ups, 2);
+        assert_eq!(driver2.typed_text(), "hi");
+        assert_eq!(driver2.held_keys(), Vec::<KeyCode>::new());
+    }
+
+    #[test]
+    fn type_text_with_pacing_emits_overlapping_rollover_and_leaves_zero_keys_held() {
+        let driver = MockDriver::sample_page();
+        let mut st = state_with(true, Arc::new(AtomicBool::new(false)));
+        st.motor_profile = MotorProfile {
+            typing_iki_median_ms: 45.0,
+            typing_hold_median_ms: 42.0,
+            typing_rollover_ratio: 0.70,
+            ..MotorProfile::default()
+        };
+        st.motion_rng = Mutex::new(SplitMix64::new(42));
+
+        let text = "thelandwithform";
+        assert!(type_text(&driver, &st, text, true).is_ok());
+        assert_eq!(driver.typed_text(), text);
+        assert_eq!(driver.held_keys(), Vec::<KeyCode>::new());
+
+        let mut current_held = 0usize;
+        let mut max_held = 0usize;
+        let mut overlaps = 0usize;
+        for ev in driver.recorded_events() {
+            match ev {
+                InputEvent::KeyDown { .. } => {
+                    if current_held > 0 {
+                        overlaps += 1;
+                    }
+                    current_held += 1;
+                    max_held = max_held.max(current_held);
+                }
+                InputEvent::KeyUp { .. } => {
+                    assert!(current_held > 0);
+                    current_held -= 1;
+                }
+                other => {
+                    assert!(
+                        !matches!(other, InputEvent::KeyPress { .. }),
+                        "expected rollover KeyDown/KeyUp, got {other:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(current_held, 0);
+        assert!(overlaps > 0, "expected overlapping rollover transitions");
+        assert!(
+            max_held <= 2,
+            "at most 2 keys may be held simultaneously, got {max_held}"
+        );
+    }
+
+    /// Driver that rejects `KeyDown` / `KeyUp` with `UnsupportedInput` to exercise fallback.
+    struct UnsupportedKeyEdgeDriver(MockDriver);
+
+    impl Driver for UnsupportedKeyEdgeDriver {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::LinuxWayland
+        }
+
+        fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
+            self.0.snapshot_tree()
+        }
+
+        fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
+            if matches!(event, InputEvent::KeyDown { .. } | InputEvent::KeyUp { .. }) {
+                return Err(WayboundError::UnsupportedInput {
+                    backend: "test".to_owned(),
+                    reason: "split key edges unsupported".to_owned(),
+                });
+            }
+            self.0.dispatch_input(event)
+        }
+    }
+
+    #[test]
+    fn type_text_falls_back_to_key_press_when_key_down_is_unsupported() {
+        let driver = UnsupportedKeyEdgeDriver(MockDriver::sample_page());
+        let mut st = state_with(true, Arc::new(AtomicBool::new(false)));
+        st.motor_profile = MotorProfile {
+            typing_iki_median_ms: 45.0,
+            typing_hold_median_ms: 40.0,
+            ..MotorProfile::default()
+        };
+        st.motion_rng = Mutex::new(SplitMix64::new(7));
+
+        assert!(type_text(&driver, &st, "hi", true).is_ok());
+        let presses: Vec<(KeyCode, u64)> = driver
+            .0
+            .recorded_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                InputEvent::KeyPress { key, hold_ms, .. } => Some((key, hold_ms)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(presses.len(), 2);
+        assert_eq!(presses[0].0, KeyCode::Char('h'));
+        assert_eq!(presses[1].0, KeyCode::Char('i'));
+        assert!(presses.iter().all(|&(_, hold_ms)| hold_ms > 0));
+    }
+
+    /// Driver that fails on the `fail_on_down`th (0-based) `KeyDown` dispatch.
+    struct MidStreamFailingKeyDriver {
+        inner: MockDriver,
+        fail_on_down: usize,
+        downs_seen: AtomicUsize,
+    }
+
+    impl Driver for MidStreamFailingKeyDriver {
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::MacOsNative
+        }
+
+        fn snapshot_tree(&self) -> Result<Vec<AccessibilityNode>> {
+            self.inner.snapshot_tree()
+        }
+
+        fn dispatch_input(&self, event: &InputEvent) -> Result<()> {
+            if matches!(event, InputEvent::KeyDown { .. }) {
+                let idx = self.downs_seen.fetch_add(1, Ordering::SeqCst);
+                if idx == self.fail_on_down {
+                    return Err(WayboundError::BackendUnavailable {
+                        backend: "mock".to_owned(),
+                        reason: format!("injected failure on key_down #{idx}"),
+                    });
+                }
+            }
+            self.inner.dispatch_input(event)
+        }
+    }
+
+    #[test]
+    fn type_text_releases_held_keys_when_mid_stream_dispatch_fails() {
+        let driver = MidStreamFailingKeyDriver {
+            inner: MockDriver::sample_page(),
+            fail_on_down: 1,
+            downs_seen: AtomicUsize::new(0),
+        };
+        let mut st = state_with(true, Arc::new(AtomicBool::new(false)));
+        st.motor_profile = MotorProfile {
+            typing_iki_median_ms: 45.0,
+            typing_hold_median_ms: 50.0,
+            // Force rollover on alternating-hand 't' -> 'h' so 't' is still held when 'h' fails.
+            typing_rollover_ratio: 0.70,
+            ..MotorProfile::default()
+        };
+        // Find a seed where the very first transition 't' -> 'h' rolls over (Down('t'), Down('h')).
+        let seed = (1u64..1000)
+            .find(|&s| {
+                let mut r = SplitMix64::new(s);
+                let evs = plan_rollover_typing_events("th", &st.motor_profile, &mut r);
+                matches!(
+                    evs.get(1),
+                    Some(waybound_core::KeyTimelineEvent {
+                        ch: 'h',
+                        action: KeyAction::Down,
+                        ..
+                    })
+                )
+            })
+            .unwrap_or(1);
+        st.motion_rng = Mutex::new(SplitMix64::new(seed));
+
+        let res = type_text(&driver, &st, "th", true);
+        assert!(matches!(res, Err(WayboundError::BackendUnavailable { .. })));
+        // Cleanup must have dispatched KeyUp('t') so zero keys remain held.
+        assert_eq!(driver.inner.held_keys(), Vec::<KeyCode>::new());
+        assert_eq!(
+            driver.inner.recorded_events(),
+            vec![
+                InputEvent::KeyDown {
+                    key: KeyCode::Char('t'),
+                    modifiers: Vec::new(),
+                },
+                InputEvent::KeyUp {
+                    key: KeyCode::Char('t'),
+                    modifiers: Vec::new(),
+                },
+            ]
+        );
     }
 
     #[test]

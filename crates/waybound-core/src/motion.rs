@@ -273,6 +273,8 @@ pub struct MotorProfile {
     pub typing_hold_median_ms: f64,
     /// Median cognitive burst pause at word/clause boundaries in milliseconds (~45..110 ms).
     pub typing_word_pause_median_ms: f64,
+    /// Probability of keystroke rollover overlap on alternating-hand transitions (~0.22..0.48).
+    pub typing_rollover_ratio: f64,
     /// Physical scroll device style for this session.
     pub scroll_style: ScrollStyle,
     /// Median inter-burst reading/clutching pause during scrolling in milliseconds (~150..320 ms).
@@ -303,6 +305,7 @@ impl Default for MotorProfile {
             typing_iki_median_ms: 115.0,
             typing_hold_median_ms: 88.0,
             typing_word_pause_median_ms: 72.0,
+            typing_rollover_ratio: 0.30,
             scroll_style: ScrollStyle::TrackpadInertial { damping: 3.8 },
             reading_pause_median_ms: 215.0,
         }
@@ -344,6 +347,7 @@ impl MotorProfile {
             typing_iki_median_ms: rng.range_f64(85.0, 155.0),
             typing_hold_median_ms: rng.range_f64(72.0, 108.0),
             typing_word_pause_median_ms: rng.range_f64(45.0, 110.0),
+            typing_rollover_ratio: rng.range_f64(0.22, 0.48),
             scroll_style,
             reading_pause_median_ms: rng.range_f64(150.0, 320.0),
         }
@@ -379,6 +383,26 @@ pub struct KeystrokeStep {
     pub hold_ms: u64,
     /// Delay to wait after this keystroke before starting the next keystroke.
     pub delay_after: Duration,
+}
+
+/// Press or release phase for an event in a rollover typing timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAction {
+    /// Key press (down) transition.
+    Down,
+    /// Key release (up) transition.
+    Up,
+}
+
+/// A single timed key-down or key-up event in a biomechanical rollover typing schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyTimelineEvent {
+    /// Character associated with this key transition.
+    pub ch: char,
+    /// Press or release action.
+    pub action: KeyAction,
+    /// Delay to wait before dispatching this event.
+    pub delay: Duration,
 }
 
 /// Configuration controlling pointer trajectory generation.
@@ -1358,6 +1382,135 @@ pub fn plan_typing_sequence(
     steps
 }
 
+/// Returns the biomechanical rollover probability for transitioning from `prev` to `curr`,
+/// or `0.0` when rollover is not biomechanically eligible.
+fn rollover_probability(prev: char, curr: char, rollover_ratio: f64) -> f64 {
+    if rollover_ratio <= 0.0 || prev == curr {
+        return 0.0;
+    }
+    let (Some(a), Some(b)) = (qwerty_key_pos(prev), qwerty_key_pos(curr)) else {
+        return 0.0;
+    };
+    if a.shifted || b.shifted {
+        return 0.0;
+    }
+    if a.row == b.row && a.col == b.col {
+        return 0.0;
+    }
+    if a.hand != b.hand {
+        rollover_ratio
+    } else if a.finger != b.finger {
+        rollover_ratio * 0.55
+    } else {
+        0.0
+    }
+}
+
+/// Plans a biomechanical keystroke timeline with authentic keystroke rollover.
+///
+/// Following Dhakal et al. (CHI 2018), key `k+1` is pressed before key `k` is released
+/// on eligible alternating-hand and different-finger transitions.
+///
+/// Guarantees:
+/// - Every `Down` has a matching `Up` for the exact same character.
+/// - `Down` events appear in the exact character order of `text`.
+/// - Shifted, control, non-ASCII, repeated-key, and same-finger transitions never overlap.
+/// - At most 2 keys are held simultaneously at any point in the timeline.
+/// - The first event always has `delay == Duration::ZERO`.
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+pub fn plan_rollover_typing_events(
+    text: &str,
+    profile: &MotorProfile,
+    rng: &mut SplitMix64,
+) -> Vec<KeyTimelineEvent> {
+    let steps = plan_typing_sequence(text, profile, rng);
+    if steps.is_empty() {
+        return Vec::new();
+    }
+
+    let rollover_ratio = if profile.typing_rollover_ratio.is_finite() {
+        profile.typing_rollover_ratio.clamp(0.0, 0.70)
+    } else {
+        0.30
+    };
+
+    let n = steps.len();
+    let mut down_t = Vec::with_capacity(n);
+    let mut up_t = Vec::with_capacity(n);
+
+    down_t.push(0u64);
+    up_t.push(steps[0].hold_ms.max(1));
+
+    for i in 1..n {
+        let prev_ch = steps[i - 1].ch;
+        let curr_ch = steps[i].ch;
+        let prev_down = down_t[i - 1];
+        let prev_up = up_t[i - 1];
+        let prev_hold = prev_up.saturating_sub(prev_down);
+        let curr_hold = steps[i].hold_ms.max(1);
+        let delay_ms = u64::try_from(steps[i - 1].delay_after.as_millis()).unwrap_or(u64::MAX);
+
+        let prob = rollover_probability(prev_ch, curr_ch, rollover_ratio);
+        let use_rollover = prob > 0.0 && rng.next_f64() < prob;
+
+        let min_down = if i >= 2 {
+            prev_down
+                .saturating_add(22)
+                .max(up_t[i - 2].saturating_add(5))
+        } else {
+            prev_down.saturating_add(22)
+        };
+
+        let (curr_down, curr_up) = if use_rollover && min_down < prev_up {
+            let overlap_frac = rng.range_f64(0.15, 0.55);
+            let overlap_ms = ((prev_hold as f64) * overlap_frac).round().max(1.0) as u64;
+            let cand_down = prev_up
+                .saturating_sub(overlap_ms)
+                .max(min_down)
+                .min(prev_up.saturating_sub(1));
+            let cand_up = cand_down
+                .saturating_add(curr_hold)
+                .max(prev_up.saturating_add(9));
+            (cand_down, cand_up)
+        } else {
+            let cand_down = prev_up.saturating_add(delay_ms).max(min_down);
+            let cand_up = cand_down
+                .saturating_add(curr_hold)
+                .max(prev_up.saturating_add(9));
+            (cand_down, cand_up)
+        };
+
+        down_t.push(curr_down);
+        up_t.push(curr_up);
+    }
+
+    // (timestamp_ms, priority [0 = Up, 1 = Down], char_index, ch, action)
+    let mut raw: Vec<(u64, u8, usize, char, KeyAction)> = Vec::with_capacity(n * 2);
+    for (idx, step) in steps.iter().enumerate() {
+        raw.push((down_t[idx], 1, idx, step.ch, KeyAction::Down));
+        raw.push((up_t[idx], 0, idx, step.ch, KeyAction::Up));
+    }
+    raw.sort_by_key(|&(t_ms, prio, idx, _, _)| (t_ms, prio, idx));
+
+    let mut timeline = Vec::with_capacity(raw.len());
+    let mut prev_t = 0u64;
+    for (pos, (t_ms, _, _, ch, action)) in raw.into_iter().enumerate() {
+        let delay = if pos == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(t_ms.saturating_sub(prev_t))
+        };
+        prev_t = t_ms;
+        timeline.push(KeyTimelineEvent { ch, action, delay });
+    }
+    timeline
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -1922,5 +2075,141 @@ mod tests {
                 assert!((0.49..=1.81).contains(&d));
             }
         }
+    }
+
+    #[test]
+    fn rollover_timeline_preserves_order_matches_pairs_and_caps_at_two_held() {
+        let mut rng = SplitMix64::new(4242);
+        let profile = MotorProfile {
+            typing_rollover_ratio: 0.45,
+            ..MotorProfile::default()
+        };
+        let text = "thelandwithformand Hello, World!\t\n123 café";
+        let events = plan_rollover_typing_events(text, &profile, &mut rng);
+
+        assert_eq!(events.len(), text.chars().count() * 2);
+        assert_eq!(events.first().map(|e| e.delay), Some(Duration::ZERO));
+
+        let mut downs = String::new();
+        let mut held: Vec<char> = Vec::new();
+        let mut max_held = 0usize;
+        for ev in &events {
+            match ev.action {
+                KeyAction::Down => {
+                    downs.push(ev.ch);
+                    held.push(ev.ch);
+                    max_held = max_held.max(held.len());
+                }
+                KeyAction::Up => {
+                    let pos = held.iter().position(|&c| c == ev.ch);
+                    assert!(pos.is_some(), "Up without matching Down for {:?}", ev.ch);
+                    if let Some(idx) = pos {
+                        let _ = held.remove(idx);
+                    }
+                }
+            }
+        }
+        assert_eq!(downs, text);
+        assert_eq!(held, Vec::<char>::new(), "all keys must be released at end");
+        assert!(
+            max_held <= 2,
+            "at most 2 keys may be held simultaneously, observed {max_held}"
+        );
+    }
+
+    #[test]
+    fn rollover_occurs_on_alternating_hand_text_with_at_least_15_percent_overlap() {
+        let mut rng = SplitMix64::new(7777);
+        let profile = MotorProfile::default();
+        let text = "thelandwithformand";
+        let trials = 40;
+        let mut total_transitions = 0usize;
+        let mut overlapping_transitions = 0usize;
+
+        for _ in 0..trials {
+            let events = plan_rollover_typing_events(text, &profile, &mut rng);
+            let mut held_count = 0usize;
+            let mut max_held = 0usize;
+            let mut down_seen = 0usize;
+            for ev in &events {
+                match ev.action {
+                    KeyAction::Down => {
+                        if down_seen > 0 {
+                            total_transitions += 1;
+                            if held_count > 0 {
+                                overlapping_transitions += 1;
+                            }
+                        }
+                        down_seen += 1;
+                        held_count += 1;
+                        max_held = max_held.max(held_count);
+                    }
+                    KeyAction::Up => {
+                        assert!(held_count > 0);
+                        held_count -= 1;
+                    }
+                }
+            }
+            assert_eq!(held_count, 0);
+            assert!(max_held <= 2);
+        }
+
+        let ratio = overlapping_transitions as f64 / total_transitions as f64;
+        assert!(
+            ratio >= 0.15,
+            "expected >= 15% rollover overlap on alternating-hand text, got {:.1}% ({overlapping_transitions}/{total_transitions})",
+            ratio * 100.0
+        );
+    }
+
+    #[test]
+    fn rollover_never_overlaps_same_finger_repeated_or_shifted_transitions() {
+        let mut rng = SplitMix64::new(9999);
+        let profile = MotorProfile {
+            typing_rollover_ratio: 0.70,
+            ..MotorProfile::default()
+        };
+
+        for text in [
+            "dedced", "swxws", "jujmj", "ssss", "llll", "AbCd", "A!B@C#", "a\nb\tc",
+        ] {
+            for _ in 0..20 {
+                let events = plan_rollover_typing_events(text, &profile, &mut rng);
+                let mut held = 0usize;
+                for ev in &events {
+                    match ev.action {
+                        KeyAction::Down => {
+                            assert_eq!(
+                                held, 0,
+                                "unexpected rollover overlap in {text:?} on {:?}",
+                                ev.ch
+                            );
+                            held += 1;
+                        }
+                        KeyAction::Up => {
+                            assert_eq!(held, 1);
+                            held -= 1;
+                        }
+                    }
+                }
+                assert_eq!(held, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn rollover_handles_empty_string_and_non_finite_ratio() {
+        let mut rng = SplitMix64::new(1);
+        let profile = MotorProfile {
+            typing_rollover_ratio: f64::NAN,
+            ..MotorProfile::default()
+        };
+        assert_eq!(
+            plan_rollover_typing_events("", &profile, &mut rng),
+            Vec::<KeyTimelineEvent>::new()
+        );
+
+        let events = plan_rollover_typing_events("the", &profile, &mut rng);
+        assert_eq!(events.len(), 6);
     }
 }

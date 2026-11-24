@@ -682,6 +682,9 @@ pub fn unsupported_input_reason(event: &InputEvent) -> Option<String> {
         } => Some(format!(
             "{button:?} mouse button: `adb shell input` only taps or long-presses (left click)"
         )),
+        InputEvent::KeyDown { .. } | InputEvent::KeyUp { .. } => {
+            Some("split key_down/key_up is not supported by adb input".to_owned())
+        }
         _ => None,
     }
 }
@@ -958,7 +961,10 @@ pub fn build_input_shell_args(event: &InputEvent, last_cursor: &mut Point) -> Op
             *last_cursor = *to;
             None
         }
-        InputEvent::MouseDown { .. } | InputEvent::MouseUp { .. } => None,
+        InputEvent::MouseDown { .. }
+        | InputEvent::MouseUp { .. }
+        | InputEvent::KeyDown { .. }
+        | InputEvent::KeyUp { .. } => None,
         InputEvent::MouseClick { button, .. } if *button != MouseButton::Left => None,
         InputEvent::MouseClick { button: _, hold_ms } => {
             let x = coord_to_i32(last_cursor.x);
@@ -1969,6 +1975,23 @@ mod tests {
         };
         assert!(matches!(
             dispatch_input(None, &middle, &mut cursor, &cache, &mut gesture, || None),
+            Err(WayboundError::UnsupportedInput { .. })
+        ));
+
+        let key_down = InputEvent::KeyDown {
+            key: KeyCode::Char('a'),
+            modifiers: Vec::new(),
+        };
+        let key_up = InputEvent::KeyUp {
+            key: KeyCode::Char('a'),
+            modifiers: Vec::new(),
+        };
+        assert!(matches!(
+            dispatch_input(None, &key_down, &mut cursor, &cache, &mut gesture, || None),
+            Err(WayboundError::UnsupportedInput { .. })
+        ));
+        assert!(matches!(
+            dispatch_input(None, &key_up, &mut cursor, &cache, &mut gesture, || None),
             Err(WayboundError::UnsupportedInput { .. })
         ));
     }

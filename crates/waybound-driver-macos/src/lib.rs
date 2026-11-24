@@ -150,6 +150,7 @@ impl Driver for MacOsDriver {
             if matches!(
                 event,
                 InputEvent::KeyPress { .. }
+                    | InputEvent::KeyDown { .. }
                     | InputEvent::MouseClick { .. }
                     | InputEvent::MouseDown { .. }
             ) {
@@ -159,7 +160,9 @@ impl Driver for MacOsDriver {
                 Ok(guard) => guard,
                 // A release must still go out after an earlier panic poisoned the cursor
                 // state; the tracked position is only a fallback for the real one anyway.
-                Err(poisoned) if matches!(event, InputEvent::MouseUp { .. }) => {
+                Err(poisoned)
+                    if matches!(event, InputEvent::MouseUp { .. } | InputEvent::KeyUp { .. }) =>
+                {
                     poisoned.into_inner()
                 }
                 Err(_) => {

@@ -52,7 +52,8 @@ use wayland_server::{
 use crate::buffer::{argb8888_to_rgba, encode_rgba_png, validate_buffer_bounds, xrgb8888_to_rgba};
 use crate::config::{CompositorConfig, WindowInfo};
 use crate::keymap::{
-    EVDEV_LEFTSHIFT, XKB_US_KEYMAP, keycode_to_evdev, modifier_to_evdev, modifier_xkb_mask,
+    EVDEV_LEFTALT, EVDEV_LEFTCTRL, EVDEV_LEFTMETA, EVDEV_LEFTSHIFT, XKB_MOD_ALT, XKB_MOD_CTRL,
+    XKB_MOD_META, XKB_MOD_SHIFT, XKB_US_KEYMAP, keycode_to_evdev, modifier_to_evdev,
 };
 
 /// Linux `evdev` button code for `BTN_LEFT`.
@@ -366,6 +367,8 @@ struct CompositorState {
     pointer_focus: Option<(ClientId, u64)>,
     keyboard_focus: Option<(ClientId, u64)>,
     last_pointer_pos: Point,
+    /// Reference counts of modifiers held via [`InputEvent::KeyDown`]: `[Shift, Ctrl, Alt, Meta]`.
+    depressed_mods: [usize; 4],
 }
 
 impl CompositorState {
@@ -387,6 +390,7 @@ impl CompositorState {
             pointer_focus: None,
             keyboard_focus: None,
             last_pointer_pos: Point { x: 0.0, y: 0.0 },
+            depressed_mods: [0; 4],
         }
     }
 
@@ -455,6 +459,7 @@ impl CompositorState {
                 .is_some_and(|(_, sid)| *sid == win.surface_id)
             {
                 self.keyboard_focus = None;
+                self.depressed_mods = [0; 4];
             }
         }
         self.window_order.retain(|&id| id != window_id);
@@ -695,6 +700,12 @@ impl CompositorState {
                 modifiers,
                 hold_ms,
             } => self.dispatch_key_press(&cid, surface_id, key, modifiers, *hold_ms, display),
+            InputEvent::KeyDown { key, modifiers } => {
+                self.dispatch_key_down(&cid, surface_id, key, modifiers)
+            }
+            InputEvent::KeyUp { key, modifiers } => {
+                self.dispatch_key_up(&cid, surface_id, key, modifiers)
+            }
         }
     }
 
@@ -826,21 +837,32 @@ impl CompositorState {
             .as_ref()
             .is_some_and(|(old_cid, old_sid)| old_cid == cid && *old_sid == surface_id);
         if !already_focused {
-            if let Some((old_cid, old_id)) = self.keyboard_focus.take()
-                && let Some(old_surface) = self.surfaces.get(&old_id).map(|s| s.wl_surface.clone())
-                && old_surface.is_alive()
-            {
-                let old_keyboards: Vec<WlKeyboard> = self
-                    .client_keyboards
-                    .get(&old_cid)
-                    .map(|list| list.iter().filter(|k| k.is_alive()).cloned().collect())
-                    .unwrap_or_default();
-                if !old_keyboards.is_empty() {
-                    let serial = self.next_serial();
-                    for kb in &old_keyboards {
-                        kb.leave(serial, &old_surface);
+            if let Some((old_cid, old_id)) = self.keyboard_focus.take() {
+                let had_mods = self.active_mod_mask() != 0;
+                self.depressed_mods = [0; 4];
+                if let Some(old_surface) = self.surfaces.get(&old_id).map(|s| s.wl_surface.clone())
+                    && old_surface.is_alive()
+                {
+                    let old_keyboards: Vec<WlKeyboard> = self
+                        .client_keyboards
+                        .get(&old_cid)
+                        .map(|list| list.iter().filter(|k| k.is_alive()).cloned().collect())
+                        .unwrap_or_default();
+                    if !old_keyboards.is_empty() {
+                        if had_mods {
+                            let mod_serial = self.next_serial();
+                            for kb in &old_keyboards {
+                                kb.modifiers(mod_serial, 0, 0, 0, 0);
+                            }
+                        }
+                        let serial = self.next_serial();
+                        for kb in &old_keyboards {
+                            kb.leave(serial, &old_surface);
+                        }
                     }
                 }
+            } else {
+                self.depressed_mods = [0; 4];
             }
             if let Some(new_surface) = self.surfaces.get(&surface_id).map(|s| s.wl_surface.clone())
                 && new_surface.is_alive()
@@ -864,6 +886,62 @@ impl CompositorState {
         hold_ms: u64,
         display: &mut Display<Self>,
     ) -> Result<()> {
+        self.dispatch_key_down(cid, surface_id, key, modifiers)?;
+        if hold_ms > 0 {
+            let _ = display.flush_clients();
+            thread::sleep(Duration::from_millis(hold_ms.min(MAX_HOLD_MS)));
+        }
+        self.dispatch_key_up(cid, surface_id, key, modifiers)
+    }
+
+    const fn evdev_mod_index(mcode: u32) -> Option<usize> {
+        match mcode {
+            EVDEV_LEFTSHIFT => Some(0),
+            EVDEV_LEFTCTRL => Some(1),
+            EVDEV_LEFTALT => Some(2),
+            EVDEV_LEFTMETA => Some(3),
+            _ => None,
+        }
+    }
+
+    const fn active_mod_mask(&self) -> u32 {
+        let mut mask = 0u32;
+        if self.depressed_mods[0] > 0 {
+            mask |= XKB_MOD_SHIFT;
+        }
+        if self.depressed_mods[1] > 0 {
+            mask |= XKB_MOD_CTRL;
+        }
+        if self.depressed_mods[2] > 0 {
+            mask |= XKB_MOD_ALT;
+        }
+        if self.depressed_mods[3] > 0 {
+            mask |= XKB_MOD_META;
+        }
+        mask
+    }
+
+    fn dedup_mod_codes(modifiers: &[KeyModifier], needs_shift: bool) -> Vec<u32> {
+        let mut mod_codes: Vec<u32> = Vec::with_capacity(modifiers.len() + 1);
+        for modifier in modifiers {
+            let code = modifier_to_evdev(*modifier);
+            if !mod_codes.contains(&code) {
+                mod_codes.push(code);
+            }
+        }
+        if needs_shift && !mod_codes.contains(&EVDEV_LEFTSHIFT) {
+            mod_codes.push(EVDEV_LEFTSHIFT);
+        }
+        mod_codes
+    }
+
+    fn dispatch_key_down(
+        &mut self,
+        cid: &ClientId,
+        surface_id: u64,
+        key: &waybound_core::KeyCode,
+        modifiers: &[KeyModifier],
+    ) -> Result<()> {
         let Some((keycode, needs_shift)) = keycode_to_evdev(key) else {
             return Err(WayboundError::UnsupportedInput {
                 backend: "wayland-compositor".to_owned(),
@@ -876,28 +954,28 @@ impl CompositorState {
             return Ok(());
         }
 
-        let mut mod_codes: Vec<u32> = modifiers.iter().map(|m| modifier_to_evdev(*m)).collect();
-        if needs_shift && !mod_codes.contains(&EVDEV_LEFTSHIFT) {
-            mod_codes.push(EVDEV_LEFTSHIFT);
-        }
-        let mod_mask = modifier_xkb_mask(modifiers, needs_shift);
-
-        // Press modifiers
+        let mod_codes = Self::dedup_mod_codes(modifiers, needs_shift);
+        let prev_mask = self.active_mod_mask();
         for &mcode in &mod_codes {
-            let serial = self.next_serial();
-            let time_ms = self.elapsed_ms();
-            for kb in &keyboards {
-                kb.key(serial, time_ms, mcode, wl_keyboard::KeyState::Pressed);
+            if let Some(idx) = Self::evdev_mod_index(mcode) {
+                if self.depressed_mods[idx] == 0 {
+                    let serial = self.next_serial();
+                    let time_ms = self.elapsed_ms();
+                    for kb in &keyboards {
+                        kb.key(serial, time_ms, mcode, wl_keyboard::KeyState::Pressed);
+                    }
+                }
+                self.depressed_mods[idx] = self.depressed_mods[idx].saturating_add(1);
             }
         }
-        if mod_mask != 0 {
+        let new_mask = self.active_mod_mask();
+        if new_mask != prev_mask {
             let serial = self.next_serial();
             for kb in &keyboards {
-                kb.modifiers(serial, mod_mask, 0, 0, 0);
+                kb.modifiers(serial, new_mask, 0, 0, 0);
             }
         }
 
-        // Press key
         let press_serial = self.next_serial();
         let press_time = self.elapsed_ms();
         for kb in &keyboards {
@@ -908,39 +986,66 @@ impl CompositorState {
                 wl_keyboard::KeyState::Pressed,
             );
         }
+        Ok(())
+    }
 
-        if hold_ms > 0 {
-            let _ = display.flush_clients();
-            thread::sleep(Duration::from_millis(hold_ms.min(MAX_HOLD_MS)));
-        }
+    fn dispatch_key_up(
+        &mut self,
+        cid: &ClientId,
+        surface_id: u64,
+        key: &waybound_core::KeyCode,
+        modifiers: &[KeyModifier],
+    ) -> Result<()> {
+        let Some((keycode, needs_shift)) = keycode_to_evdev(key) else {
+            return Err(WayboundError::UnsupportedInput {
+                backend: "wayland-compositor".to_owned(),
+                reason: format!("key {key:?} is not mapped in the US-QWERTY keymap"),
+            });
+        };
 
-        // Release key
-        let release_serial = self.next_serial();
-        let release_time = self.elapsed_ms();
-        for kb in &keyboards {
-            kb.key(
-                release_serial,
-                release_time,
-                keycode,
-                wl_keyboard::KeyState::Released,
-            );
-        }
-
-        // Release modifiers
-        if mod_mask != 0 {
-            let serial = self.next_serial();
+        let keyboards = self.ensure_keyboard_focus(cid, surface_id);
+        if !keyboards.is_empty() {
+            let release_serial = self.next_serial();
+            let release_time = self.elapsed_ms();
             for kb in &keyboards {
-                kb.modifiers(serial, 0, 0, 0, 0);
+                kb.key(
+                    release_serial,
+                    release_time,
+                    keycode,
+                    wl_keyboard::KeyState::Released,
+                );
             }
         }
+
+        let mod_codes = Self::dedup_mod_codes(modifiers, needs_shift);
+        let prev_mask = self.active_mod_mask();
+        let mut released_mods = Vec::with_capacity(mod_codes.len());
         for &mcode in mod_codes.iter().rev() {
-            let serial = self.next_serial();
-            let time_ms = self.elapsed_ms();
-            for kb in &keyboards {
-                kb.key(serial, time_ms, mcode, wl_keyboard::KeyState::Released);
+            if let Some(idx) = Self::evdev_mod_index(mcode)
+                && self.depressed_mods[idx] > 0
+            {
+                self.depressed_mods[idx] -= 1;
+                if self.depressed_mods[idx] == 0 {
+                    released_mods.push(mcode);
+                }
             }
         }
-
+        let new_mask = self.active_mod_mask();
+        if !keyboards.is_empty() {
+            if new_mask != prev_mask {
+                let serial = self.next_serial();
+                for kb in &keyboards {
+                    kb.modifiers(serial, new_mask, 0, 0, 0);
+                }
+            }
+            for mcode in released_mods {
+                let serial = self.next_serial();
+                let time_ms = self.elapsed_ms();
+                for kb in &keyboards {
+                    kb.key(serial, time_ms, mcode, wl_keyboard::KeyState::Released);
+                }
+            }
+        }
         Ok(())
     }
     fn destroy_surface(&mut self, surface_id: u64) {
@@ -962,6 +1067,7 @@ impl CompositorState {
             .is_some_and(|(_, sid)| *sid == surface_id)
         {
             self.keyboard_focus = None;
+            self.depressed_mods = [0; 4];
         }
     }
 

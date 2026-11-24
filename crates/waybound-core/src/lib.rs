@@ -26,13 +26,13 @@ pub use fingerprint::{
 pub use input::{InputEvent, KeyCode, KeyModifier, MouseButton, Point};
 pub use locator::{AccessibilityNode, Bounds, LocatorQuery, Role};
 pub use motion::{
-    KeystrokeStep, MotionConfig, MotionStep, MotorProfile, ScrollStep, ScrollStyle, SplitMix64,
-    action_pause_for, double_click_gap_for, erfc_approx, hover_pause_before_click, hover_pause_for,
-    key_delay, key_hold_for, key_hold_ms, minimum_jerk, mouse_hold_for, mouse_hold_ms,
-    pick_click_point, pick_click_point_from, plan_click_slip, plan_human_pointer_path,
-    plan_human_pointer_path_with_profile, plan_pointer_path, plan_scroll_burst,
-    plan_scroll_burst_with_profile, plan_typing_sequence, reading_pause_for,
-    sigma_lognormal_progress,
+    KeyAction, KeyTimelineEvent, KeystrokeStep, MotionConfig, MotionStep, MotorProfile, ScrollStep,
+    ScrollStyle, SplitMix64, action_pause_for, double_click_gap_for, erfc_approx,
+    hover_pause_before_click, hover_pause_for, key_delay, key_hold_for, key_hold_ms, minimum_jerk,
+    mouse_hold_for, mouse_hold_ms, pick_click_point, pick_click_point_from, plan_click_slip,
+    plan_human_pointer_path, plan_human_pointer_path_with_profile, plan_pointer_path,
+    plan_rollover_typing_events, plan_scroll_burst, plan_scroll_burst_with_profile,
+    plan_typing_sequence, reading_pause_for, sigma_lognormal_progress,
 };
 pub use network::{
     CapturedResponse, CapturedWebSocketFrame, HttpHeader, NetworkStats, WebSocketDirection,

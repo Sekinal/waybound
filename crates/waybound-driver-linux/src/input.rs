@@ -104,6 +104,32 @@ fn xdotool_keysym(ch: char) -> String {
     }
 }
 
+fn xdotool_key_spec(key: &KeyCode, modifiers: &[KeyModifier]) -> String {
+    let mut parts: Vec<String> = modifiers
+        .iter()
+        .map(|m| xdotool_modifier(*m).to_owned())
+        .collect();
+    let key_part = match key {
+        KeyCode::Enter => "Return".to_owned(),
+        KeyCode::Tab => "Tab".to_owned(),
+        KeyCode::Escape => "Escape".to_owned(),
+        KeyCode::Backspace => "BackSpace".to_owned(),
+        KeyCode::ArrowLeft => "Left".to_owned(),
+        KeyCode::ArrowRight => "Right".to_owned(),
+        KeyCode::ArrowUp => "Up".to_owned(),
+        KeyCode::ArrowDown => "Down".to_owned(),
+        KeyCode::Space => "space".to_owned(),
+        KeyCode::Delete => "Delete".to_owned(),
+        KeyCode::Home => "Home".to_owned(),
+        KeyCode::End => "End".to_owned(),
+        KeyCode::PageUp => "Prior".to_owned(),
+        KeyCode::PageDown => "Next".to_owned(),
+        KeyCode::Char(ch) => xdotool_keysym(*ch),
+    };
+    parts.push(key_part);
+    parts.join("+")
+}
+
 /// Builds the sequence of `xdotool` argument vectors for an [`InputEvent`].
 #[must_use]
 pub fn build_xdotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
@@ -182,34 +208,17 @@ pub fn build_xdotool_commands(event: &InputEvent) -> Vec<Vec<String>> {
                 ]];
             }
 
-            let mut parts: Vec<String> = modifiers
-                .iter()
-                .map(|m| xdotool_modifier(*m).to_owned())
-                .collect();
-            let key_part = match key {
-                KeyCode::Enter => "Return".to_owned(),
-                KeyCode::Tab => "Tab".to_owned(),
-                KeyCode::Escape => "Escape".to_owned(),
-                KeyCode::Backspace => "BackSpace".to_owned(),
-                KeyCode::ArrowLeft => "Left".to_owned(),
-                KeyCode::ArrowRight => "Right".to_owned(),
-                KeyCode::ArrowUp => "Up".to_owned(),
-                KeyCode::ArrowDown => "Down".to_owned(),
-                KeyCode::Space => "space".to_owned(),
-                KeyCode::Delete => "Delete".to_owned(),
-                KeyCode::Home => "Home".to_owned(),
-                KeyCode::End => "End".to_owned(),
-                KeyCode::PageUp => "Prior".to_owned(),
-                KeyCode::PageDown => "Next".to_owned(),
-                KeyCode::Char(ch) => xdotool_keysym(*ch),
-            };
-            parts.push(key_part);
-
             vec![vec![
                 "key".to_owned(),
                 "--clearmodifiers".to_owned(),
-                parts.join("+"),
+                xdotool_key_spec(key, modifiers),
             ]]
+        }
+        InputEvent::KeyDown { key, modifiers } => {
+            vec![vec!["keydown".to_owned(), xdotool_key_spec(key, modifiers)]]
+        }
+        InputEvent::KeyUp { key, modifiers } => {
+            vec![vec!["keyup".to_owned(), xdotool_key_spec(key, modifiers)]]
         }
     }
 }
@@ -231,59 +240,120 @@ const fn ydotool_modifier_keycode(modifier: KeyModifier) -> u16 {
     }
 }
 
-/// Maps common ASCII characters to Linux `input-event-codes.h` keycodes.
-const fn linux_char_keycode(ch: char) -> Option<u16> {
-    match ch.to_ascii_lowercase() {
-        '1' => Some(2),
-        '2' => Some(3),
-        '3' => Some(4),
-        '4' => Some(5),
-        '5' => Some(6),
-        '6' => Some(7),
-        '7' => Some(8),
-        '8' => Some(9),
-        '9' => Some(10),
-        '0' => Some(11),
-        '-' => Some(12),
-        '=' => Some(13),
-        'q' => Some(16),
-        'w' => Some(17),
-        'e' => Some(18),
-        'r' => Some(19),
-        't' => Some(20),
-        'y' => Some(21),
-        'u' => Some(22),
-        'i' => Some(23),
-        'o' => Some(24),
-        'p' => Some(25),
-        '[' => Some(26),
-        ']' => Some(27),
-        'a' => Some(30),
-        's' => Some(31),
-        'd' => Some(32),
-        'f' => Some(33),
-        'g' => Some(34),
-        'h' => Some(35),
-        'j' => Some(36),
-        'k' => Some(37),
-        'l' => Some(38),
-        ';' => Some(39),
-        '\'' => Some(40),
-        '`' => Some(41),
-        '\\' => Some(43),
-        'z' => Some(44),
-        'x' => Some(45),
-        'c' => Some(46),
-        'v' => Some(47),
-        'b' => Some(48),
-        'n' => Some(49),
-        'm' => Some(50),
-        ',' => Some(51),
-        '.' => Some(52),
-        '/' => Some(53),
-        ' ' => Some(57),
-        _ => None,
+/// Maps US-QWERTY ASCII characters to Linux `input-event-codes.h` `(keycode, needs_shift)`.
+const fn linux_char_keycode_with_shift(ch: char) -> Option<(u16, bool)> {
+    let (base, shifted) = match ch {
+        'A'..='Z' => (ch.to_ascii_lowercase(), true),
+        '!' => ('1', true),
+        '@' => ('2', true),
+        '#' => ('3', true),
+        '$' => ('4', true),
+        '%' => ('5', true),
+        '^' => ('6', true),
+        '&' => ('7', true),
+        '*' => ('8', true),
+        '(' => ('9', true),
+        ')' => ('0', true),
+        '_' => ('-', true),
+        '+' => ('=', true),
+        '{' => ('[', true),
+        '}' => (']', true),
+        ':' => (';', true),
+        '"' => ('\'', true),
+        '~' => ('`', true),
+        '|' => ('\\', true),
+        '<' => (',', true),
+        '>' => ('.', true),
+        '?' => ('/', true),
+        other => (other, false),
+    };
+    let code = match base {
+        '1' => 2,
+        '2' => 3,
+        '3' => 4,
+        '4' => 5,
+        '5' => 6,
+        '6' => 7,
+        '7' => 8,
+        '8' => 9,
+        '9' => 10,
+        '0' => 11,
+        '-' => 12,
+        '=' => 13,
+        'q' => 16,
+        'w' => 17,
+        'e' => 18,
+        'r' => 19,
+        't' => 20,
+        'y' => 21,
+        'u' => 22,
+        'i' => 23,
+        'o' => 24,
+        'p' => 25,
+        '[' => 26,
+        ']' => 27,
+        'a' => 30,
+        's' => 31,
+        'd' => 32,
+        'f' => 33,
+        'g' => 34,
+        'h' => 35,
+        'j' => 36,
+        'k' => 37,
+        'l' => 38,
+        ';' => 39,
+        '\'' => 40,
+        '`' => 41,
+        '\\' => 43,
+        'z' => 44,
+        'x' => 45,
+        'c' => 46,
+        'v' => 47,
+        'b' => 48,
+        'n' => 49,
+        'm' => 50,
+        ',' => 51,
+        '.' => 52,
+        '/' => 53,
+        ' ' => 57,
+        _ => return None,
+    };
+    Some((code, shifted))
+}
+
+const fn linux_key_with_shift(key: &KeyCode) -> Option<(u16, bool)> {
+    match key {
+        KeyCode::Enter => Some((28, false)),
+        KeyCode::Tab => Some((15, false)),
+        KeyCode::Escape => Some((1, false)),
+        KeyCode::Backspace => Some((14, false)),
+        KeyCode::ArrowLeft => Some((105, false)),
+        KeyCode::ArrowRight => Some((106, false)),
+        KeyCode::ArrowUp => Some((103, false)),
+        KeyCode::ArrowDown => Some((108, false)),
+        KeyCode::Space => Some((57, false)),
+        KeyCode::Delete => Some((111, false)),
+        KeyCode::Home => Some((102, false)),
+        KeyCode::End => Some((107, false)),
+        KeyCode::PageUp => Some((104, false)),
+        KeyCode::PageDown => Some((109, false)),
+        KeyCode::Char(ch) => linux_char_keycode_with_shift(*ch),
     }
+}
+
+fn ydotool_mod_codes(modifiers: &[KeyModifier], needs_shift: bool) -> Vec<u16> {
+    let mut codes = Vec::with_capacity(modifiers.len() + 1);
+    for modifier in modifiers {
+        let code = ydotool_modifier_keycode(*modifier);
+        if !codes.contains(&code) {
+            codes.push(code);
+        }
+    }
+    let shift = ydotool_modifier_keycode(KeyModifier::Shift);
+    if needs_shift && !codes.contains(&shift) {
+        codes.push(shift);
+    }
+    codes
 }
 
 /// Builds a `ydotool click` that only presses (`down`) or only releases `button`.
@@ -361,6 +431,82 @@ pub fn build_ydotool_commands(
     }
 }
 
+fn ydotool_key_press_commands(key: &KeyCode, modifiers: &[KeyModifier]) -> Vec<Vec<String>> {
+    if modifiers.is_empty()
+        && let KeyCode::Char(ch) = key
+        && !ch.is_control()
+    {
+        return vec![vec![
+            "type".to_owned(),
+            "--key-delay".to_owned(),
+            "0".to_owned(),
+            "--".to_owned(),
+            ch.to_string(),
+        ]];
+    }
+
+    let Some((code, needs_shift)) = linux_key_with_shift(key) else {
+        if let KeyCode::Char(ch) = key {
+            return vec![vec![
+                "type".to_owned(),
+                "--key-delay".to_owned(),
+                "0".to_owned(),
+                "--".to_owned(),
+                ch.to_string(),
+            ]];
+        }
+        return Vec::new();
+    };
+
+    let mod_codes = ydotool_mod_codes(modifiers, needs_shift);
+    let mut args = vec!["key".to_owned()];
+    for mcode in &mod_codes {
+        args.push(format!("{mcode}:1"));
+    }
+    args.push(format!("{code}:1"));
+    args.push(format!("{code}:0"));
+    for mcode in mod_codes.iter().rev() {
+        args.push(format!("{mcode}:0"));
+    }
+    vec![args]
+}
+
+fn ydotool_key_edge_commands(
+    key: &KeyCode,
+    modifiers: &[KeyModifier],
+    down: bool,
+) -> Vec<Vec<String>> {
+    if let Some((code, needs_shift)) = linux_key_with_shift(key) {
+        let mod_codes = ydotool_mod_codes(modifiers, needs_shift);
+        let mut args = vec!["key".to_owned()];
+        if down {
+            for mcode in &mod_codes {
+                args.push(format!("{mcode}:1"));
+            }
+            args.push(format!("{code}:1"));
+        } else {
+            args.push(format!("{code}:0"));
+            for mcode in mod_codes.iter().rev() {
+                args.push(format!("{mcode}:0"));
+            }
+        }
+        vec![args]
+    } else if down
+        && let KeyCode::Char(ch) = key
+        && !ch.is_control()
+    {
+        vec![vec![
+            "type".to_owned(),
+            "--key-delay".to_owned(),
+            "0".to_owned(),
+            "--".to_owned(),
+            ch.to_string(),
+        ]]
+    } else {
+        Vec::new()
+    }
+}
+
 /// `ydotool` commands for events that do not depend on the pointer position.
 fn ydotool_stateless_commands(event: &InputEvent) -> Vec<Vec<String>> {
     match event {
@@ -398,62 +544,9 @@ fn ydotool_stateless_commands(event: &InputEvent) -> Vec<Vec<String>> {
                 ]]
             }
         }
-        InputEvent::KeyPress { key, modifiers, .. } => {
-            if modifiers.is_empty()
-                && let KeyCode::Char(ch) = key
-                && !ch.is_control()
-            {
-                return vec![vec![
-                    "type".to_owned(),
-                    "--key-delay".to_owned(),
-                    "0".to_owned(),
-                    "--".to_owned(),
-                    ch.to_string(),
-                ]];
-            }
-
-            let primary_code = match key {
-                KeyCode::Enter => Some(28),
-                KeyCode::Tab => Some(15),
-                KeyCode::Escape => Some(1),
-                KeyCode::Backspace => Some(14),
-                KeyCode::ArrowLeft => Some(105),
-                KeyCode::ArrowRight => Some(106),
-                KeyCode::ArrowUp => Some(103),
-                KeyCode::ArrowDown => Some(108),
-                KeyCode::Space => Some(57),
-                KeyCode::Delete => Some(111),
-                KeyCode::Home => Some(102),
-                KeyCode::End => Some(107),
-                KeyCode::PageUp => Some(104),
-                KeyCode::PageDown => Some(109),
-                KeyCode::Char(ch) => linux_char_keycode(*ch),
-            };
-
-            let Some(code) = primary_code else {
-                if let KeyCode::Char(ch) = key {
-                    return vec![vec![
-                        "type".to_owned(),
-                        "--key-delay".to_owned(),
-                        "0".to_owned(),
-                        "--".to_owned(),
-                        ch.to_string(),
-                    ]];
-                }
-                return Vec::new();
-            };
-
-            let mut args = vec!["key".to_owned()];
-            for modifier in modifiers {
-                args.push(format!("{}:1", ydotool_modifier_keycode(*modifier)));
-            }
-            args.push(format!("{code}:1"));
-            args.push(format!("{code}:0"));
-            for modifier in modifiers.iter().rev() {
-                args.push(format!("{}:0", ydotool_modifier_keycode(*modifier)));
-            }
-            vec![args]
-        }
+        InputEvent::KeyPress { key, modifiers, .. } => ydotool_key_press_commands(key, modifiers),
+        InputEvent::KeyDown { key, modifiers } => ydotool_key_edge_commands(key, modifiers, true),
+        InputEvent::KeyUp { key, modifiers } => ydotool_key_edge_commands(key, modifiers, false),
     }
 }
 
@@ -548,11 +641,26 @@ pub fn dispatch_input(
             key: KeyCode::Char(ch),
             modifiers,
             ..
+        }
+        | InputEvent::KeyDown {
+            key: KeyCode::Char(ch),
+            modifiers,
         } = event
         && modifiers.is_empty()
         && !ch.is_ascii()
         && !ch.is_control()
         && try_paste_unicode_x11(*ch, display)?
+    {
+        return Ok(());
+    }
+    if server == DisplayServer::X11
+        && let InputEvent::KeyUp {
+            key: KeyCode::Char(ch),
+            modifiers,
+        } = event
+        && modifiers.is_empty()
+        && !ch.is_ascii()
+        && !ch.is_control()
     {
         return Ok(());
     }
@@ -860,5 +968,32 @@ mod tests {
             .len(),
             0
         );
+    }
+
+    #[test]
+    fn builds_key_down_and_up_commands_for_xdotool_and_ydotool() {
+        let down = InputEvent::KeyDown {
+            key: KeyCode::Char('t'),
+            modifiers: Vec::new(),
+        };
+        let up = InputEvent::KeyUp {
+            key: KeyCode::Char('t'),
+            modifiers: Vec::new(),
+        };
+        assert_eq!(build_xdotool_commands(&down), vec![vec!["keydown", "t"]]);
+        assert_eq!(build_xdotool_commands(&up), vec![vec!["keyup", "t"]]);
+        assert_eq!(ydo(&down), vec![vec!["key", "20:1"]]);
+        assert_eq!(ydo(&up), vec![vec!["key", "20:0"]]);
+
+        let shifted_down = InputEvent::KeyDown {
+            key: KeyCode::Char('A'),
+            modifiers: Vec::new(),
+        };
+        let shifted_up = InputEvent::KeyUp {
+            key: KeyCode::Char('A'),
+            modifiers: Vec::new(),
+        };
+        assert_eq!(ydo(&shifted_down), vec![vec!["key", "42:1", "30:1"]]);
+        assert_eq!(ydo(&shifted_up), vec![vec!["key", "30:0", "42:0"]]);
     }
 }
