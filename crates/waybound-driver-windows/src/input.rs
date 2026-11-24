@@ -328,53 +328,97 @@ pub mod win32_input {
                 }
                 send_inputs(&batch)
             }
-            InputEvent::KeyPress { key, modifiers, .. } => {
-                let has_shortcut_modifier = modifiers.iter().any(|m| {
-                    matches!(
-                        m,
-                        KeyModifier::Control | KeyModifier::Alt | KeyModifier::Meta
-                    )
-                });
+            InputEvent::KeyPress { key, modifiers, .. } => dispatch_key_press(key, modifiers),
+            InputEvent::KeyDown { key, modifiers } => dispatch_key_edge(key, modifiers, false),
+            InputEvent::KeyUp { key, modifiers } => dispatch_key_edge(key, modifiers, true),
+        }
+    }
 
-                if !has_shortcut_modifier
-                    && modifiers.is_empty()
-                    && let KeyCode::Char(c) = key
-                    && !c.is_control()
-                {
-                    let mut utf16 = [0u16; 2];
-                    let encoded = c.encode_utf16(&mut utf16);
-                    let mut batch = Vec::with_capacity(encoded.len() * 2);
-                    for &unit in encoded.iter() {
-                        batch.push(keybd_unicode_input(unit, false));
-                        batch.push(keybd_unicode_input(unit, true));
-                    }
-                    return send_inputs(&batch);
-                }
+    fn dispatch_key_press(key: &KeyCode, modifiers: &[KeyModifier]) -> Result<()> {
+        let has_shortcut_modifier = modifiers.iter().any(|m| {
+            matches!(
+                m,
+                KeyModifier::Control | KeyModifier::Alt | KeyModifier::Meta
+            )
+        });
 
-                let mut batch = Vec::with_capacity(modifiers.len() * 2 + 4);
-                for &modifier in modifiers {
-                    batch.push(keybd_vk_input(modifier_to_vk(modifier), false));
-                }
+        if !has_shortcut_modifier
+            && modifiers.is_empty()
+            && let KeyCode::Char(c) = key
+            && !c.is_control()
+        {
+            let mut utf16 = [0u16; 2];
+            let encoded = c.encode_utf16(&mut utf16);
+            let mut batch = Vec::with_capacity(encoded.len() * 2);
+            for &unit in encoded.iter() {
+                batch.push(keybd_unicode_input(unit, false));
+                batch.push(keybd_unicode_input(unit, true));
+            }
+            return send_inputs(&batch);
+        }
 
-                if let Some(vk) = key_to_vk(key.clone()) {
-                    batch.push(keybd_vk_input(vk, false));
-                    batch.push(keybd_vk_input(vk, true));
-                } else if let KeyCode::Char(c) = key {
-                    let mut utf16 = [0u16; 2];
-                    let encoded = c.encode_utf16(&mut utf16);
-                    for &unit in encoded.iter() {
-                        batch.push(keybd_unicode_input(unit, false));
-                        batch.push(keybd_unicode_input(unit, true));
-                    }
-                }
+        let mut batch = Vec::with_capacity(modifiers.len() * 2 + 4);
+        for &modifier in modifiers {
+            batch.push(keybd_vk_input(modifier_to_vk(modifier), false));
+        }
 
-                for &modifier in modifiers.iter().rev() {
-                    batch.push(keybd_vk_input(modifier_to_vk(modifier), true));
-                }
-
-                send_inputs(&batch)
+        if let Some(vk) = key_to_vk(key.clone()) {
+            batch.push(keybd_vk_input(vk, false));
+            batch.push(keybd_vk_input(vk, true));
+        } else if let KeyCode::Char(c) = key {
+            let mut utf16 = [0u16; 2];
+            let encoded = c.encode_utf16(&mut utf16);
+            for &unit in encoded.iter() {
+                batch.push(keybd_unicode_input(unit, false));
+                batch.push(keybd_unicode_input(unit, true));
             }
         }
+
+        for &modifier in modifiers.iter().rev() {
+            batch.push(keybd_vk_input(modifier_to_vk(modifier), true));
+        }
+
+        send_inputs(&batch)
+    }
+
+    fn dispatch_key_edge(key: &KeyCode, modifiers: &[KeyModifier], key_up: bool) -> Result<()> {
+        if modifiers.is_empty()
+            && let KeyCode::Char(c) = key
+            && !c.is_control()
+        {
+            let mut utf16 = [0u16; 2];
+            let encoded = c.encode_utf16(&mut utf16);
+            let mut batch = Vec::with_capacity(encoded.len());
+            for &unit in encoded.iter() {
+                batch.push(keybd_unicode_input(unit, key_up));
+            }
+            return send_inputs(&batch);
+        }
+
+        let mut batch = Vec::with_capacity(modifiers.len() + 2);
+        if !key_up {
+            for &modifier in modifiers {
+                batch.push(keybd_vk_input(modifier_to_vk(modifier), false));
+            }
+        }
+
+        if let Some(vk) = key_to_vk(key.clone()) {
+            batch.push(keybd_vk_input(vk, key_up));
+        } else if let KeyCode::Char(c) = key {
+            let mut utf16 = [0u16; 2];
+            let encoded = c.encode_utf16(&mut utf16);
+            for &unit in encoded.iter() {
+                batch.push(keybd_unicode_input(unit, key_up));
+            }
+        }
+
+        if key_up {
+            for &modifier in modifiers.iter().rev() {
+                batch.push(keybd_vk_input(modifier_to_vk(modifier), true));
+            }
+        }
+
+        send_inputs(&batch)
     }
 }
 

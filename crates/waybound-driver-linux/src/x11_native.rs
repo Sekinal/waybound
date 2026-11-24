@@ -184,6 +184,8 @@ impl X11Client {
                 modifiers,
                 hold_ms,
             } => self.dispatch_key(key, modifiers, *hold_ms),
+            InputEvent::KeyDown { key, modifiers } => self.dispatch_key_edge(key, modifiers, true),
+            InputEvent::KeyUp { key, modifiers } => self.dispatch_key_edge(key, modifiers, false),
         }
     }
 
@@ -211,22 +213,7 @@ impl X11Client {
         Ok(())
     }
 
-    fn dispatch_key(&self, key: &KeyCode, modifiers: &[KeyModifier], hold_ms: u64) -> Result<()> {
-        // Non-ASCII characters (accented Latin, CJK, emoji) are pasted via X11 clipboard + Ctrl+v.
-        if modifiers.is_empty()
-            && let KeyCode::Char(ch) = key
-            && !ch.is_ascii()
-            && !ch.is_control()
-        {
-            if try_paste_unicode_x11(*ch, self.display.as_deref())? {
-                return Ok(());
-            }
-            return Err(WayboundError::BackendUnavailable {
-                backend: BACKEND_NAME.to_owned(),
-                reason: format!("xclip unavailable for non-ASCII character {ch:?}"),
-            });
-        }
-
+    fn resolve_key(&self, key: &KeyCode, modifiers: &[KeyModifier]) -> Result<(u8, Vec<u8>)> {
         let keysym = keycode_to_keysym(key).ok_or_else(|| WayboundError::BackendUnavailable {
             backend: BACKEND_NAME.to_owned(),
             reason: format!("no X11 keysym for key {key:?}"),
@@ -256,6 +243,27 @@ impl X11Client {
             mod_kcs.push(shift_kc);
         }
 
+        Ok((kc, mod_kcs))
+    }
+
+    fn dispatch_key(&self, key: &KeyCode, modifiers: &[KeyModifier], hold_ms: u64) -> Result<()> {
+        // Non-ASCII characters (accented Latin, CJK, emoji) are pasted via X11 clipboard + Ctrl+v.
+        if modifiers.is_empty()
+            && let KeyCode::Char(ch) = key
+            && !ch.is_ascii()
+            && !ch.is_control()
+        {
+            if try_paste_unicode_x11(*ch, self.display.as_deref())? {
+                return Ok(());
+            }
+            return Err(WayboundError::BackendUnavailable {
+                backend: BACKEND_NAME.to_owned(),
+                reason: format!("xclip unavailable for non-ASCII character {ch:?}"),
+            });
+        }
+
+        let (kc, mod_kcs) = self.resolve_key(key, modifiers)?;
+
         for &mkc in &mod_kcs {
             self.fake_input(KEY_PRESS_EVENT, mkc, 0, 0)?;
         }
@@ -269,6 +277,46 @@ impl X11Client {
         self.fake_input(KEY_RELEASE_EVENT, kc, 0, 0)?;
         for &mkc in mod_kcs.iter().rev() {
             self.fake_input(KEY_RELEASE_EVENT, mkc, 0, 0)?;
+        }
+        self.flush()
+    }
+
+    fn dispatch_key_edge(
+        &self,
+        key: &KeyCode,
+        modifiers: &[KeyModifier],
+        down: bool,
+    ) -> Result<()> {
+        // Non-ASCII characters are pasted atomically on `KeyDown`; `KeyUp` is a harmless no-op.
+        if modifiers.is_empty()
+            && let KeyCode::Char(ch) = key
+            && !ch.is_ascii()
+            && !ch.is_control()
+        {
+            if !down {
+                return Ok(());
+            }
+            if try_paste_unicode_x11(*ch, self.display.as_deref())? {
+                return Ok(());
+            }
+            return Err(WayboundError::BackendUnavailable {
+                backend: BACKEND_NAME.to_owned(),
+                reason: format!("xclip unavailable for non-ASCII character {ch:?}"),
+            });
+        }
+
+        let (kc, mod_kcs) = self.resolve_key(key, modifiers)?;
+
+        if down {
+            for &mkc in &mod_kcs {
+                self.fake_input(KEY_PRESS_EVENT, mkc, 0, 0)?;
+            }
+            self.fake_input(KEY_PRESS_EVENT, kc, 0, 0)?;
+        } else {
+            self.fake_input(KEY_RELEASE_EVENT, kc, 0, 0)?;
+            for &mkc in mod_kcs.iter().rev() {
+                self.fake_input(KEY_RELEASE_EVENT, mkc, 0, 0)?;
+            }
         }
         self.flush()
     }

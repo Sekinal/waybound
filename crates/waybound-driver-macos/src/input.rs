@@ -51,6 +51,8 @@ pub fn dispatch_cg_event(event: &InputEvent, last_cursor: &mut Point) -> Result<
             modifiers,
             hold_ms,
         } => post_key(key, modifiers, *hold_ms),
+        InputEvent::KeyDown { key, modifiers } => post_key_down(key, modifiers),
+        InputEvent::KeyUp { key, modifiers } => post_key_up(key, modifiers),
         InputEvent::MouseDown { button } => {
             let events = button_events(*button);
             if let Some(actual) = current_cursor_position() {
@@ -202,7 +204,10 @@ pub fn current_cursor_position() -> Option<Point> {
     })
 }
 
-fn post_key(key: &KeyCode, modifiers: &[KeyModifier], hold_ms: u64) -> Result<()> {
+fn resolve_key(
+    key: &KeyCode,
+    modifiers: &[KeyModifier],
+) -> Result<(u16, Option<char>, Vec<KeyModifier>)> {
     let mut held: Vec<KeyModifier> = Vec::with_capacity(modifiers.len() + 1);
     for modifier in modifiers {
         if !held.contains(modifier) {
@@ -211,20 +216,20 @@ fn post_key(key: &KeyCode, modifiers: &[KeyModifier], hold_ms: u64) -> Result<()
     }
 
     match key {
-        KeyCode::Enter => post_chord(0x24, None, &held, hold_ms),
-        KeyCode::Tab => post_chord(0x30, None, &held, hold_ms),
-        KeyCode::Escape => post_chord(0x35, None, &held, hold_ms),
-        KeyCode::Backspace => post_chord(0x33, None, &held, hold_ms),
-        KeyCode::ArrowLeft => post_chord(0x7B, None, &held, hold_ms),
-        KeyCode::ArrowRight => post_chord(0x7C, None, &held, hold_ms),
-        KeyCode::ArrowUp => post_chord(0x7E, None, &held, hold_ms),
-        KeyCode::ArrowDown => post_chord(0x7D, None, &held, hold_ms),
-        KeyCode::Space => post_chord(0x31, Some(' '), &held, hold_ms),
-        KeyCode::Delete => post_chord(0x75, None, &held, hold_ms),
-        KeyCode::Home => post_chord(0x73, None, &held, hold_ms),
-        KeyCode::End => post_chord(0x77, None, &held, hold_ms),
-        KeyCode::PageUp => post_chord(0x74, None, &held, hold_ms),
-        KeyCode::PageDown => post_chord(0x79, None, &held, hold_ms),
+        KeyCode::Enter => Ok((0x24, None, held)),
+        KeyCode::Tab => Ok((0x30, None, held)),
+        KeyCode::Escape => Ok((0x35, None, held)),
+        KeyCode::Backspace => Ok((0x33, None, held)),
+        KeyCode::ArrowLeft => Ok((0x7B, None, held)),
+        KeyCode::ArrowRight => Ok((0x7C, None, held)),
+        KeyCode::ArrowUp => Ok((0x7E, None, held)),
+        KeyCode::ArrowDown => Ok((0x7D, None, held)),
+        KeyCode::Space => Ok((0x31, Some(' '), held)),
+        KeyCode::Delete => Ok((0x75, None, held)),
+        KeyCode::Home => Ok((0x73, None, held)),
+        KeyCode::End => Ok((0x77, None, held)),
+        KeyCode::PageUp => Ok((0x74, None, held)),
+        KeyCode::PageDown => Ok((0x79, None, held)),
         KeyCode::Char(ch) => match (ansi_keycode(*ch), held.is_empty()) {
             // Plain typing: the real ANSI key (so `KeyboardEvent.code` is right), Shift held
             // for capitals and shifted symbols, and the character pinned via the Unicode
@@ -233,17 +238,17 @@ fn post_key(key: &KeyCode, modifiers: &[KeyModifier], hold_ms: u64) -> Result<()
                 if shifted {
                     held.push(KeyModifier::Shift);
                 }
-                post_chord(keycode, Some(*ch), &held, hold_ms)
+                Ok((keycode, Some(*ch), held))
             }
             // Shortcut: let the system derive the character from the key and modifiers.
             (Some((keycode, shifted)), false) => {
                 if shifted && !held.contains(&KeyModifier::Shift) {
                     held.push(KeyModifier::Shift);
                 }
-                post_chord(keycode, None, &held, hold_ms)
+                Ok((keycode, None, held))
             }
             // Non-ASCII text has no ANSI key; deliver it as a Unicode string.
-            (None, true) => post_chord(0, Some(*ch), &held, hold_ms),
+            (None, true) => Ok((0, Some(*ch), held)),
             // Never fall back to keycode 0 here: that is the A key, so an unmapped shortcut
             // would silently become e.g. Cmd+A (select all).
             (None, false) => Err(WayboundError::BackendUnavailable {
@@ -252,6 +257,57 @@ fn post_key(key: &KeyCode, modifiers: &[KeyModifier], hold_ms: u64) -> Result<()
             }),
         },
     }
+}
+
+fn post_key(key: &KeyCode, modifiers: &[KeyModifier], hold_ms: u64) -> Result<()> {
+    let (keycode, unicode, held) = resolve_key(key, modifiers)?;
+    post_chord(keycode, unicode, &held, hold_ms)
+}
+
+fn post_key_down(key: &KeyCode, modifiers: &[KeyModifier]) -> Result<()> {
+    let (keycode, unicode, held) = resolve_key(key, modifiers)?;
+    let mut flags = 0u64;
+    let mut pressed: Vec<KeyModifier> = Vec::with_capacity(held.len());
+
+    for modifier in &held {
+        flags |= modifier_flag(*modifier);
+        if let Err(err) = post_key_event(modifier_keycode(*modifier), true, flags, None) {
+            flags &= !modifier_flag(*modifier);
+            for prev in pressed.iter().rev() {
+                flags &= !modifier_flag(*prev);
+                let _ = post_key_event(modifier_keycode(*prev), false, flags, None);
+            }
+            return Err(err);
+        }
+        pressed.push(*modifier);
+    }
+
+    if let Err(err) = post_key_event(keycode, true, flags, unicode) {
+        for prev in pressed.iter().rev() {
+            flags &= !modifier_flag(*prev);
+            let _ = post_key_event(modifier_keycode(*prev), false, flags, None);
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn post_key_up(key: &KeyCode, modifiers: &[KeyModifier]) -> Result<()> {
+    let (keycode, unicode, held) = resolve_key(key, modifiers)?;
+    let mut flags = 0u64;
+    for modifier in &held {
+        flags |= modifier_flag(*modifier);
+    }
+
+    let mut result = post_key_event(keycode, false, flags, unicode);
+    for modifier in held.iter().rev() {
+        flags &= !modifier_flag(*modifier);
+        let released = post_key_event(modifier_keycode(*modifier), false, flags, None);
+        if result.is_ok() {
+            result = released;
+        }
+    }
+    result
 }
 
 /// Presses `modifiers`, taps `keycode`, then releases the modifiers in reverse order,

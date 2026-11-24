@@ -108,6 +108,25 @@ pub enum InputEvent {
         #[serde(default)]
         hold_ms: u64,
     },
+    /// Press `key` (optionally with `modifiers`) and keep it held until a matching [`InputEvent::KeyUp`].
+    KeyDown {
+        /// Key to press.
+        key: KeyCode,
+        /// Active modifiers to hold for this key.
+        #[serde(default)]
+        modifiers: Vec<KeyModifier>,
+    },
+    /// Release `key` previously pressed with [`InputEvent::KeyDown`].
+    ///
+    /// Releasing a key that is not currently held must succeed harmlessly so cleanup paths
+    /// can always release tracked keys.
+    KeyUp {
+        /// Key to release.
+        key: KeyCode,
+        /// Active modifiers paired with this release.
+        #[serde(default)]
+        modifiers: Vec<KeyModifier>,
+    },
     /// Press `button` at the current pointer position and keep it held.
     ///
     /// Must be paired with a later [`InputEvent::MouseUp`] for the same button.
@@ -218,6 +237,75 @@ mod tests {
         assert_eq!(
             encoded,
             Some(serde_json::json!({"kind": "pointer_move", "to": {"x": 3.0, "y": 4.0}}))
+        );
+    }
+
+    #[test]
+    fn key_down_and_up_round_trip_with_stable_wire_tags() {
+        let events = [
+            InputEvent::KeyDown {
+                key: KeyCode::Char('a'),
+                modifiers: Vec::new(),
+            },
+            InputEvent::KeyUp {
+                key: KeyCode::Char('a'),
+                modifiers: vec![KeyModifier::Shift],
+            },
+            InputEvent::KeyDown {
+                key: KeyCode::Enter,
+                modifiers: vec![KeyModifier::Control],
+            },
+        ];
+        for event in &events {
+            assert_eq!(round_trip(event).as_ref(), Some(event));
+        }
+
+        let down = serde_json::to_value(InputEvent::KeyDown {
+            key: KeyCode::Char('t'),
+            modifiers: Vec::new(),
+        })
+        .ok();
+        assert_eq!(
+            down,
+            Some(serde_json::json!({
+                "kind": "key_down",
+                "key": {"char": "t"},
+                "modifiers": []
+            }))
+        );
+
+        let up = serde_json::to_value(InputEvent::KeyUp {
+            key: KeyCode::Char('t'),
+            modifiers: Vec::new(),
+        })
+        .ok();
+        assert_eq!(
+            up,
+            Some(serde_json::json!({
+                "kind": "key_up",
+                "key": {"char": "t"},
+                "modifiers": []
+            }))
+        );
+
+        // `modifiers` defaults to empty when omitted on the wire.
+        let parsed_down: Option<InputEvent> =
+            serde_json::from_str(r#"{"kind":"key_down","key":"enter"}"#).ok();
+        assert_eq!(
+            parsed_down,
+            Some(InputEvent::KeyDown {
+                key: KeyCode::Enter,
+                modifiers: Vec::new(),
+            })
+        );
+        let parsed_up: Option<InputEvent> =
+            serde_json::from_str(r#"{"kind":"key_up","key":"space"}"#).ok();
+        assert_eq!(
+            parsed_up,
+            Some(InputEvent::KeyUp {
+                key: KeyCode::Space,
+                modifiers: Vec::new(),
+            })
         );
     }
 }

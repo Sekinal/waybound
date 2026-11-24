@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use waybound_core::{
-    AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, MouseButton, Point, Result, Role,
-    WayboundError, WindowSummary,
+    AccessibilityNode, BackendKind, Bounds, Driver, InputEvent, KeyCode, MouseButton, Point,
+    Result, Role, WayboundError, WindowSummary,
 };
 
 /// Minimal valid 1x1 transparent PNG bytes for hermetic screenshot tests.
@@ -91,6 +91,10 @@ struct MockState {
     positional_ids: bool,
     /// Visible viewport; when set, `Scroll` events shift every node by the scroll delta.
     viewport: Option<Bounds>,
+    /// Keys currently held via [`InputEvent::KeyDown`] (released on [`InputEvent::KeyUp`]).
+    held_keys: Vec<KeyCode>,
+    /// Characters accumulated from [`InputEvent::KeyDown`] events.
+    typed_text: String,
 }
 
 const fn bounds(x: f64, y: f64, width: f64, height: f64) -> Bounds {
@@ -282,6 +286,22 @@ impl MockDriver {
             .map_or_else(|_| Vec::new(), |g| g.scoped_events.clone())
     }
 
+    /// Returns keys currently held down via [`InputEvent::KeyDown`].
+    #[cfg(test)]
+    pub fn held_keys(&self) -> Vec<KeyCode> {
+        self.state
+            .lock()
+            .map_or_else(|_| Vec::new(), |g| g.held_keys.clone())
+    }
+
+    /// Returns text accumulated from [`InputEvent::KeyDown`] events.
+    #[cfg(test)]
+    pub fn typed_text(&self) -> String {
+        self.state
+            .lock()
+            .map_or_else(|_| String::new(), |g| g.typed_text.clone())
+    }
+
     /// Toggles the checked state of the enabled checkable node under the pointer, if any.
     fn click(&self) {
         let Ok(mut guard) = self.state.lock() else {
@@ -462,6 +482,28 @@ impl Driver for MockDriver {
                         node.bounds.x += delta_x;
                         node.bounds.y += delta_y;
                     }
+                }
+            }
+            InputEvent::KeyDown { key, .. } => {
+                if let Ok(mut guard) = self.state.lock() {
+                    match key {
+                        KeyCode::Char(ch) => guard.typed_text.push(*ch),
+                        KeyCode::Space => guard.typed_text.push(' '),
+                        KeyCode::Enter => guard.typed_text.push('\n'),
+                        KeyCode::Tab => guard.typed_text.push('\t'),
+                        KeyCode::Backspace => {
+                            let _ = guard.typed_text.pop();
+                        }
+                        _ => {}
+                    }
+                    guard.held_keys.push(key.clone());
+                }
+            }
+            InputEvent::KeyUp { key, .. } => {
+                if let Ok(mut guard) = self.state.lock()
+                    && let Some(pos) = guard.held_keys.iter().position(|k| k == key)
+                {
+                    let _ = guard.held_keys.remove(pos);
                 }
             }
             _ => {}
