@@ -163,3 +163,298 @@ export interface LocatorQuery {
   readonly within: LocatorQuery | null;
   readonly strict?: boolean;
 }
+
+/** Exact TLS `ClientHello` fingerprint observed on the wire from the live browser. */
+export interface TlsFingerprint {
+  readonly tlsVersion: number;
+  readonly cipherSuites: readonly number[];
+  readonly extensions: readonly number[];
+  readonly supportedGroups: readonly number[];
+  readonly ecPointFormats: readonly number[];
+  readonly signatureAlgorithms: readonly number[];
+  readonly alpnProtocols: readonly string[];
+  readonly supportedVersions: readonly number[];
+  readonly certCompressionAlgorithms: readonly number[];
+  readonly alpsProtocols: readonly string[];
+  readonly alpsUseNewCodepoint: boolean;
+  readonly pskKeyExchangeModes: readonly number[];
+  readonly greasePresent: boolean;
+  readonly hasStatusRequest: boolean;
+  readonly hasSignedCertTimestamp: boolean;
+  readonly hasSessionTicket: boolean;
+  readonly hasExtendedMasterSecret: boolean;
+  readonly hasRenegotiationInfo: boolean;
+  readonly hasEch: boolean;
+  readonly ja3String: string;
+  readonly ja3Hash: string;
+  readonly ja4: string;
+}
+
+/** Single HTTP/2 `SETTINGS` frame parameter in wire order. */
+export interface Http2Setting {
+  readonly id: number;
+  readonly value: number;
+}
+
+/** HTTP/2 `HEADERS` frame stream dependency / priority fields (RFC 9113). */
+export interface Http2StreamDependency {
+  readonly dependencyId: number;
+  readonly weight: number;
+  readonly exclusive: boolean;
+}
+
+/** Exact HTTP/2 connection & header framing fingerprint observed from the live browser. */
+export interface Http2Fingerprint {
+  readonly settings: readonly Http2Setting[];
+  readonly initialWindowUpdate: number | null;
+  readonly pseudoHeaderOrder: readonly string[];
+  readonly headersPriority?: Http2StreamDependency | null;
+  readonly akamaiFingerprint: string;
+}
+
+/** Ordered HTTP header `(name, value)` pair preserving exact wire order. */
+export interface HeaderEntry {
+  readonly name: string;
+  readonly value: string;
+}
+
+/** Cookie captured passively from live browser `Cookie` / `Set-Cookie` headers. */
+export interface CapturedCookie {
+  readonly name: string;
+  readonly value: string;
+  readonly domain: string;
+  readonly path: string;
+  readonly secure: boolean;
+  readonly httpOnly: boolean;
+}
+
+/** Complete live wire fingerprint + cookie jar snapshot of a running browser session. */
+export interface SessionFingerprint {
+  readonly tls: TlsFingerprint | null;
+  readonly http2: Http2Fingerprint | null;
+  readonly defaultHeaders: readonly HeaderEntry[];
+  readonly apiHeaders?: readonly HeaderEntry[];
+  readonly cookies: readonly CapturedCookie[];
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseIntOr(raw: unknown, fallback = 0): number {
+  return typeof raw === "number" && Number.isInteger(raw) ? raw : fallback;
+}
+
+function parseOptionalInt(raw: unknown): number | null {
+  return typeof raw === "number" && Number.isInteger(raw) ? raw : null;
+}
+
+function parseIntArray(raw: unknown): number[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: number[] = [];
+  for (const item of raw) {
+    if (typeof item === "number" && Number.isInteger(item)) {
+      out.push(item);
+    }
+  }
+  return out;
+}
+
+function parseStringArray(raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item === "string") {
+      out.push(item);
+    }
+  }
+  return out;
+}
+
+function parseStringOr(raw: unknown, fallback = ""): string {
+  return typeof raw === "string" ? raw : fallback;
+}
+
+function parseHeaderEntries(raw: unknown): HeaderEntry[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: HeaderEntry[] = [];
+  for (const entry of raw) {
+    if (isPlainObject(entry)) {
+      out.push({
+        name: entry.name === undefined || entry.name === null ? "" : String(entry.name),
+        value: entry.value === undefined || entry.value === null ? "" : String(entry.value),
+      });
+    }
+  }
+  return out;
+}
+
+/** @internal Parse one `CapturedCookie` from wire JSON (snake_case or camelCase). */
+export function parseCapturedCookie(entry: Record<string, unknown>): CapturedCookie {
+  return {
+    name: entry.name === undefined || entry.name === null ? "" : String(entry.name),
+    value: entry.value === undefined || entry.value === null ? "" : String(entry.value),
+    domain: entry.domain === undefined || entry.domain === null ? "" : String(entry.domain),
+    path: entry.path === undefined || entry.path === null ? "/" : String(entry.path),
+    secure: entry.secure === true,
+    httpOnly: (entry.http_only ?? entry.httpOnly) === true,
+  };
+}
+
+function parseTlsFingerprint(raw: Record<string, unknown>): TlsFingerprint {
+  return {
+    tlsVersion: parseIntOr(raw.tls_version ?? raw.tlsVersion),
+    cipherSuites: parseIntArray(raw.cipher_suites ?? raw.cipherSuites),
+    extensions: parseIntArray(raw.extensions),
+    supportedGroups: parseIntArray(raw.supported_groups ?? raw.supportedGroups),
+    ecPointFormats: parseIntArray(raw.ec_point_formats ?? raw.ecPointFormats),
+    signatureAlgorithms: parseIntArray(raw.signature_algorithms ?? raw.signatureAlgorithms),
+    alpnProtocols: parseStringArray(raw.alpn_protocols ?? raw.alpnProtocols),
+    supportedVersions: parseIntArray(raw.supported_versions ?? raw.supportedVersions),
+    certCompressionAlgorithms: parseIntArray(
+      raw.cert_compression_algorithms ?? raw.certCompressionAlgorithms,
+    ),
+    alpsProtocols: parseStringArray(raw.alps_protocols ?? raw.alpsProtocols),
+    alpsUseNewCodepoint: (raw.alps_use_new_codepoint ?? raw.alpsUseNewCodepoint) === true,
+    pskKeyExchangeModes: parseIntArray(raw.psk_key_exchange_modes ?? raw.pskKeyExchangeModes),
+    greasePresent: (raw.grease_present ?? raw.greasePresent) === true,
+    hasStatusRequest: (raw.has_status_request ?? raw.hasStatusRequest) === true,
+    hasSignedCertTimestamp: (raw.has_signed_cert_timestamp ?? raw.hasSignedCertTimestamp) === true,
+    hasSessionTicket: (raw.has_session_ticket ?? raw.hasSessionTicket) === true,
+    hasExtendedMasterSecret:
+      (raw.has_extended_master_secret ?? raw.hasExtendedMasterSecret) === true,
+    hasRenegotiationInfo: (raw.has_renegotiation_info ?? raw.hasRenegotiationInfo) === true,
+    hasEch: (raw.has_ech ?? raw.hasEch) === true,
+    ja3String: parseStringOr(raw.ja3_string ?? raw.ja3String),
+    ja3Hash: parseStringOr(raw.ja3_hash ?? raw.ja3Hash),
+    ja4: parseStringOr(raw.ja4),
+  };
+}
+
+function parseHttp2Fingerprint(raw: Record<string, unknown>): Http2Fingerprint {
+  const settings: Http2Setting[] = [];
+  if (Array.isArray(raw.settings)) {
+    for (const entry of raw.settings) {
+      if (isPlainObject(entry)) {
+        settings.push({
+          id: parseIntOr(entry.id),
+          value: parseIntOr(entry.value),
+        });
+      }
+    }
+  }
+  const rawPriority = raw.headers_priority ?? raw.headersPriority;
+  let headersPriority: Http2StreamDependency | null = null;
+  if (isPlainObject(rawPriority)) {
+    headersPriority = {
+      dependencyId: parseIntOr(rawPriority.dependency_id ?? rawPriority.dependencyId),
+      weight: parseIntOr(rawPriority.weight),
+      exclusive: rawPriority.exclusive === true,
+    };
+  }
+  return {
+    settings,
+    initialWindowUpdate: parseOptionalInt(raw.initial_window_update ?? raw.initialWindowUpdate),
+    pseudoHeaderOrder: parseStringArray(raw.pseudo_header_order ?? raw.pseudoHeaderOrder),
+    headersPriority,
+    akamaiFingerprint: parseStringOr(raw.akamai_fingerprint ?? raw.akamaiFingerprint),
+  };
+}
+
+/**
+ * Parse a JSON object matching `waybound_core::SessionFingerprint` (snake_case wire format,
+ * or TypeScript camelCase) into a typed `SessionFingerprint`.
+ */
+export function parseSessionFingerprint(raw: unknown): SessionFingerprint {
+  if (!isPlainObject(raw)) {
+    throw new TypeError("expected JSON object for SessionFingerprint");
+  }
+  const tls = isPlainObject(raw.tls) ? parseTlsFingerprint(raw.tls) : null;
+  const http2 = isPlainObject(raw.http2) ? parseHttp2Fingerprint(raw.http2) : null;
+  const defaultHeaders = parseHeaderEntries(raw.default_headers ?? raw.defaultHeaders);
+  const apiHeaders = parseHeaderEntries(raw.api_headers ?? raw.apiHeaders);
+  const cookies: CapturedCookie[] = [];
+  if (Array.isArray(raw.cookies)) {
+    for (const entry of raw.cookies) {
+      if (isPlainObject(entry)) {
+        cookies.push(parseCapturedCookie(entry));
+      }
+    }
+  }
+  return {
+    tls,
+    http2,
+    defaultHeaders,
+    apiHeaders,
+    cookies,
+  };
+}
+
+/**
+ * Serialize a `SessionFingerprint` to the snake_case JSON object expected by
+ * `waybound_core::SessionFingerprint` and `waybound-daemon --replay`.
+ */
+export function serializeSessionFingerprint(fp: SessionFingerprint): Record<string, unknown> {
+  return {
+    tls:
+      fp.tls === null
+        ? null
+        : {
+            tls_version: fp.tls.tlsVersion,
+            cipher_suites: [...fp.tls.cipherSuites],
+            extensions: [...fp.tls.extensions],
+            supported_groups: [...fp.tls.supportedGroups],
+            ec_point_formats: [...fp.tls.ecPointFormats],
+            signature_algorithms: [...fp.tls.signatureAlgorithms],
+            alpn_protocols: [...fp.tls.alpnProtocols],
+            supported_versions: [...fp.tls.supportedVersions],
+            cert_compression_algorithms: [...fp.tls.certCompressionAlgorithms],
+            alps_protocols: [...fp.tls.alpsProtocols],
+            alps_use_new_codepoint: fp.tls.alpsUseNewCodepoint,
+            psk_key_exchange_modes: [...fp.tls.pskKeyExchangeModes],
+            grease_present: fp.tls.greasePresent,
+            has_status_request: fp.tls.hasStatusRequest,
+            has_signed_cert_timestamp: fp.tls.hasSignedCertTimestamp,
+            has_session_ticket: fp.tls.hasSessionTicket,
+            has_extended_master_secret: fp.tls.hasExtendedMasterSecret,
+            has_renegotiation_info: fp.tls.hasRenegotiationInfo,
+            has_ech: fp.tls.hasEch,
+            ja3_string: fp.tls.ja3String,
+            ja3_hash: fp.tls.ja3Hash,
+            ja4: fp.tls.ja4,
+          },
+    http2:
+      fp.http2 === null
+        ? null
+        : {
+            settings: fp.http2.settings.map((s) => ({ id: s.id, value: s.value })),
+            initial_window_update: fp.http2.initialWindowUpdate,
+            pseudo_header_order: [...fp.http2.pseudoHeaderOrder],
+            headers_priority:
+              fp.http2.headersPriority === undefined || fp.http2.headersPriority === null
+                ? null
+                : {
+                    dependency_id: fp.http2.headersPriority.dependencyId,
+                    weight: fp.http2.headersPriority.weight,
+                    exclusive: fp.http2.headersPriority.exclusive,
+                  },
+            akamai_fingerprint: fp.http2.akamaiFingerprint,
+          },
+    default_headers: fp.defaultHeaders.map((h) => ({ name: h.name, value: h.value })),
+    api_headers: (fp.apiHeaders ?? []).map((h) => ({ name: h.name, value: h.value })),
+    cookies: fp.cookies.map((c) => ({
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path,
+      secure: c.secure,
+      http_only: c.httpOnly,
+    })),
+  };
+}

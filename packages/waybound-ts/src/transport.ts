@@ -14,6 +14,8 @@ import {
   type NamedKey,
   type NetworkStats,
   parseRole,
+  parseSessionFingerprint,
+  type SessionFingerprint,
   type TreeSnapshot,
   type WindowSummary,
 } from "./types.js";
@@ -592,6 +594,18 @@ export class Transport {
       "wait_for_network_idle",
       waitTimeoutMs(this.baseTimeoutMs, clamped),
     );
+  }
+
+  /** Export the live TLS, HTTP/2, header, and cookie fingerprint captured from the session. */
+  async exportFingerprint(): Promise<SessionFingerprint> {
+    const response = await this.request({ method: "export_session_fingerprint" });
+    if (response.status !== "session_fingerprint" || !isObject(response.fingerprint)) {
+      throw new WayboundDaemonError(
+        "protocol_error",
+        `unexpected export_session_fingerprint response: ${describe(response)}`,
+      );
+    }
+    return parseSessionFingerprint(response.fingerprint);
   }
 
   /** Return per-session bandwidth and connection counters from the daemon proxy. */

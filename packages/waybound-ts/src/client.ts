@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { WayboundDaemonError } from "./errors.js";
+import { HandoffHttpClient, type HandoffHttpClientOptions } from "./handoff.js";
 import {
   checkMs,
   type NewWindowOptions,
@@ -20,6 +21,7 @@ import {
   type NamedKey,
   type NetworkStats,
   Role,
+  type SessionFingerprint,
   type TreeSnapshot,
   type WindowSummary,
 } from "./types.js";
@@ -434,6 +436,21 @@ export class Page {
   /** Wait until no HTTP/1.1–2 request is in flight for `idleMs`. */
   waitForNetworkIdle(options: NetworkIdleOptions = {}): Promise<void> {
     return this.#transport.waitForNetworkIdle(options.idleMs ?? 500, options.timeoutMs ?? 15_000);
+  }
+
+  /** Export the live TLS, HTTP/2, header, and cookie fingerprint captured from the session. */
+  exportFingerprint(): Promise<SessionFingerprint> {
+    return this.#transport.exportFingerprint();
+  }
+
+  /**
+   * Export the live browser fingerprint and create a standalone BoringSSL/H2 HTTP client.
+   *
+   * The returned `HandoffHttpClient` continues working after the browser session closes.
+   */
+  async handoffHttpClient(options: HandoffHttpClientOptions = {}): Promise<HandoffHttpClient> {
+    const fp = await this.exportFingerprint();
+    return HandoffHttpClient.create(fp, options);
   }
 
   /** Return per-session bandwidth and connection counters from the daemon proxy. */

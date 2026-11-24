@@ -29,6 +29,13 @@ export {
 } from "./client.js";
 export { WayboundDaemonError, WayboundLaunchError } from "./errors.js";
 export {
+  HandoffHttpClient,
+  type HandoffHttpClientOptions,
+  type HandoffRequestOptions,
+  HandoffResponse,
+  type MultipartFile,
+} from "./handoff.js";
+export {
   type AcquireOptions,
   BrowserPool,
   type BrowserPoolOptions,
@@ -95,14 +102,23 @@ export {
   BLOCK_PRESETS,
   type BlockPreset,
   Bounds,
+  type CapturedCookie,
   CapturedResponse,
+  type HeaderEntry,
+  type Http2Fingerprint,
+  type Http2Setting,
+  type Http2StreamDependency,
   type HttpHeader,
   KeyModifier,
   type LocatorQuery,
   NAMED_KEYS,
   type NamedKey,
   type NetworkStats,
+  parseSessionFingerprint,
   Role,
+  type SessionFingerprint,
+  serializeSessionFingerprint,
+  type TlsFingerprint,
   type TreeSnapshot,
   type WindowSummary,
 } from "./types.js";
