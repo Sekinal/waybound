@@ -820,4 +820,101 @@ describe("wire encoding helpers", () => {
     });
     assert.deepEqual(snapshotOpts, [{ maxNodes: 50, windowId: 7 }]);
   });
+
+  it("exports SessionFingerprint via Transport.exportFingerprint() and Page.exportFingerprint()", async () => {
+    const wireFp = {
+      tls: {
+        tls_version: 0x0303,
+        cipher_suites: [0x1301, 0x1302],
+        extensions: [0x0000, 0x0010],
+        supported_groups: [0x001d, 0x0017],
+        ec_point_formats: [0],
+        signature_algorithms: [0x0403, 0x0804],
+        alpn_protocols: ["h2", "http/1.1"],
+        supported_versions: [0x0304, 0x0303],
+        cert_compression_algorithms: [2],
+        alps_protocols: ["h2"],
+        alps_use_new_codepoint: true,
+        psk_key_exchange_modes: [1],
+        grease_present: true,
+        has_status_request: true,
+        has_signed_cert_timestamp: true,
+        has_session_ticket: true,
+        has_extended_master_secret: true,
+        has_renegotiation_info: true,
+        has_ech: false,
+        ja3_string: "771,4865-4866,0-16,29-23,0",
+        ja3_hash: "deadbeef",
+        ja4: "t13d1516h2_abc_def",
+      },
+      http2: {
+        settings: [
+          { id: 1, value: 65536 },
+          { id: 4, value: 6291456 },
+        ],
+        initial_window_update: 15663105,
+        pseudo_header_order: [":method", ":authority", ":scheme", ":path"],
+        headers_priority: { dependency_id: 0, weight: 255, exclusive: true },
+        akamai_fingerprint: "1:65536;4:6291456|15663105|0|m,a,s,p",
+      },
+      default_headers: [{ name: "user-agent", value: "Chrome/140.0" }],
+      api_headers: [{ name: "sec-fetch-mode", value: "cors" }],
+      cookies: [
+        {
+          name: "sid",
+          value: "xyz",
+          domain: ".example.test",
+          path: "/",
+          secure: true,
+          http_only: true,
+        },
+      ],
+    };
+
+    const d = await fakeDaemon((req, sock) => {
+      assert.equal(req.method, "export_session_fingerprint");
+      reply(sock, { status: "session_fingerprint", fingerprint: wireFp });
+    });
+    const t = await Transport.connect(d.endpoint);
+    try {
+      const fromTransport = await t.exportFingerprint();
+      const fromPage = await new Page(t).exportFingerprint();
+      assert.deepEqual(fromPage, fromTransport);
+      assert.equal(fromPage.tls?.tlsVersion, 0x0303);
+      assert.deepEqual(fromPage.tls?.alpnProtocols, ["h2", "http/1.1"]);
+      assert.equal(fromPage.tls?.alpsUseNewCodepoint, true);
+      assert.equal(fromPage.http2?.initialWindowUpdate, 15663105);
+      assert.deepEqual(fromPage.http2?.headersPriority, {
+        dependencyId: 0,
+        weight: 255,
+        exclusive: true,
+      });
+      assert.deepEqual(fromPage.defaultHeaders, [{ name: "user-agent", value: "Chrome/140.0" }]);
+      assert.deepEqual(fromPage.apiHeaders, [{ name: "sec-fetch-mode", value: "cors" }]);
+      assert.deepEqual(fromPage.cookies, [
+        {
+          name: "sid",
+          value: "xyz",
+          domain: ".example.test",
+          path: "/",
+          secure: true,
+          httpOnly: true,
+        },
+      ]);
+    } finally {
+      t.close();
+      await d.close();
+    }
+
+    const badDaemon = await fakeDaemon((_req, sock) => {
+      reply(sock, { status: "ok" });
+    });
+    const badTransport = await Transport.connect(badDaemon.endpoint);
+    try {
+      await expectCode(badTransport.exportFingerprint(), "protocol_error");
+    } finally {
+      badTransport.close();
+      await badDaemon.close();
+    }
+  });
 });

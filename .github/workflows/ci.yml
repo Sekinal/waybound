@@ -176,7 +176,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build daemon for end-to-end tests
-        run: cargo build -p waybound-daemon
+        run: cargo build -p waybound-daemon --features replay
         working-directory: .
       - uses: actions/setup-node@v7
         with:
