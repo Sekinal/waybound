@@ -2464,7 +2464,7 @@ mod tests {
         assert_eq!(downs, 2);
         assert_eq!(ups, 2);
         assert_eq!(driver2.typed_text(), "hi");
-        assert!(driver2.held_keys().is_empty());
+        assert_eq!(driver2.held_keys(), Vec::<KeyCode>::new());
     }
 
     #[test]
@@ -2482,7 +2482,7 @@ mod tests {
         let text = "thelandwithform";
         assert!(type_text(&driver, &st, text, true).is_ok());
         assert_eq!(driver.typed_text(), text);
-        assert!(driver.held_keys().is_empty());
+        assert_eq!(driver.held_keys(), Vec::<KeyCode>::new());
 
         let mut current_held = 0usize;
         let mut max_held = 0usize;
@@ -2631,7 +2631,7 @@ mod tests {
         let res = type_text(&driver, &st, "th", true);
         assert!(matches!(res, Err(WayboundError::BackendUnavailable { .. })));
         // Cleanup must have dispatched KeyUp('t') so zero keys remain held.
-        assert!(driver.inner.held_keys().is_empty());
+        assert_eq!(driver.inner.held_keys(), Vec::<KeyCode>::new());
         assert_eq!(
             driver.inner.recorded_events(),
             vec![

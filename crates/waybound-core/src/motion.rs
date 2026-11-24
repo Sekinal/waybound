@@ -2110,7 +2110,7 @@ mod tests {
             }
         }
         assert_eq!(downs, text);
-        assert!(held.is_empty(), "all keys must be released at end");
+        assert_eq!(held, Vec::<char>::new(), "all keys must be released at end");
         assert!(
             max_held <= 2,
             "at most 2 keys may be held simultaneously, observed {max_held}"
@@ -2204,7 +2204,10 @@ mod tests {
             typing_rollover_ratio: f64::NAN,
             ..MotorProfile::default()
         };
-        assert!(plan_rollover_typing_events("", &profile, &mut rng).is_empty());
+        assert_eq!(
+            plan_rollover_typing_events("", &profile, &mut rng),
+            Vec::<KeyTimelineEvent>::new()
+        );
 
         let events = plan_rollover_typing_events("the", &profile, &mut rng);
         assert_eq!(events.len(), 6);
