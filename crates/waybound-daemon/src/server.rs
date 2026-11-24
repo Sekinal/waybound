@@ -18,10 +18,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use waybound_core::{
-    BackendKind, Driver, InputEvent, KeyCode, KeyModifier, LocatorQuery, MotionConfig, MouseButton,
-    Point, Request, Response, Result, Role, SplitMix64, WayboundError, WindowSummary, WireRequest,
-    hover_pause_before_click, key_delay, key_hold_ms, mouse_hold_ms, parse_wire_request,
-    pick_click_point, plan_human_pointer_path, plan_scroll_burst,
+    BackendKind, Bounds, Driver, InputEvent, KeyCode, KeyModifier, LocatorQuery, MotionConfig,
+    MotorProfile, MouseButton, Point, Request, Response, Result, Role, SplitMix64, WayboundError,
+    WindowSummary, WireRequest, action_pause_for, double_click_gap_for, hover_pause_for,
+    key_hold_for, mouse_hold_for, parse_wire_request, pick_click_point_from,
+    plan_human_pointer_path_with_profile, plan_scroll_burst_with_profile, plan_typing_sequence,
+    reading_pause_for,
 };
 use waybound_net::{FingerprintRecorder, InflightCounter, wait_for_network_idle};
 
@@ -89,6 +91,10 @@ struct SessionState {
     last_cursor: Mutex<Option<Point>>,
     /// Serializes `NewWindow` opener calls so concurrent requests never claim the same window ID.
     new_window_lock: Mutex<()>,
+    /// Persistent biomechanical motor profile sampled once per daemon session.
+    motor_profile: MotorProfile,
+    /// Shared PRNG for intra-session motor variation.
+    motion_rng: Mutex<SplitMix64>,
     /// Mouse buttons currently held by in-flight drags; shutdown waits for this to drop to 0.
     held_buttons: AtomicUsize,
     shutdown: Arc<AtomicBool>,
@@ -97,19 +103,31 @@ struct SessionState {
 }
 
 impl SessionState {
-    const fn new(
+    fn new(
         options: ServerOptions,
         responses: Arc<ResponseStore>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
+        let mut rng = SplitMix64::from_entropy();
+        let motor_profile = MotorProfile::sample(&mut rng);
         Self {
             last_cursor: Mutex::new(None),
             new_window_lock: Mutex::new(()),
+            motor_profile,
+            motion_rng: Mutex::new(rng),
             held_buttons: AtomicUsize::new(0),
             shutdown,
             responses,
             options,
         }
+    }
+
+    fn with_motion_rng<T>(&self, f: impl FnOnce(&MotorProfile, &mut SplitMix64) -> T) -> T {
+        let mut rng = self
+            .motion_rng
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&self.motor_profile, &mut rng)
     }
 }
 
@@ -245,7 +263,7 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             Ok(()) => Response::Ok,
             Err(err) => Response::from(&err),
         },
-        Request::Navigate { url } => match navigate_url(driver, &url) {
+        Request::Navigate { url } => match navigate_url(driver, state, &url) {
             Ok(()) => Response::Ok,
             Err(err) => Response::from(&err),
         },
@@ -261,7 +279,7 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             Ok(()) => Response::Ok,
             Err(err) => Response::from(&err),
         },
-        Request::NewTab { url } => match open_new_tab(driver, url.as_deref()) {
+        Request::NewTab { url } => match open_new_tab(driver, state, url.as_deref()) {
             Ok(()) => Response::Ok,
             Err(err) => Response::from(&err),
         },
@@ -290,11 +308,7 @@ fn handle_request(driver: &dyn Driver, state: &SessionState, request: Request) -
             }
         }
         Request::Press { key, modifiers } => {
-            let hold_ms = if state.options.use_motion {
-                key_hold_ms(&mut SplitMix64::from_entropy())
-            } else {
-                0
-            };
+            let hold_ms = motion_key_hold(driver, state);
             match driver.dispatch_input(&InputEvent::KeyPress {
                 key,
                 modifiers,
@@ -453,11 +467,33 @@ fn poll_locate(
     }
 }
 
+fn motion_enabled_for(driver: &dyn Driver, state: &SessionState) -> bool {
+    state.options.use_motion && driver.backend_kind() != BackendKind::AndroidWaydroid
+}
+
+fn pace_pause(driver: &dyn Driver, state: &SessionState, fixed_ms: u64) -> Duration {
+    if motion_enabled_for(driver, state) {
+        #[allow(clippy::cast_precision_loss)]
+        let base_ms = fixed_ms as f64;
+        state.with_motion_rng(|profile, rng| action_pause_for(profile, base_ms, rng))
+    } else {
+        Duration::from_millis(fixed_ms)
+    }
+}
+
+fn motion_key_hold(driver: &dyn Driver, state: &SessionState) -> u64 {
+    if motion_enabled_for(driver, state) {
+        state.with_motion_rng(key_hold_for)
+    } else {
+        0
+    }
+}
+
 fn move_pointer(
     driver: &dyn Driver,
     state: &SessionState,
     target: Point,
-    rng: &mut SplitMix64,
+    target_bounds: Option<Bounds>,
 ) -> Result<()> {
     // Start from where the cursor really is: the tracked position is stale whenever the
     // physical mouse moved since the last request, and is (0, 0) before the first one.
@@ -469,8 +505,17 @@ fn move_pointer(
         .or(tracked)
         .unwrap_or(target);
 
-    if state.options.use_motion && driver.backend_kind() != BackendKind::AndroidWaydroid {
-        let path = plan_human_pointer_path(start, target, MotionConfig::default(), rng);
+    if motion_enabled_for(driver, state) {
+        let path = state.with_motion_rng(|profile, rng| {
+            plan_human_pointer_path_with_profile(
+                start,
+                target,
+                target_bounds,
+                MotionConfig::default(),
+                profile,
+                rng,
+            )
+        });
         for step in path {
             if !step.delay.is_zero() {
                 thread::sleep(step.delay);
@@ -493,11 +538,13 @@ fn scroll_viewport(
     delta_x: f64,
     delta_y: f64,
 ) -> Result<()> {
-    if !state.options.use_motion || driver.backend_kind() == BackendKind::AndroidWaydroid {
+    if !motion_enabled_for(driver, state) {
         return driver.dispatch_input(&InputEvent::Scroll { delta_x, delta_y });
     }
-    let mut rng = SplitMix64::from_entropy();
-    for step in plan_scroll_burst(delta_x, delta_y, &mut rng) {
+    let steps = state.with_motion_rng(|profile, rng| {
+        plan_scroll_burst_with_profile(delta_x, delta_y, profile, rng)
+    });
+    for step in steps {
         if !step.delay.is_zero() {
             thread::sleep(step.delay);
         }
@@ -523,7 +570,7 @@ fn locate_with_wait(
     poll_locate(driver, query, wait, ACTION_POLL_INTERVAL)
 }
 
-fn validate_bounds(b: waybound_core::Bounds, query: &LocatorQuery) -> Result<()> {
+fn validate_bounds(b: Bounds, query: &LocatorQuery) -> Result<()> {
     if !b.x.is_finite()
         || !b.y.is_finite()
         || !b.width.is_finite()
@@ -585,14 +632,23 @@ fn hover_element_node_within(
             // On macOS, wheel events go to the window under the cursor — ensure cursor is inside vp.
             if !positioned_in_vp && driver.backend_kind() == BackendKind::MacOsNative {
                 let (vx, vy) = vp.center();
-                let mut rng = SplitMix64::from_entropy();
-                move_pointer(driver, state, Point { x: vx, y: vy }, &mut rng)?;
+                move_pointer(driver, state, Point { x: vx, y: vy }, Some(vp))?;
                 positioned_in_vp = true;
             }
-            let step = (vp.height * 0.6).clamp(180.0, 520.0);
+            let step_frac = if motion_enabled_for(driver, state) {
+                state.with_motion_rng(|_, rng| rng.range_f64(0.48, 0.70))
+            } else {
+                0.6
+            };
+            let step = (vp.height * step_frac).clamp(180.0, 520.0);
             let delta_y = if cy > bottom { -step } else { step };
             scroll_viewport(driver, state, 0.0, delta_y)?;
-            thread::sleep(Duration::from_millis(120));
+            let post_scroll_pause = if motion_enabled_for(driver, state) {
+                state.with_motion_rng(reading_pause_for)
+            } else {
+                Duration::from_millis(120)
+            };
+            thread::sleep(post_scroll_pause);
             node = driver.locate(query)?;
             validate_bounds(node.bounds, query)?;
         }
@@ -600,15 +656,16 @@ fn hover_element_node_within(
 
     let b = node.bounds;
 
-    let mut rng = SplitMix64::from_entropy();
     let target = if state.options.use_motion {
-        pick_click_point(b, &mut rng)
+        let tracked = state.last_cursor.lock().map_or(None, |g| *g);
+        let start = driver.cursor_position().ok().flatten().or(tracked);
+        state.with_motion_rng(|profile, rng| pick_click_point_from(start, b, profile, rng))
     } else {
         let (x, y) = b.center();
         Point { x, y }
     };
 
-    move_pointer(driver, state, target, &mut rng)?;
+    move_pointer(driver, state, target, Some(b))?;
     Ok(node)
 }
 
@@ -620,10 +677,12 @@ fn click_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery
 /// Presses and releases the left button where the pointer is (with a human pause and hold
 /// when motion is enabled).
 fn press_left_at_pointer(driver: &dyn Driver, state: &SessionState) -> Result<()> {
-    let hold_ms = if state.options.use_motion {
-        let mut rng = SplitMix64::from_entropy();
-        thread::sleep(hover_pause_before_click(&mut rng));
-        mouse_hold_ms(&mut rng)
+    let hold_ms = if motion_enabled_for(driver, state) {
+        let (pause, hold) = state.with_motion_rng(|profile, rng| {
+            (hover_pause_for(profile, rng), mouse_hold_for(profile, rng))
+        });
+        thread::sleep(pause);
+        hold
     } else {
         0
     };
@@ -636,10 +695,25 @@ fn press_left_at_pointer(driver: &dyn Driver, state: &SessionState) -> Result<()
 
 fn dblclick_element(driver: &dyn Driver, state: &SessionState, query: &LocatorQuery) -> Result<()> {
     click_element(driver, state, query)?;
-    thread::sleep(Duration::from_millis(60));
+    let (gap, second_hold_ms) = if motion_enabled_for(driver, state) {
+        state.with_motion_rng(|profile, rng| {
+            let gap = double_click_gap_for(profile, rng);
+            let base_hold = mouse_hold_for(profile, rng);
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            let second_hold = ((base_hold as f64) * 0.85).round().max(25.0) as u64;
+            (gap, second_hold)
+        })
+    } else {
+        (Duration::from_millis(60), 0)
+    };
+    thread::sleep(gap);
     driver.dispatch_input(&InputEvent::MouseClick {
         button: MouseButton::Left,
-        hold_ms: 0,
+        hold_ms: second_hold_ms,
     })
 }
 
@@ -651,7 +725,7 @@ fn select_option_element(
     index: Option<usize>,
 ) -> Result<()> {
     click_element(driver, state, query)?;
-    thread::sleep(Duration::from_millis(120));
+    thread::sleep(pace_pause(driver, state, 120));
 
     if let Some(target_label) = label {
         // First try clicking a visible ARIA `option` node matching `target_label`.
@@ -660,12 +734,12 @@ fn select_option_element(
             return click_element(driver, state, &opt_query);
         }
         // Fallback for native OS `<select>` popups: type-ahead characters + Enter.
-        type_text(driver, target_label, false)?;
-        thread::sleep(Duration::from_millis(80));
+        type_text(driver, state, target_label, false)?;
+        thread::sleep(pace_pause(driver, state, 80));
         return driver.dispatch_input(&InputEvent::KeyPress {
             key: KeyCode::Enter,
             modifiers: Vec::new(),
-            hold_ms: 0,
+            hold_ms: motion_key_hold(driver, state),
         });
     }
 
@@ -673,21 +747,21 @@ fn select_option_element(
         driver.dispatch_input(&InputEvent::KeyPress {
             key: KeyCode::Home,
             modifiers: Vec::new(),
-            hold_ms: 0,
+            hold_ms: motion_key_hold(driver, state),
         })?;
-        thread::sleep(Duration::from_millis(40));
+        thread::sleep(pace_pause(driver, state, 40));
         for _ in 0..idx.min(200) {
             driver.dispatch_input(&InputEvent::KeyPress {
                 key: KeyCode::ArrowDown,
                 modifiers: Vec::new(),
-                hold_ms: 0,
+                hold_ms: motion_key_hold(driver, state),
             })?;
-            thread::sleep(Duration::from_millis(25));
+            thread::sleep(pace_pause(driver, state, 25));
         }
         return driver.dispatch_input(&InputEvent::KeyPress {
             key: KeyCode::Enter,
             modifiers: Vec::new(),
-            hold_ms: 0,
+            hold_ms: motion_key_hold(driver, state),
         });
     }
 
@@ -705,11 +779,11 @@ enum BrowserAction {
     PrevTab,
 }
 
-fn open_new_tab(driver: &dyn Driver, url: Option<&str>) -> Result<()> {
+fn open_new_tab(driver: &dyn Driver, state: &SessionState, url: Option<&str>) -> Result<()> {
     browser_shortcut(driver, BrowserAction::NewTab)?;
     if let Some(dest) = url {
         thread::sleep(Duration::from_millis(120));
-        navigate_url(driver, dest)?;
+        navigate_url(driver, state, dest)?;
     }
     Ok(())
 }
@@ -746,7 +820,7 @@ fn fill_element(
     text: &str,
 ) -> Result<()> {
     click_element(driver, state, query)?;
-    replace_field_content(driver, text, state.options.use_motion)
+    replace_field_content(driver, state, text, state.options.use_motion)
 }
 
 /// Replaces the focused field's content with `text` (Playwright `fill` semantics).
@@ -754,17 +828,22 @@ fn fill_element(
 /// The click lands at an arbitrary point inside the field, so typing straight away would
 /// insert into the middle of any existing value. Select everything first; the first typed
 /// character then replaces the selection, or Backspace clears it when `text` is empty.
-fn replace_field_content(driver: &dyn Driver, text: &str, pace: bool) -> Result<()> {
+fn replace_field_content(
+    driver: &dyn Driver,
+    state: &SessionState,
+    text: &str,
+    pace: bool,
+) -> Result<()> {
     let select_all_mod = match driver.backend_kind() {
         BackendKind::MacOsNative => KeyModifier::Meta,
         _ => KeyModifier::Control,
     };
 
-    thread::sleep(Duration::from_millis(40));
+    thread::sleep(pace_pause(driver, state, 40));
     match driver.dispatch_input(&InputEvent::KeyPress {
         key: KeyCode::Char('a'),
         modifiers: vec![select_all_mod],
-        hold_ms: 0,
+        hold_ms: motion_key_hold(driver, state),
     }) {
         Ok(()) => {}
         // Android before API 33 cannot send Ctrl+A through `adb shell input`, and a
@@ -779,44 +858,57 @@ fn replace_field_content(driver: &dyn Driver, text: &str, pace: bool) -> Result<
                 %reason,
                 "select-all unavailable; fill appends to the field's existing text"
             );
-            return type_text(driver, text, pace);
+            return type_text(driver, state, text, pace);
         }
         Err(err) => return Err(err),
     }
-    thread::sleep(Duration::from_millis(40));
+    thread::sleep(pace_pause(driver, state, 40));
 
     if text.is_empty() {
         return driver.dispatch_input(&InputEvent::KeyPress {
             key: KeyCode::Backspace,
             modifiers: Vec::new(),
-            hold_ms: 0,
+            hold_ms: motion_key_hold(driver, state),
         });
     }
-    type_text(driver, text, pace)
+    type_text(driver, state, text, pace)
 }
 
-fn type_text(driver: &dyn Driver, text: &str, pace: bool) -> Result<()> {
-    let mut rng = SplitMix64::from_entropy();
-    for ch in text.chars() {
-        let key = match ch {
-            '\n' | '\r' => KeyCode::Enter,
-            '\t' => KeyCode::Tab,
-            other => KeyCode::Char(other),
-        };
-        let hold_ms = if pace { key_hold_ms(&mut rng) } else { 0 };
-        driver.dispatch_input(&InputEvent::KeyPress {
-            key,
-            modifiers: Vec::new(),
-            hold_ms,
-        })?;
-        if pace {
-            thread::sleep(key_delay(ch, &mut rng));
+const fn char_to_key(ch: char) -> KeyCode {
+    match ch {
+        '\n' | '\r' => KeyCode::Enter,
+        '\t' => KeyCode::Tab,
+        other => KeyCode::Char(other),
+    }
+}
+
+fn type_text(driver: &dyn Driver, state: &SessionState, text: &str, pace: bool) -> Result<()> {
+    if pace && driver.backend_kind() != BackendKind::AndroidWaydroid {
+        let steps = state.with_motion_rng(|profile, rng| plan_typing_sequence(text, profile, rng));
+        for step in steps {
+            driver.dispatch_input(&InputEvent::KeyPress {
+                key: char_to_key(step.ch),
+                modifiers: Vec::new(),
+                hold_ms: step.hold_ms,
+            })?;
+            if !step.delay_after.is_zero() {
+                thread::sleep(step.delay_after);
+            }
         }
+        return Ok(());
+    }
+
+    for ch in text.chars() {
+        driver.dispatch_input(&InputEvent::KeyPress {
+            key: char_to_key(ch),
+            modifiers: Vec::new(),
+            hold_ms: 0,
+        })?;
     }
     Ok(())
 }
 
-fn navigate_url(driver: &dyn Driver, url: &str) -> Result<()> {
+fn navigate_url(driver: &dyn Driver, state: &SessionState, url: &str) -> Result<()> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(WayboundError::Io(std::io::Error::new(
             ErrorKind::InvalidInput,
@@ -839,7 +931,7 @@ fn navigate_url(driver: &dyn Driver, url: &str) -> Result<()> {
         hold_ms: 0,
     })?;
     thread::sleep(Duration::from_millis(150));
-    type_text(driver, url, false)?;
+    type_text(driver, state, url, false)?;
     thread::sleep(Duration::from_millis(50));
     driver.dispatch_input(&InputEvent::KeyPress {
         key: KeyCode::Enter,
@@ -1110,8 +1202,10 @@ fn sleep_unless_shutting_down(state: &SessionState, duration: Duration) -> Resul
 fn plan_drag_path(
     start: Point,
     end: Point,
+    target_bounds: Option<Bounds>,
     smooth: bool,
     settle: Duration,
+    profile: &MotorProfile,
     rng: &mut SplitMix64,
 ) -> Vec<waybound_core::MotionStep> {
     let dx = end.x - start.x;
@@ -1136,10 +1230,12 @@ fn plan_drag_path(
     let nudged = steps.last().map_or(start, |step| step.point);
 
     if smooth {
-        steps.extend(plan_human_pointer_path(
+        steps.extend(plan_human_pointer_path_with_profile(
             nudged,
             end,
+            target_bounds,
             MotionConfig::default(),
+            profile,
             rng,
         ));
     }
@@ -1188,32 +1284,35 @@ fn drag_element(
         }
     })?;
 
-    let use_motion = state.options.use_motion;
-    let mut rng = SplitMix64::from_entropy();
-    let drop_point = if use_motion {
-        pick_click_point(zone, &mut rng)
+    // Android turns the whole press..release into one swipe, so intermediate points add
+    // nothing but latency there.
+    let smooth = motion_enabled_for(driver, state);
+    let cursor_before = state.last_cursor.lock().map_or(None, |g| *g);
+    let drop_point = if state.options.use_motion {
+        state.with_motion_rng(|profile, rng| {
+            pick_click_point_from(cursor_before, zone, profile, rng)
+        })
     } else {
         let (x, y) = zone.center();
         Point { x, y }
     };
-    let start = state
-        .last_cursor
-        .lock()
-        .map_or(None, |g| *g)
-        .unwrap_or(drop_point);
-    let (press_hold, settle) = if use_motion {
-        thread::sleep(hover_pause_before_click(&mut rng));
-        (
-            Duration::from_millis(rng.range_u64(90, 160)),
-            Duration::from_millis(rng.range_u64(120, 220)),
-        )
-    } else {
-        (DRAG_PRESS_HOLD, DRAG_SETTLE)
-    };
-    // Android turns the whole press..release into one swipe, so intermediate points add
-    // nothing but latency there.
-    let smooth = use_motion && driver.backend_kind() != BackendKind::AndroidWaydroid;
-    let path = plan_drag_path(start, drop_point, smooth, settle, &mut rng);
+    let start = cursor_before.unwrap_or(drop_point);
+    let (pre_hover, press_hold, path) = state.with_motion_rng(|profile, rng| {
+        let (pre_hover, press_hold, settle) = if smooth {
+            (
+                hover_pause_for(profile, rng),
+                action_pause_for(profile, 120.0, rng),
+                action_pause_for(profile, 165.0, rng),
+            )
+        } else {
+            (Duration::ZERO, DRAG_PRESS_HOLD, DRAG_SETTLE)
+        };
+        let path = plan_drag_path(start, drop_point, Some(zone), smooth, settle, profile, rng);
+        (pre_hover, press_hold, path)
+    });
+    if !pre_hover.is_zero() {
+        thread::sleep(pre_hover);
+    }
 
     let button = MouseButton::Left;
     let held = HeldButton::press(driver, state, button)?;
@@ -1237,10 +1336,7 @@ const VIEWPORT_EDGE_MARGIN: f64 = 12.0;
 /// [`VIEWPORT_EDGE_MARGIN`]), where a drop actually lands on the target, or `None` when no
 /// part of it is visible. An unknown or degenerate viewport leaves `target` unchanged,
 /// using the same "usable viewport" rule as `hover_element`.
-fn visible_drop_zone(
-    target: waybound_core::Bounds,
-    viewport: Option<waybound_core::Bounds>,
-) -> Option<waybound_core::Bounds> {
+fn visible_drop_zone(target: Bounds, viewport: Option<Bounds>) -> Option<Bounds> {
     let Some(vp) = viewport.filter(|vp| vp.width > 2.0 * VIEWPORT_EDGE_MARGIN && vp.height > 40.0)
     else {
         return Some(target);
@@ -1249,7 +1345,7 @@ fn visible_drop_zone(
     let top = target.y.max(vp.y + VIEWPORT_EDGE_MARGIN);
     let right = (target.x + target.width).min(vp.x + vp.width - VIEWPORT_EDGE_MARGIN);
     let bottom = (target.y + target.height).min(vp.y + vp.height - VIEWPORT_EDGE_MARGIN);
-    (right > left && bottom > top).then_some(waybound_core::Bounds {
+    (right > left && bottom > top).then_some(Bounds {
         x: left,
         y: top,
         width: right - left,
@@ -1296,14 +1392,14 @@ fn reidentify<'a>(
 }
 
 /// Manhattan distance between two rectangles' centers plus their size differences.
-fn bounds_distance(a: &waybound_core::Bounds, b: &waybound_core::Bounds) -> f64 {
+fn bounds_distance(a: &Bounds, b: &Bounds) -> f64 {
     let (ax, ay) = a.center();
     let (bx, by) = b.center();
     (ax - bx).abs() + (ay - by).abs() + (a.width - b.width).abs() + (a.height - b.height).abs()
 }
 
 /// Returns `true` when either rectangle contains the other's center.
-fn bounds_overlap(a: &waybound_core::Bounds, b: &waybound_core::Bounds) -> bool {
+fn bounds_overlap(a: &Bounds, b: &Bounds) -> bool {
     a.contains_center(b) || b.contains_center(a)
 }
 
@@ -1662,7 +1758,7 @@ fn handle_io_streams<R: Read, W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use waybound_core::{AccessibilityNode, Bounds, Role};
+    use waybound_core::{AccessibilityNode, Role, pick_click_point};
 
     use super::*;
     use crate::mock_driver::MockDriver;
@@ -2236,10 +2332,11 @@ mod tests {
     #[test]
     fn drag_path_nudges_then_ends_exactly_on_target() {
         let mut rng = SplitMix64::new(7);
+        let profile = MotorProfile::default();
         let start = Point { x: 0.0, y: 0.0 };
         let end = Point { x: 0.0, y: 300.0 };
         let settle = Duration::from_millis(5);
-        let path = plan_drag_path(start, end, true, settle, &mut rng);
+        let path = plan_drag_path(start, end, None, true, settle, &profile, &mut rng);
         assert!(path.len() > 4);
         assert_eq!(
             path.first().map(|s| s.point),
@@ -2254,7 +2351,7 @@ mod tests {
         assert_eq!(path.last().map(|s| s.delay), Some(settle));
 
         // Dropping onto the start point still moves far enough to begin a drag.
-        let in_place = plan_drag_path(start, start, false, settle, &mut rng);
+        let in_place = plan_drag_path(start, start, None, false, settle, &profile, &mut rng);
         assert_eq!(
             in_place.iter().map(|s| s.point).collect::<Vec<_>>(),
             vec![
@@ -2264,6 +2361,40 @@ mod tests {
                 start
             ]
         );
+    }
+
+    #[test]
+    fn dblclick_and_fill_with_motion_use_session_motor_profile() {
+        let driver = MockDriver::sample_page();
+        let st = state_with(true, Arc::new(AtomicBool::new(false)));
+        set_last_cursor(&st, Point { x: 10.0, y: 10.0 });
+
+        assert!(dblclick_element(&driver, &st, &search_button()).is_ok());
+        let clicks: Vec<u64> = driver
+            .recorded_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                InputEvent::MouseClick { hold_ms, .. } => Some(hold_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(clicks.len(), 2);
+        assert!(clicks[0] > 0, "first click hold_ms should be non-zero");
+        assert!(clicks[1] > 0, "second click hold_ms should be non-zero");
+
+        let driver2 = MockDriver::sample_page();
+        assert!(fill_element(&driver2, &st, &origin_box(), "hi").is_ok());
+        let key_holds: Vec<u64> = driver2
+            .recorded_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                InputEvent::KeyPress { hold_ms, .. } => Some(hold_ms),
+                _ => None,
+            })
+            .collect();
+        // Ctrl/Cmd+A + 'h' + 'i'
+        assert_eq!(key_holds.len(), 3);
+        assert!(key_holds.iter().all(|&h| h > 0));
     }
 
     #[test]
