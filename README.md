@@ -38,7 +38,7 @@ pip install waybound                 # Core sync/async SDK + CLI + MCP server (z
 pip install "waybound[crawlee]"      # + WayboundCrawler for Crawlee Python
 pip install "waybound[scrapy]"       # + WayboundDownloadHandler for Scrapy
 
-waybound fetch v0.6.0                # Downloads prebuilt waybound-daemon (macOS/Linux/Windows)
+waybound fetch v0.7.0                # Downloads prebuilt waybound-daemon (macOS/Linux/Windows)
 waybound doctor                      # Finds daemon, Chrome, adb/waydroid; probes tshark's capture interface
 ```
 

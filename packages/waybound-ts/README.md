@@ -68,7 +68,7 @@ platform (verified against the release's SHA-256 file):
 
 ```ts
 import { downloadDaemonBinary } from "waybound";
-const daemonPath = await downloadDaemonBinary(); // or { version: "v0.6.0" }
+const daemonPath = await downloadDaemonBinary(); // or { version: "v0.7.0" }
 ```
 
 ## Development

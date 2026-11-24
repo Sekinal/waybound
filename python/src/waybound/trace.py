@@ -43,7 +43,7 @@ def _sdk_version() -> str:
     try:
         return package_version("waybound")
     except PackageNotFoundError:
-        return "0.6.0"
+        return "0.7.0"
 
 
 def _iso_utc_from_ms(ts_ms: int | None) -> str:
